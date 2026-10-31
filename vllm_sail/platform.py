@@ -207,8 +207,27 @@ class PPUPlatform(NvmlCudaPlatform):
         normalize_expert_dtype(vllm_config)
 
         if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
-            raise ValueError(
-                "PPU DeepGEMM does not support MegaMoE; select ppu_deep_gemm or auto."
+            from vllm_sail.utils.deep_gemm_mega import check_mega_moe_supported
+
+            config = vllm_config.model_config.hf_text_config
+            if config.model_type not in (
+                "deepseek_v4",
+                "deepseek_v41",
+                "deepseek_v41_text",
+            ):
+                raise ValueError(
+                    "SAIL MegaMoE is integrated with DeepSeek V4/V4.1 only."
+                )
+            if getattr(config, "expert_dtype", "fp4") != "fp4":
+                raise ValueError(
+                    "SAIL MegaMoE requires MXFP4 experts (expert_dtype=fp4)."
+                )
+            import torch
+
+            check_mega_moe_supported(
+                torch.device("cuda", torch.cuda.current_device()),
+                config.hidden_size,
+                config.moe_intermediate_size,
             )
 
         compilation_config = vllm_config.compilation_config

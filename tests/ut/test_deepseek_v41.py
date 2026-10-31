@@ -1,15 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """V4.1 integration contracts; CPU tests never import torch or vLLM."""
 
+import ast
+import importlib
+import inspect
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from tests.support.source import function
+from tests.support.source import definition, function
 from tests.ut import test_ppu_kernel_capabilities as harness
 
 modules = harness.modules
 load_patch = harness.load_patch
+
+_MEGAMOE_IMPL = harness.ROOT / "vllm_sail/models/deepseek_v41/mega_moe.py"
+_MEGAMOE_PATCH = (
+    harness.ROOT / "vllm_sail/patch/enhancement/models/deepseek_v41_megamoe.py"
+)
+_MEGAMOE_API = harness.ROOT / "vllm_sail/utils/deep_gemm_mega.py"
+_MEGAMOE_MODEL = "vllm.models.deepseek_v4.nvidia.model"
+_MEGAMOE_CLASS = "PPUDeepGemmMegaMoEExperts"
+_MEGAMOE_REQUIRED = (
+    "get_symm_buffer_for_mega_moe",
+    "mega_moe_pre_dispatch",
+    "fp4_fp4_mega_moe",
+)
 
 
 @pytest.mark.upstream_source
@@ -576,3 +593,536 @@ def test_v41_draft_inherits_its_own_loader_and_execution(modules):
     assert draft.hf_to_vllm_mapper is mapper
     assert mapper_args == [("fp4", "weight_scale")]
     assert draft.packed_modules_mapping["fused_wqa_wkv"] == ["wq_a", "wkv"]
+
+
+@pytest.fixture
+def megamoe_patch(modules):
+    class NativeExperts:
+        def __init__(self, vllm_config, **kwargs):
+            self.vllm_config = vllm_config
+            self.kwargs = kwargs
+
+    class PPUExperts(NativeExperts):
+        pass
+
+    class FlashInferExperts(NativeExperts):
+        pass
+
+    class MoE:
+        def _init_mega_moe_experts(self, vllm_config, config, prefix):
+            raise AssertionError("unpatched initializer")
+
+    calls = []
+    outputs = {name: object() for name in ("native", "ppu")}
+
+    def gate(name):
+        def route(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return outputs[name]
+
+        return route
+
+    platform = SimpleNamespace(ppu=True, is_cuda=lambda: True)
+    platform.is_ppu = lambda: platform.ppu
+    modules("vllm.platforms", current_platform=platform)
+    envs = modules("vllm.envs", VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION=False)
+    modules("vllm.config", VllmConfig=object)
+    group = SimpleNamespace(world_size=2, rank_in_group=1)
+    modules("vllm.distributed", get_ep_group=lambda: group)
+    model = modules(
+        _MEGAMOE_MODEL, DeepseekV4MegaMoEExperts=NativeExperts, DeepseekV4MoE=MoE
+    )
+    fi = modules(
+        "vllm.models.deepseek_v4.nvidia.fi_moe",
+        DeepseekV4MegaMoEExperts=NativeExperts,
+        DeepseekV4MegaMoEExpertsFI=FlashInferExperts,
+    )
+    modules(
+        "vllm_sail.models.deepseek_v41.mega_moe",
+        PPUDeepGemmMegaMoEExperts=PPUExperts,
+        mega_gate=gate("ppu"),
+    )
+    original_gate = gate("native")
+    provider = modules("vllm.utils.deep_gemm", bf16_mega_gate=original_gate)
+    original_init = MoE._init_mega_moe_experts
+    patch = load_patch(_MEGAMOE_PATCH)
+    return SimpleNamespace(
+        platform=platform,
+        envs=envs,
+        group=group,
+        model=model,
+        fi=fi,
+        native=NativeExperts,
+        ppu=PPUExperts,
+        flashinfer=FlashInferExperts,
+        provider=provider,
+        original_gate=original_gate,
+        original_init=original_init,
+        patch=patch,
+        calls=calls,
+        outputs=outputs,
+    )
+
+
+@pytest.mark.parametrize("ppu", [False, True], ids=["cuda", "ppu"])
+@pytest.mark.parametrize("flashinfer", [False, True])
+@pytest.mark.parametrize(
+    "has_shared,disable_fusion,tp_size,sequence_parallel,native_fusion",
+    [
+        (False, False, 1, False, False),
+        (True, False, 1, False, True),
+        (True, False, 2, True, True),
+        (True, False, 2, False, False),
+        (True, True, 1, False, False),
+    ],
+)
+def test_megamoe_selects_ppu_only_without_flashinfer_and_preserves_native_fusion(
+    megamoe_patch,
+    ppu,
+    flashinfer,
+    has_shared,
+    disable_fusion,
+    tp_size,
+    sequence_parallel,
+    native_fusion,
+):
+    harness = megamoe_patch
+    harness.platform.ppu = ppu
+    harness.envs.VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION = disable_fusion
+    config = SimpleNamespace(
+        n_shared_experts=2, hidden_size=512, moe_intermediate_size=128
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=8)
+        )
+    )
+    moe = harness.model.DeepseekV4MoE()
+    shared = object() if has_shared else None
+    moe.__dict__.update(
+        n_routed_experts=4,
+        n_activated_experts=2,
+        shared_experts=shared,
+        use_sequence_parallel=sequence_parallel,
+        tp_size=tp_size,
+        use_fi_mega_moe=flashinfer,
+        swiglu_limit=7,
+    )
+    moe._init_mega_moe_experts(
+        vllm_config=vllm_config, config=config, prefix="model.layers.3.ffn"
+    )
+    expected = (
+        harness.flashinfer if flashinfer else harness.ppu if ppu else harness.native
+    )
+    assert type(moe.experts) is expected
+    assert moe.experts.vllm_config is vllm_config
+    kwargs = dict(
+        num_experts=12,
+        num_local_experts=6,
+        experts_start_idx=6,
+        num_logical_experts=4,
+        top_k=2,
+        hidden_size=512,
+        intermediate_size=128,
+        num_shared_experts=2 if native_fusion and not ppu and not flashinfer else 0,
+        prefix="model.layers.3.ffn.experts",
+    )
+    if flashinfer:
+        kwargs["activation_clamp"] = 7.0
+    assert moe.experts.kwargs == kwargs
+    assert moe.shared_experts is shared
+    assert moe.ep_group is harness.group
+    assert (moe.n_local_experts, moe.experts_start_idx, moe.experts_end_idx) == (
+        6,
+        6,
+        12,
+    )
+    assert harness.model.DeepseekV4MegaMoEExperts is harness.native
+    assert harness.fi.DeepseekV4MegaMoEExperts is harness.native
+    assert harness.fi.DeepseekV4MegaMoEExpertsFI is harness.flashinfer
+    assert harness.flashinfer.__bases__ == (harness.native,)
+    marker = getattr(moe._init_mega_moe_experts, harness.patch.PATCH_MARKER)
+    target = f"{_MEGAMOE_MODEL}.DeepseekV4MoE._init_mega_moe_experts"
+    assert marker[target] is harness.original_init
+
+
+def test_megamoe_gate_routes_only_ppu_and_delegates_cuda_unchanged(megamoe_patch):
+    harness = megamoe_patch
+    args = (object(), object(), 2)
+    kwargs = dict(
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=1.5,
+        ep_rank=1,
+        bias=object(),
+        image_bias=object(),
+        image_token_mask=object(),
+        fix_routing_mask=object(),
+        unmapped_topk_idx=object(),
+    )
+    assert harness.provider.bf16_mega_gate is harness.patch.route_experts
+    marker = getattr(harness.provider.bf16_mega_gate, harness.patch.PATCH_MARKER)
+    assert marker["vllm.utils.deep_gemm.bf16_mega_gate"] is harness.original_gate
+    for ppu in (True, False, True):
+        harness.platform.ppu = ppu
+        name = "ppu" if ppu else "native"
+        harness.calls.clear()
+        assert harness.provider.bf16_mega_gate(*args, **kwargs) is harness.outputs[name]
+        assert harness.calls == [(name, args, kwargs)]
+
+
+def test_megamoe_inherits_native_expert_mapping_and_eplb_interfaces():
+    for path in (_MEGAMOE_IMPL, _MEGAMOE_PATCH):
+        imports = {
+            (node.module, alias.name, alias.asname)
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        assert (_MEGAMOE_MODEL, "DeepseekV4MegaMoEExperts", None) in imports
+    local = definition(_MEGAMOE_IMPL, _MEGAMOE_CLASS)
+    assert [ast.unparse(base) for base in local.bases] == ["DeepseekV4MegaMoEExperts"]
+    local_methods = {
+        node.name for node in local.body if isinstance(node, ast.FunctionDef)
+    }
+    assert not local_methods.intersection(
+        {
+            "_map_global_expert_id",
+            "set_eplb_state",
+            "get_expert_weights",
+            "update_expert_map",
+            "has_fused_shared_experts",
+            "layer_id",
+        }
+    )
+
+
+@pytest.mark.upstream_source
+def test_megamoe_targets_and_inherited_interfaces_exist_in_v031(upstream_source_root):
+    upstream_model = upstream_source_root / "vllm/models/deepseek_v4/nvidia/model.py"
+    for name in (
+        "_map_global_expert_id",
+        "set_eplb_state",
+        "get_expert_weights",
+        "update_expert_map",
+        "has_fused_shared_experts",
+        "layer_id",
+    ):
+        definition(upstream_model, f"DeepseekV4MegaMoEExperts.{name}")
+    definition(upstream_model, "DeepseekV4MoE._init_mega_moe_experts")
+    definition(
+        upstream_source_root / "vllm/models/deepseek_v4/nvidia/fi_moe.py",
+        "DeepseekV4MegaMoEExpertsFI",
+    )
+    gate_path = upstream_source_root / "vllm/utils/deep_gemm.py"
+    if not gate_path.is_file():
+        gate_path = upstream_source_root / "vllm/utils/deep_gemm/__init__.py"
+    definition(gate_path, "bf16_mega_gate")
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "method",
+    [
+        "__init__",
+        "forward",
+        "weight_loader",
+        "finalize_weights",
+        "_init_mega_moe_experts",
+    ],
+)
+def test_megamoe_signatures_accept_upstream_keywords(upstream_source_root, method):
+    selector = method == "_init_mega_moe_experts"
+    upstream_class = "DeepseekV4MoE" if selector else "DeepseekV4MegaMoEExperts"
+    upstream = function(
+        upstream_source_root / "vllm/models/deepseek_v4/nvidia/model.py",
+        f"{upstream_class}.{method}",
+        {},
+    )
+    local = function(
+        _MEGAMOE_PATCH if selector else _MEGAMOE_IMPL,
+        method if selector else f"{_MEGAMOE_CLASS}.{method}",
+        {},
+    )
+    offered = inspect.signature(upstream)
+    accepted = inspect.signature(local)
+    keyword_kinds = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    for include_defaults in (False, True):
+        kwargs = {
+            name: object()
+            for name, param in offered.parameters.items()
+            if param.kind in keyword_kinds
+            and (include_defaults or param.default is inspect.Parameter.empty)
+        }
+        accepted.bind(**kwargs)
+    for kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+        if any(param.kind == kind for param in offered.parameters.values()):
+            assert any(param.kind == kind for param in accepted.parameters.values())
+
+
+@pytest.fixture
+def megamoe_loader():
+    loader = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.weight_loader", {})
+
+    def prepare(local_ids):
+        mapped, indexed, loaded = [], [], []
+        slots = {slot: object() for slot in local_ids}
+
+        class Data:
+            def __getitem__(self, slot):
+                indexed.append(slot)
+                return slots[slot]
+
+        def map_expert(expert_id):
+            mapped.append(expert_id)
+            return local_ids
+
+        expert = SimpleNamespace(
+            _map_global_expert_id=map_expert,
+            _load_weight=lambda *args: loaded.append(args),
+        )
+        return SimpleNamespace(
+            loader=loader,
+            expert=expert,
+            param=SimpleNamespace(data=Data()),
+            mapped=mapped,
+            indexed=indexed,
+            loaded=loaded,
+            slots=slots,
+        )
+
+    return prepare
+
+
+@pytest.mark.parametrize("shard_id", ["w1", "w3", "w2"])
+@pytest.mark.parametrize("is_scale", [False, True])
+@pytest.mark.parametrize("local_ids", [(0, 4), ()], ids=["replicas", "nonlocal"])
+@pytest.mark.parametrize("return_success", [False, None, True])
+def test_megamoe_weight_loader_routes_replicas_and_skips_nonlocal(
+    megamoe_loader, shard_id, is_scale, local_ids, return_success
+):
+    harness = megamoe_loader(local_ids)
+    bank = "w2" if shard_id == "w2" else "w13"
+    weight_name = f"model.layers.3.ffn.experts.{bank}_weight"
+    if is_scale:
+        weight_name += "_scale"
+    source = object()
+    result = harness.loader(
+        harness.expert,
+        param=harness.param,
+        loaded_weight=source,
+        weight_name=weight_name,
+        shard_id=shard_id,
+        expert_id=2,
+        return_success=return_success,
+    )
+    assert result is (bool(local_ids) if return_success else None)
+    assert harness.mapped == [2]
+    assert harness.indexed == list(local_ids)
+    assert harness.loaded == [
+        (harness.slots[slot], source, shard_id, is_scale) for slot in local_ids
+    ]
+
+
+@pytest.mark.parametrize(
+    "shard_id,wrong_bank", [("w1", "w2"), ("w3", "w2"), ("w2", "w13")]
+)
+@pytest.mark.parametrize("return_success", [False, True])
+def test_megamoe_weight_loader_skips_mismatched_parameter_bank(
+    megamoe_loader, shard_id, wrong_bank, return_success
+):
+    harness = megamoe_loader((0, 4))
+    result = harness.loader(
+        harness.expert,
+        harness.param,
+        object(),
+        f"{wrong_bank}_weight",
+        shard_id,
+        2,
+        return_success=return_success,
+    )
+    assert result is (False if return_success else None)
+    assert harness.indexed == harness.loaded == []
+
+
+def test_megamoe_weight_loader_defaults_to_none_and_rejects_unknown_shards(
+    megamoe_loader,
+):
+    harness = megamoe_loader((0,))
+    result = harness.loader(
+        harness.expert, harness.param, object(), "w2_weight", "w2", 2
+    )
+    assert result is None
+    assert harness.indexed == [0]
+    harness.indexed.clear()
+    harness.loaded.clear()
+    with pytest.raises(ValueError, match="Unsupported expert shard id"):
+        harness.loader(harness.expert, harness.param, object(), "w13_weight", "w9", 2)
+    assert harness.indexed == harness.loaded == []
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "start,end,logical_id,local_ids",
+    [(6, 12, 2, (0, 4)), (6, 12, 0, (2,)), (8, 10, 2, ())],
+    ids=["redundant-replicas", "offset-slot", "nonlocal"],
+)
+def test_megamoe_weight_loader_uses_upstream_logical_to_physical_map(
+    megamoe_loader, upstream_source_root, start, end, logical_id, local_ids
+):
+    harness = megamoe_loader(local_ids)
+    mapping = function(
+        upstream_source_root / "vllm/models/deepseek_v4/nvidia/model.py",
+        "DeepseekV4MegaMoEExperts._map_global_expert_id",
+        {},
+    )
+    harness.expert.__dict__.update(
+        experts_start_idx=start, experts_end_idx=end, num_logical_experts=4
+    )
+    harness.expert._map_global_expert_id = lambda expert_id: mapping(
+        harness.expert, expert_id
+    )
+    source = object()
+    result = harness.loader(
+        harness.expert,
+        harness.param,
+        source,
+        "w13_weight",
+        "w1",
+        logical_id,
+        return_success=True,
+    )
+    assert result is bool(local_ids)
+    assert harness.indexed == list(local_ids)
+    assert harness.loaded == [
+        (harness.slots[slot], source, "w1", False) for slot in local_ids
+    ]
+
+
+@pytest.mark.parametrize("shared_experts", [None, object()])
+def test_megamoe_finalize_reuses_loader_storage_and_checks_runtime_once(shared_experts):
+    calls = []
+    l1, l2 = (object(), object()), (object(), object())
+    expert = SimpleNamespace(
+        l1_weights=l1,
+        l2_weights=l2,
+        num_shared_experts=0,
+        _transformed_l1_weights=None,
+        _transformed_l2_weights=None,
+        _transformed_shared_l1_weights=None,
+        _transformed_shared_l2_weights=None,
+        _check_runtime_supported=lambda: calls.append("check"),
+    )
+    finalize = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.finalize_weights", {})
+    for _ in range(2):
+        assert finalize(expert, shared_experts=shared_experts) is None
+        assert expert._transformed_l1_weights is l1
+        assert expert._transformed_l2_weights is l2
+        assert expert._transformed_shared_l1_weights is None
+        assert expert._transformed_shared_l2_weights is None
+    assert calls == ["check"]
+
+
+@pytest.fixture
+def megamoe_api_module(monkeypatch):
+    calls = []
+    original_import = importlib.import_module
+
+    def import_module(name, *args, **kwargs):
+        if name == "deep_gemm.mega":
+            calls.append(name)
+            raise ImportError("DeepGEMM is not installed")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    for name in ("deep_gemm", "torch", "vllm"):
+        monkeypatch.setitem(sys.modules, name, None)
+    module = load_patch(_MEGAMOE_API)
+    assert calls == []
+    return module, calls
+
+
+def test_megamoe_api_import_is_lazy_and_reports_missing_package(megamoe_api_module):
+    module, calls = megamoe_api_module
+    with pytest.raises(
+        RuntimeError, match=r"DeepGEMM-for-sail.*deep_gemm\.mega"
+    ) as error:
+        module.mega_moe_api()
+    assert isinstance(error.value.__cause__, ImportError)
+    assert calls == ["deep_gemm.mega"]
+
+
+@pytest.mark.parametrize("missing", _MEGAMOE_REQUIRED)
+@pytest.mark.parametrize("noncallable", [False, True], ids=["absent", "noncallable"])
+def test_megamoe_api_reports_missing_required_functions_and_allows_retry(
+    megamoe_api_module, monkeypatch, missing, noncallable
+):
+    module, calls = megamoe_api_module
+    api = SimpleNamespace(**{name: lambda: None for name in _MEGAMOE_REQUIRED})
+    if noncallable:
+        setattr(api, missing, object())
+    else:
+        delattr(api, missing)
+
+    def import_module(name):
+        calls.append(name)
+        return api
+
+    monkeypatch.setattr(
+        module, "importlib", SimpleNamespace(import_module=import_module)
+    )
+    with pytest.raises(RuntimeError) as error:
+        module.mega_moe_api()
+    assert str(error.value) == f"PPU MegaMoE API is missing: {missing}"
+    setattr(api, missing, lambda: None)
+    assert module.mega_moe_api() is api
+    assert module.mega_moe_api() is api
+    assert calls == ["deep_gemm.mega", "deep_gemm.mega"]
+
+
+def test_megamoe_api_reports_all_missing_functions(megamoe_api_module, monkeypatch):
+    module, _ = megamoe_api_module
+    monkeypatch.setattr(
+        module, "importlib", SimpleNamespace(import_module=lambda _: SimpleNamespace())
+    )
+    with pytest.raises(RuntimeError) as error:
+        module.mega_moe_api()
+    missing = ", ".join(_MEGAMOE_REQUIRED)
+    assert str(error.value) == f"PPU MegaMoE API is missing: {missing}"
+
+
+@pytest.mark.parametrize(
+    "hidden,intermediate,supported",
+    [
+        (2048, 64, True),
+        (2560, 128, True),
+        (512, 128, False),
+        (2048, 0, False),
+        (2048, 96, False),
+        (2304, 128, False),
+    ],
+)
+def test_megamoe_geometry_matches_wheel_contract(
+    modules, monkeypatch, hidden, intermediate, supported
+):
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True,
+            has_device_capability=lambda capability, device_id: capability == 89,
+        ),
+    )
+    modules("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
+    module = load_patch(_MEGAMOE_API)
+    calls = []
+    monkeypatch.setattr(module, "mega_moe_api", lambda: calls.append("api"))
+    device = SimpleNamespace(index=0)
+    if supported:
+        module.check_mega_moe_supported(device, hidden, intermediate)
+        assert calls == ["api"]
+    else:
+        with pytest.raises(ValueError, match="H >= 2048.*I divisible by 64"):
+            module.check_mega_moe_supported(device, hidden, intermediate)
+        assert not calls

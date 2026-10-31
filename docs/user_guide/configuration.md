@@ -73,6 +73,32 @@ quantization and checkpoint-name mappings. These source adaptations still need
 device, model-load and inference verification; see the
 [verification guide](verification_guide.md).
 
+### MegaMoE
+
+On Zhenwu M890, select the native DeepSeek expert path explicitly:
+
+```bash
+vllm serve /path/to/deepseek-v41 \
+  --enable-expert-parallel --moe-backend deep_gemm_mega_moe
+```
+
+This requires a [DeepGEMM-for-sail](https://github.com/t-head/DeepGEMM-for-sail)
+build exposing `deep_gemm.mega.get_symm_buffer_for_mega_moe`,
+`mega_moe_pre_dispatch` and `fp4_fp4_mega_moe`. The adapter targets the
+`mxf4xmxf4` API with int32 expert IDs and named `sym_buffer` dispatch.
+Package/API discovery is not device-validation evidence.
+
+SAIL uses W4A4 MXFP4 dispatch, raw UE8M0 expert scales and BF16 outputs. Native
+expert-parallel routing/EPLB remain in vLLM; shared experts use their separate
+MLP. The current adapter supports MXFP4 routed experts, standard SwiGLU and the
+upstream normalized sqrtsoftplus/hash/image routes. It requires hidden size
+at least 2048 and divisible by 512, with expert intermediate size divisible by
+64. The unavailable SM100 MegaGate is replaced by an FP32 routing calculation
+on PPU.
+
+`VLLM_SAIL_MOE_BACKEND=deepgemm` continues to select the ordinary PPU DeepGEMM
+expert backend. Use the CLI selection above for MegaMoE.
+
 ## Compatibility controls
 
 | Variable | Default | Behavior |
