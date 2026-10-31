@@ -73,6 +73,19 @@ quantization and checkpoint-name mappings. These source adaptations still need
 device, model-load and inference verification; see the
 [verification guide](verification_guide.md).
 
+### MegaMHC
+
+Set `VLLM_SAIL_DEEPSEEK_V41_MEGA_MHC=1` to request SAIL's fused shifted
+post/pre/RMSNorm boundary. It defaults to `0`, accepts the corresponding
+`VLLM_PPU_*` alias, and requires Zhenwu M890, the optional `deep_gemm.mega_mhc`
+API, hidden size 5120 and four residual streams. BF16 input/output and the
+preceding sublayer's pre-mix are preserved. Auxiliary-state capture, missing
+APIs and unsupported tensor layouts retain delayed mHC.
+
+Warm each execution stream eagerly before graph capture so DeepGEMM can
+initialize its per-stream workspace. Launch errors propagate without retrying
+against partially modified output.
+
 ## Compatibility controls
 
 | Variable | Default | Behavior |
