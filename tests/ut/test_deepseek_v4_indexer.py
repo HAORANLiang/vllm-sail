@@ -16,8 +16,16 @@ from tests.support.source import assert_accepts_upstream_keywords
 
 ROOT = Path(__file__).parents[2]
 BASE = "vllm.models.deepseek_v4"
+V41_BASE = "vllm.models.deepseek_v41"
 Q_PROVIDER = f"{BASE}.common.ops.fused_indexer_q"
 K_PROVIDER = f"{BASE}.common.ops.fused_compress_quant_cache"
+Q_CONSUMERS = (
+    Q_PROVIDER,
+    f"{BASE}.common.ops",
+    f"{BASE}.attention",
+    f"{V41_BASE}.common.ops",
+    f"{V41_BASE}.attention",
+)
 OPS = "vllm_sail.models.deepseek_v4.ops.indexer"
 
 
@@ -92,9 +100,8 @@ def installed(monkeypatch, patch_utils_module):
         calls.append(("int8_k", args, kwargs))
         return "int8_k"
 
-    module(Q_PROVIDER, fused_indexer_q_rope_quant=upstream_q)
-    module(f"{BASE}.common.ops", fused_indexer_q_rope_quant=upstream_q)
-    module(f"{BASE}.attention", fused_indexer_q_rope_quant=upstream_q)
+    for consumer in Q_CONSUMERS:
+        module(consumer, fused_indexer_q_rope_quant=upstream_q)
     module(K_PROVIDER, compress_norm_rope_store_triton=upstream_k)
     module(f"{BASE}.compressor", compress_norm_rope_store_triton=upstream_k)
     module(
@@ -115,25 +122,25 @@ def installed(monkeypatch, patch_utils_module):
     return platform, modules, calls, patched
 
 
-@pytest.mark.parametrize(
-    "consumer", [Q_PROVIDER, f"{BASE}.common.ops", f"{BASE}.attention"]
-)
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
 def test_ppu10_query_bypasses_unsupported_fp8_kernel(installed, consumer):
-    _, modules, calls, _ = installed
-    assert modules[consumer].fused_indexer_q_rope_quant(*range(6)) == "int8_q"
-    assert calls[-1][2] == {"output_buffers": None}
+    _, modules, calls, patched = installed
+    query = modules[consumer].fused_indexer_q_rope_quant
+    assert query is patched.fused_indexer_q_rope_quant
+    assert query(*range(6)) == "int8_q"
+    assert calls == [("int8_q", tuple(range(6)), {"output_buffers": None})]
 
 
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
 @pytest.mark.parametrize("buffers", [None, (object(), object())])
-def test_attention_alias_forwards_int8_output_buffers(installed, buffers):
+def test_attention_alias_forwards_int8_output_buffers(installed, consumer, buffers):
     _, modules, calls, _ = installed
-    modules[f"{BASE}.attention"].fused_indexer_q_rope_quant(
-        *range(6), output_buffers=buffers
-    )
+    modules[consumer].fused_indexer_q_rope_quant(*range(6), output_buffers=buffers)
     assert calls[-1][0] == "int8_q"
     assert calls[-1][2]["output_buffers"] is buffers
 
 
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
 @pytest.mark.parametrize(
     "ppu,capability,use_fp4",
     [
@@ -142,24 +149,23 @@ def test_attention_alias_forwards_int8_output_buffers(installed, buffers):
         (True, (8, 0), True),
     ],
 )
-def test_other_query_paths_delegate(installed, ppu, capability, use_fp4):
+def test_other_query_paths_delegate(installed, consumer, ppu, capability, use_fp4):
     platform, modules, calls, _ = installed
     platform.ppu, platform.capability = ppu, capability
     assert (
-        modules[f"{BASE}.attention"].fused_indexer_q_rope_quant(
-            *range(6), use_fp4=use_fp4
-        )
+        modules[consumer].fused_indexer_q_rope_quant(*range(6), use_fp4=use_fp4)
         == "upstream_q"
     )
-    assert calls[-1][2] == {
-        "use_fp4": use_fp4,
-        "weights_out_dtype": "float32",
-    }
+    assert calls == [
+        (
+            "upstream_q",
+            tuple(range(6)),
+            {"use_fp4": use_fp4, "weights_out_dtype": "float32"},
+        )
+    ]
 
 
-@pytest.mark.parametrize(
-    "consumer", [Q_PROVIDER, f"{BASE}.common.ops", f"{BASE}.attention"]
-)
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
 @pytest.mark.parametrize(
     "ppu,capability,use_fp4",
     [(False, (8, 0), False), (True, (8, 9), False), (True, (8, 0), True)],
@@ -181,18 +187,20 @@ def test_delegated_query_rejects_output_buffers(
     }
 
 
-def test_fp4_query_forwards_scoring_weights_dtype(installed):
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
+def test_fp4_query_forwards_scoring_weights_dtype(installed, consumer):
     _, modules, calls, _ = installed
-    modules[Q_PROVIDER].fused_indexer_q_rope_quant(
+    modules[consumer].fused_indexer_q_rope_quant(
         *range(6), use_fp4=True, weights_out_dtype="bfloat16"
     )
     assert calls[-1][2]["weights_out_dtype"] == "bfloat16"
 
 
-def test_int8_query_requires_float32_scoring_weights(installed):
+@pytest.mark.parametrize("consumer", Q_CONSUMERS)
+def test_int8_query_requires_float32_scoring_weights(installed, consumer):
     _, modules, calls, _ = installed
     with pytest.raises(AssertionError):
-        modules[Q_PROVIDER].fused_indexer_q_rope_quant(
+        modules[consumer].fused_indexer_q_rope_quant(
             *range(6), weights_out_dtype="bfloat16"
         )
     assert not calls
@@ -220,19 +228,22 @@ def test_compressed_keys_match_the_int8_query_path(
     assert calls[-1][1] == tuple(args)
 
 
-def test_rebinding_is_idempotent_and_preserves_other_overrides(installed):
+@pytest.mark.parametrize("consumer", Q_CONSUMERS[1:])
+def test_rebinding_is_idempotent_and_preserves_other_overrides(installed, consumer):
     _, modules, _, patched = installed
 
     def replacement():
         return None
 
-    modules[f"{BASE}.attention"].fused_indexer_q_rope_quant = replacement
+    modules[consumer].fused_indexer_q_rope_quant = replacement
     patched._rebind_indexer_aliases()
     patched._rebind_indexer_aliases()
-    assert modules[f"{BASE}.attention"].fused_indexer_q_rope_quant is replacement
-    assert modules[f"{BASE}.common.ops"].fused_indexer_q_rope_quant is (
-        modules[Q_PROVIDER].fused_indexer_q_rope_quant
-    )
+    assert modules[consumer].fused_indexer_q_rope_quant is replacement
+    for other in Q_CONSUMERS:
+        if other != consumer:
+            assert modules[other].fused_indexer_q_rope_quant is (
+                patched.fused_indexer_q_rope_quant
+            )
 
 
 def test_consumer_inventory_and_signatures_match_vllm_source(installed):
@@ -245,7 +256,12 @@ def test_consumer_inventory_and_signatures_match_vllm_source(installed):
         # The fixture intentionally stubs vLLM; source validation is opt-in here.
         pytest.skip("set VLLM_SOURCE_ROOT to a vLLM checkout for source validation")
     discovered = {name: set() for name in patched._INDEXER_ALIAS_CONSUMERS}
-    for path in (vllm_root / "models/deepseek_v4").rglob("*.py"):
+    paths = (
+        path
+        for model in ("deepseek_v4", "deepseek_v41")
+        for path in (vllm_root / "models" / model).rglob("*.py")
+    )
+    for path in paths:
         parts = path.relative_to(vllm_root).with_suffix("").parts
         is_package = parts[-1] == "__init__"
         module = ".".join(("vllm", *(parts[:-1] if is_package else parts)))
@@ -256,7 +272,12 @@ def test_consumer_inventory_and_signatures_match_vllm_source(installed):
             provider = importlib.util.resolve_name(
                 "." * node.level + (node.module or ""), package
             )
-            if provider not in (Q_PROVIDER, K_PROVIDER, f"{BASE}.common.ops"):
+            if provider not in (
+                Q_PROVIDER,
+                K_PROVIDER,
+                f"{BASE}.common.ops",
+                f"{V41_BASE}.common.ops",
+            ):
                 continue
             for alias in node.names:
                 if alias.name in discovered:

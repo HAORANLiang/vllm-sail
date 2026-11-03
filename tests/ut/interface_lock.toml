@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 274
+target_count = 275
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -1624,6 +1624,14 @@ module = "vllm/models/deepseek_v4/nvidia/model.py"
 symbol = "_select_dsv4_attn_cls"
 present = true
 fingerprint = "sha256:cd9f420e339d3b9ab68d87165c2a97f241aedc28639e1be8e2606fdd8a69cbdb"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v41.attention.DeepseekV4Indexer.__init__"
+kind = "class"
+module = "vllm/models/deepseek_v41/attention.py"
+symbol = "DeepseekV4Indexer.__init__"
+present = true
+fingerprint = "sha256:8fb800a55761172913a1d59630b24b2a0a53b90ce2fd75abc41df557b84b2a13"
 
 [[patch_target]]
 name = "vllm.models.deepseek_v41.attention.DeepseekV4IndexerCache.get_kv_cache_spec"

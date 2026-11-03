@@ -65,6 +65,14 @@ unsupported-op stub. Its fused MTP kernel applies only to eligible batches;
 other batches use the existing Triton path. The new HGGC port still requires
 native build and device correctness verification before deployment.
 
+## DeepSeek V4.1
+
+The v0.31 integration retains upstream V4.1 target/DSpark execution, shared KV
+and index metadata, and adds PPU attention, delayed mHC, channelwise dense/Engram
+quantization and checkpoint-name mappings. These source adaptations still need
+device, model-load and inference verification; see the
+[verification guide](verification_guide.md).
+
 ## Compatibility controls
 
 | Variable | Default | Behavior |

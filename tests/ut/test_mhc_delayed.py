@@ -85,12 +85,14 @@ def delayed(modules):
     provider = modules("vllm.model_executor.kernels.mhc.tilelang", **originals)
     consumer = modules("vllm.models.deepseek_v41.nvidia.model", **originals)
     mega = modules("vllm.models.deepseek_v41.nvidia.ops.mega_mhc", **originals)
+    mhc = modules("vllm.models.deepseek_v41.nvidia.ops.mhc", **originals)
     patch = load_patch(PATH)
     return SimpleNamespace(
         patch=patch,
         provider=provider,
         consumer=consumer,
         mega=mega,
+        mhc=mhc,
         originals=originals,
         calls=calls,
         platform=platform,
@@ -98,19 +100,31 @@ def delayed(modules):
 
 
 def test_delayed_aliases_and_double_install_guard(delayed):
-    for name, consumer in zip(NAMES, (delayed.consumer, delayed.mega), strict=True):
+    consumers = (
+        (NAMES[0], delayed.consumer),
+        (NAMES[1], delayed.mega),
+        (NAMES[1], delayed.mhc),
+    )
+    for name, consumer in consumers:
         replacement = getattr(delayed.patch, name)
         assert getattr(delayed.provider, name) is replacement
         assert getattr(consumer, name) is replacement
         marker = getattr(replacement, delayed.patch.PATCH_MARKER)
         assert marker[f"{delayed.patch._MODULE}.{name}"] is delayed.originals[name]
+        assert marker[f"{consumer.__name__}.{name}"] is delayed.originals[name]
     delayed.patch._rebind_delayed_aliases()
-    delayed.consumer.mhc_pre_delayed_tilelang = object()
     delayed.patch._rebind_delayed_aliases()
-    assert (
-        delayed.consumer.mhc_pre_delayed_tilelang
-        is not delayed.patch.mhc_pre_delayed_tilelang
-    )
+    for name, consumer in consumers:
+        assert getattr(consumer, name) is getattr(delayed.patch, name)
+        override = object()
+        setattr(consumer, name, override)
+        delayed.patch._rebind_delayed_aliases()
+        assert getattr(consumer, name) is override
+        assert getattr(delayed.provider, name) is getattr(delayed.patch, name)
+    # Same-named attributes outside the consumer list are not rebound.
+    assert getattr(delayed.consumer, NAMES[1]) is delayed.originals[NAMES[1]]
+    for consumer in (delayed.mega, delayed.mhc):
+        assert getattr(consumer, NAMES[0]) is delayed.originals[NAMES[0]]
     with pytest.raises(RuntimeError, match="already patched"):
         load_patch(PATH)
 

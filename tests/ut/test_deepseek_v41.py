@@ -408,7 +408,17 @@ def test_v41_selector_preserves_cuda_and_other_backends(modules):
 def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     modules, dequant_at_load
 ):
-    calls = []
+    calls, hook_calls = [], []
+    projected, output = object(), object()
+
+    def wo_b_proj(value):
+        hook_calls.append(value)
+        return output
+
+    def helper(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[4](projected)
+
     loaded = SimpleNamespace(element_size=lambda: 2 if dequant_at_load else 1)
     bf16 = loaded if dequant_at_load else object()
     modules(
@@ -417,7 +427,7 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     )
     modules(
         "vllm.models.deepseek_v4.nvidia.ops.o_proj",
-        deep_gemm_fp8_o_proj=lambda *args, **kwargs: calls.append((args, kwargs)),
+        deep_gemm_fp8_o_proj=helper,
     )
 
     class Upstream:
@@ -435,6 +445,7 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         _o_proj_block_size=32,
         wo_a=SimpleNamespace(weight=loaded, weight_scale=object()),
         wo_b=object(),
+        _wo_b_proj=wo_b_proj,
         rotary_emb=SimpleNamespace(cos_sin_cache=object()),
         n_local_groups=2,
         n_local_heads=16,
@@ -443,13 +454,92 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         o_lora_rank=1024,
     )
     o, pos = object(), object()
-    attn._o_proj(o, pos)
-    args, kwargs = calls.pop()
-    assert args[:2] == (o, pos) and args[3].weight is bf16 and args[4] is attn.wo_b
+    assert attn._o_proj(o, pos) is output
+    assert hook_calls == [projected]
+    ((args, kwargs),) = calls
+    assert args[:2] == (o, pos) and args[3].weight is bf16
+    assert args[4] is attn._wo_b_proj
     assert kwargs["heads_per_group"] == 8 and kwargs["einsum_recipe"] == (1, 1, 32)
     assert attn.wo_a.weight is loaded
     assert attn.forward_mqa is Upstream.forward_mqa
     assert attn._forward_prefill is Upstream._forward_prefill
+
+
+@pytest.mark.parametrize("has_hook", [False, True])
+@pytest.mark.parametrize("quantization", ["int8", "channelwise_fp8", "block_fp8"])
+def test_v4_projection_uses_hook_or_raw_layer_once(quantization, has_hook):
+    helper_calls, projection_calls = [], []
+    projected, raw_output, hook_output = object(), object(), object()
+
+    def raw_layer(value):
+        projection_calls.append(("raw", value))
+        return raw_output
+
+    def hook(value):
+        projection_calls.append(("hook", value))
+        return hook_output
+
+    def helper(kind):
+        def call(*args, **kwargs):
+            helper_calls.append((kind, args, kwargs))
+            return args[4](projected)
+
+        return call
+
+    project = function(
+        "vllm_sail/models/deepseek_v4/flashmla.py",
+        "DeepseekV4FlashMLAAttention._o_proj",
+        {
+            "torch": SimpleNamespace(int8="int8", float8_e4m3fn="fp8"),
+            "deep_gemm_int8_o_proj": helper("int8"),
+            "deep_gemm_fp8_channel_o_proj": helper("channelwise_fp8"),
+            "deep_gemm_fp8_o_proj": helper("block_fp8"),
+        },
+    )
+    wo_a = SimpleNamespace(
+        weight=SimpleNamespace(dtype="int8" if quantization == "int8" else "fp8")
+    )
+    if quantization == "block_fp8":
+        wo_a.weight_scale_inv = object()
+    else:
+        wo_a.weight_scale = object()
+    attn = SimpleNamespace(
+        wo_a=wo_a,
+        wo_b=raw_layer,
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=16,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+        _einsum_recipe=(1, 128, 128),
+        _tma_aligned_scales=False,
+    )
+    if has_hook:
+        attn._wo_b_proj = hook
+    o, positions = object(), object()
+    assert project(attn, o, positions) is (hook_output if has_hook else raw_output)
+    assert projection_calls == [("hook" if has_hook else "raw", projected)]
+    ((kind, args, kwargs),) = helper_calls
+    assert kind == quantization
+    assert args == (
+        o,
+        positions,
+        attn.rotary_emb.cos_sin_cache,
+        wo_a,
+        hook if has_hook else raw_layer,
+    )
+    expected = {
+        "n_groups": 2,
+        "heads_per_group": 8,
+        "nope_dim": 448,
+        "rope_dim": 64,
+        "o_lora_rank": 1024,
+        "einsum_recipe": attn._einsum_recipe,
+    }
+    if quantization == "block_fp8":
+        expected["tma_aligned_scales"] = attn._tma_aligned_scales
+    assert kwargs == expected
 
 
 def test_v41_draft_inherits_its_own_loader_and_execution(modules):

@@ -12,6 +12,21 @@ from vllm_sail.patch.utils import patch
 _cache_spec = attention.DeepseekV4IndexerCache.get_kv_cache_spec
 _kernel_sizes = DeepseekV41IndexerBackend.get_supported_kernel_block_sizes
 _AFFECTED = ">=0.31.0,<0.32.0"
+_indexer_init = attention.DeepseekV4Indexer.__init__
+
+
+@patch(
+    "vllm.models.deepseek_v41.attention",
+    "DeepseekV4Indexer.__init__",
+    reason="SAIL paged logits metadata needs the V4.1 query head count and head dimension.",
+    affected_versions=_AFFECTED,
+    remove_when="The upstream V4.1 indexer publishes query dimensions in its cache spec.",
+)
+def indexer_init(self, *args, **kwargs):
+    _indexer_init(self, *args, **kwargs)
+    if current_platform.is_ppu():
+        self.k_cache.n_head = self.n_head
+        self.k_cache.q_head_dim = self.head_dim
 
 
 @patch(
@@ -32,7 +47,11 @@ def get_kv_cache_spec(self, vllm_config):
         # splitting cannot represent the shared, padded BLHNC allocation.
         # Reset the old padding so MLAAttentionSpec recomputes its alignment.
         spec = replace(
-            spec, block_size=64 * self.compress_ratio, page_size_padded=None
+            spec,
+            block_size=64 * self.compress_ratio,
+            page_size_padded=None,
+            indexer_n_head=getattr(self, "n_head", None),
+            indexer_q_head_dim=getattr(self, "q_head_dim", None),
         )
     return spec
 
