@@ -43,6 +43,7 @@ EXPECTED_MODULES = {
     "deepseek_v41_engram",
     "deepseek_v41_indexer",
     "deepseek_v41_megamoe",
+    "deepseek_v41_mhc",
     "kimi_k3",
     "llama4",
     "moe_marlin_gate",
