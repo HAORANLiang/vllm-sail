@@ -217,6 +217,7 @@
   "vllm.models.glm5next.nvidia.sparse_indexer.SparseAttnIndexerKpool.forward_native": "23971144eab0af19a8f1c209c2989170303b96cb103121e939b7d56cad69b8b5",
   "vllm.models.glm5next.nvidia.sparse_indexer.SparseAttnIndexerKpool.forward_ppu": "additive",
   "vllm.models.glm5next.nvidia.sparse_indexer.has_cutedsl": "3a8a381051873fd39fb434d0d8d26f422dc1de6c9b42b8ba136a2a9862b57337",
+  "vllm.models.kimi_k3.common.dsa_cache.dsa_indexer_uses_fp4": "58cc6ae0808b0bc568789f98789295b53537b6e676fc4df18846760637b5038c",
   "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention.__init__": "f0b804b8c4e1907718b24de789e81607c7ade9008d316966d7de0ecd3d75b930",
   "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention._forward": "babb432be682b75264bfe68c7827c5d03d9d7af6cc51bb82528bd0c5cf8e3d0e",
   "vllm.models.kimi_k3.nvidia.kda.KimiK3DeltaAttention.get_kv_cache_spec": "21a8254738f92454860ea4b4ec26512d21b95b395c7c01e7e53190596c3aadf8",
