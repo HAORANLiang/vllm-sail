@@ -77,15 +77,6 @@ reason = "Logprob container/ranking logic, no device. Guards the sampling-output
 min_tests = 1
 
 [[entry]]
-id = "pooling_params"
-path = "tests/test_pooling_params.py"
-mode = "direct"
-chips = ["cpu", "810e", "890p"]
-category = "params"
-reason = "PoolingParams validation and protocol parsing; pure CPU data classes."
-min_tests = 1
-
-[[entry]]
 id = "sampling_params"
 path = "tests/test_sampling_params.py"
 mode = "direct"
@@ -208,6 +199,16 @@ min_tests = 1
 # (markers / -k / deselect / env) and records known xfails. Upstream source is
 # NEVER edited; all adaptation lives in the harness + adapted test module.
 # ---------------------------------------------------------------------------
+
+[[entry]]
+id = "pooling_params"
+path = "tests/test_pooling_params.py"
+mode = "adapted"
+chips = ["cpu", "810e", "890p"]
+category = "params"
+reason = "PoolingParams validation excluding the Snowflake embedding-dimension case; its offline model configuration is not provisioned."
+deselect = ["tests/test_pooling_params.py::test_embed_dimensions[model_info1]"]
+min_tests = 40
 
 [[entry]]
 id = "prefix_caching"

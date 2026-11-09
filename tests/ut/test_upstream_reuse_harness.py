@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -513,6 +514,40 @@ def test_strict_collection_minimum_is_retained():
         make_entry("tests/test_example.py", min_tests=3), passing_result()
     )
     assert error is not None and "expected at least 3" in error
+
+
+def test_pooling_reuse_excludes_only_the_snowflake_parameter(tmp_path):
+    entry = next(e for e in harness.load_manifest() if e.id == "pooling_params")
+    target = tmp_path / entry.path
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "import pytest\n"
+        '@pytest.mark.parametrize("model_info", [\n'
+        '    {"name": "intfloat/multilingual-e5-small"},\n'
+        '    {"name": "Snowflake/snowflake-arctic-embed-m-v1.5"},\n'
+        "])\n"
+        "def test_embed_dimensions(model_info):\n"
+        '    assert model_info["name"] == "intfloat/multilingual-e5-small"\n'
+        '@pytest.mark.parametrize("case", range(39))\n'
+        "def test_other_pooling_parameters(case):\n"
+        "    assert case >= 0\n"
+    )
+    runner = UpstreamRunner(tmp_path)
+    report = tmp_path / "report.xml"
+    result = subprocess.run(
+        runner.build_command(entry, report),
+        cwd=tmp_path,
+        env=runner.build_env(entry),
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert harness._parse_junit(report)[:4] == (40, 0, 0, 0)
+    assert entry.mode == "adapted"
+    assert entry.min_tests == 40
+    assert not entry.skip_reason
 
 
 def test_strict_allowed_skip_requires_node_reason_and_bounded_count():
