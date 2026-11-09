@@ -25,6 +25,7 @@ def upstream_constructor(
     """Strict external constructor contract; the registered adapter runs intact."""
     record_ctor(self, config, vllm_config, prefix, aux_stream, run_gemm_rs_ar)  # noqa: F821
     self.model_config = vllm_config.model_config
+    self.use_recoverssm = False
     self.local_num_heads = config.num_heads // 8
     self.head_dim = 128
     backend = resolve_kda_prefill_backend(  # noqa: F821
@@ -96,6 +97,18 @@ def kda_constructor(modules):
             def get_state_dtype(self):
                 return "bf16", "fp32"
 
+            def _recoverssm_verify(self, *args):
+                raise AssertionError("verify is not part of constructor test")
+
+        class MetadataBuilder:
+            def _get_recoverssm_context(self):
+                raise AssertionError("commit is not part of constructor test")
+
+        modules(
+            "vllm.models.kimi_k3.nvidia.kda_metadata",
+            KimiK3KDAMetadataBuilder=MetadataBuilder,
+            NULL_BLOCK_ID=0,
+        )
         provider = modules(
             "vllm.models.kimi_k3.nvidia.kda",
             KimiK3DeltaAttention=Attention,

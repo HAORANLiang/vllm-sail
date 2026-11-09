@@ -17,6 +17,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.kimi_k3.nvidia import kda as _kda
+from vllm.models.kimi_k3.nvidia import kda_metadata as _kda_metadata
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
@@ -29,6 +30,13 @@ _META = dict(
     reason="Kimi KDA must select PPU PLA kernels instead of NVIDIA FlashKDA/native decode.",
     affected_versions=">=0.32.0,<0.33.0",
     remove_when="Kimi KDA supports platform kernel registration for prefill and decode.",
+)
+_METADATA_MODULE = "vllm.models.kimi_k3.nvidia.kda_metadata"
+_REPLAY_META = dict(
+    reason="Kimi KDA RecoverSSM must run PLA replay verify/commit on PPU instead of "
+    "Triton RecoverSSM.",
+    affected_versions=">=0.32.0,<0.33.0",
+    remove_when="Kimi KDA RecoverSSM supports platform verify/commit registration.",
 )
 
 logger = _kda.logger
@@ -44,6 +52,15 @@ _upstream_flashkda_prefill = _kda._flashkda_prefill
 _upstream_forward = _kda.KimiK3DeltaAttention._forward
 _upstream_init = _kda.KimiK3DeltaAttention.__init__
 _upstream_get_kv_cache_spec = _kda.KimiK3DeltaAttention.get_kv_cache_spec
+_upstream_recoverssm_verify = _kda.KimiK3DeltaAttention._recoverssm_verify
+_upstream_get_recoverssm_context = (
+    _kda_metadata.KimiK3KDAMetadataBuilder._get_recoverssm_context
+)
+
+
+def _replay_conv_state_layout() -> str:
+    """PLA's name for the raw, untransposed layout of the conv state cache."""
+    return "DS" if is_conv_state_dim_first() else "SD"
 
 
 def is_fused_kda_decode_supported(
@@ -280,6 +297,7 @@ def _init(
     bind_body(_upstream_init, namespace)(
         self, config, vllm_config, prefix, aux_stream, run_gemm_rs_ar
     )
+    _bind_pla_replay(self, vllm_config)
     if not demoted_specs:
         return
     logger.info_once("PPU serves the FlashKDA prefill backend with the PLA kernel.")
@@ -289,6 +307,129 @@ def _init(
 
 
 patch(_MODULE, "KimiK3DeltaAttention.__init__", **_META)(_init)
+
+
+def _bind_pla_replay(self, vllm_config: VllmConfig) -> None:
+    """Give a RecoverSSM layer PLA replay records in place of upstream's.
+
+    PLA verify and commit share their own records, incompatible with
+    upstream's correction records, so the layer keeps exactly one set; the
+    metadata builder then picks the matching commit context.
+    """
+    self._pla_replay_records = None
+    if not self.use_recoverssm:
+        return
+    from vllm_sail.attention.pla_kda import get_pla_kda_replay
+
+    replay = get_pla_kda_replay()
+    conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()[:2]
+    if not (
+        replay is not None
+        and self.head_dim == 128
+        and self.conv_size == 4
+        and self.conv1d.bias is None
+        and self.conv1d.weight.dtype == torch.float32
+        and self.gate_lower_bound is not None
+        and 1 <= self.spec_query_len <= 32
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and conv_state_dtype == torch.bfloat16
+        and recurrent_state_dtype == torch.float32
+    ):
+        logger.info_once(
+            "PLA KDA replay cannot serve this layer; keeping Triton RecoverSSM."
+        )
+        return
+    self._pla_replay_records = replay.KDAReplayRecords.allocate(
+        vllm_config.scheduler_config.max_num_seqs,
+        self.local_num_heads,
+        self.spec_query_len,
+        self.conv1d.weight.device,
+    )
+    self.recoverssm_records = None
+
+
+def _recoverssm_verify(
+    self,
+    m: _kda.KimiK3KDAMetadata,
+    mixed_qkv: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    conv_weight: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    records = getattr(self, "_pla_replay_records", None)
+    if records is None:
+        return _upstream_recoverssm_verify(
+            self, m, mixed_qkv, raw_g, raw_beta, conv_weight, query_start_loc, out
+        )
+
+    from pla.decode.kda_replayssm_vllm import kda_replay_verify
+
+    logger.info_once("Using PLA KDA kernel: kda_replay_verify")
+    if out is None:
+        out = mixed_qkv.new_empty(
+            (1, mixed_qkv.shape[0], self.local_num_heads, self.head_dim)
+        )
+    # PLA reads the conv state in its cache layout and leaves it, like the
+    # checkpoint, unchanged; the commit after sampling folds the records in.
+    conv_state, state = self.kv_cache[:2]
+    kda_replay_verify(
+        mixed_qkv=mixed_qkv,
+        raw_g=raw_g[0].flatten(-2),
+        raw_beta=raw_beta[0],
+        conv_weight=conv_weight,
+        conv_state=conv_state,
+        checkpoint_state=state,
+        A_log=self.A_log,
+        dt_bias=self.dt_bias,
+        lower_bound=self.gate_lower_bound,
+        records=records,
+        query_start_loc=query_start_loc,
+        state_indices=m.spec_state_indices_tensor[: m.num_spec_decodes, 0],
+        conv_state_layout=_replay_conv_state_layout(),
+        out=out[0].flatten(-2),
+        null_block_id=_kda_metadata.NULL_BLOCK_ID,
+    )
+    return out
+
+
+patch(_MODULE, "KimiK3DeltaAttention._recoverssm_verify", **_REPLAY_META)(
+    _recoverssm_verify
+)
+
+
+@patch(
+    _METADATA_MODULE,
+    "KimiK3KDAMetadataBuilder._get_recoverssm_context",
+    **_REPLAY_META,
+)
+def _get_recoverssm_context(self):
+    if self.recoverssm_context is not None:
+        return self.recoverssm_context
+    forward_context = self.vllm_config.compilation_config.static_forward_context
+    layers = [forward_context[layer_name] for layer_name in self.layer_names]
+    replay = [
+        getattr(layer, "_pla_replay_records", None) is not None for layer in layers
+    ]
+    if not any(replay):
+        return _upstream_get_recoverssm_context(self)
+    if not all(replay):
+        # One commit serves the whole group, and the two record formats differ.
+        raise ValueError(
+            "KDA RecoverSSM layers must all use PLA replay or none of them"
+        )
+    from vllm_sail.attention.pla_kda import PLAKDAReplayCommitContext
+
+    logger.info_once("Using PLA KDA kernel: KDAReplayCommitContext")
+    self.recoverssm_context = PLAKDAReplayCommitContext.create(
+        layers,
+        spec_query_len=1 + self.vllm_config.num_speculative_tokens,
+        max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+        conv_state_layout=_replay_conv_state_layout(),
+        null_block_id=_kda_metadata.NULL_BLOCK_ID,
+    )
+    return self.recoverssm_context
 
 
 @patch(_MODULE, "KimiK3DeltaAttention.get_kv_cache_spec", **_META)
