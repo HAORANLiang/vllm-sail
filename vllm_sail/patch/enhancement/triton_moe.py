@@ -44,6 +44,8 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    A_is_sorted: bool = False,
+    C_is_sorted: bool = False,
     # PPU MODIFICATION: begin
     use_valu: bool = False,
     # PPU MODIFICATION: end
@@ -58,6 +60,11 @@ def invoke_fused_moe_triton_kernel(
     if topk_weights is not None and not topk_weights.is_contiguous():
         raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+    assert not (A_is_sorted or C_is_sorted) or sorted_token_ids is not None
+    # PPU MODIFICATION: begin
+    if A_is_sorted or C_is_sorted:
+        raise ValueError("The PPU fused MoE kernel has no sorted-activation path.")
+    # PPU MODIFICATION: end
 
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -93,10 +100,10 @@ def invoke_fused_moe_triton_kernel(
         assert B_scale is None
 
     M = A.size(0)
-    num_tokens = M * top_k
+    num_tokens = C.size(0) * C.size(1) if A_is_sorted else M * top_k
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)
-        if A.size(0) < config["BLOCK_SIZE_M"]:
+        if not A_is_sorted and A.size(0) < config["BLOCK_SIZE_M"]:
             # optimize for small batch_size.
             # We assume that top_ids of each token is unique,
             # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -440,19 +447,19 @@ def get_moe_configs(
     dtype: str | None,
     block_n: int | None = None,
     block_k: int | None = None,
+    down_moe: bool = False,
     # PPU MODIFICATION: begin
     use_moe_wna16_cuda: bool = False,
     # PPU MODIFICATION: end
 ) -> dict[int, Any] | None:
-    """
-    Return optimized configurations for the fused MoE kernel.
+    """Return optimized configurations for the fused MoE kernel.
 
     The return value will be a dictionary that maps an irregular grid of
     batch sizes to configurations of the fused_moe kernel. To evaluate the
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
+    A down-projection config is optional and uses a separate `_down.json` file.
     """
-
     # Avoid optimizing for the batch invariant case. Use default config
     if envs.VLLM_BATCH_INVARIANT:
         return None
@@ -463,6 +470,8 @@ def get_moe_configs(
     # PPU MODIFICATION: begin
     json_file_name = get_config_file_name(E, N, dtype, block_shape, use_moe_wna16_cuda)
     # PPU MODIFICATION: end
+    if down_moe:
+        json_file_name = json_file_name.removesuffix(".json") + "_down.json"
 
     config_file_paths = []
 
@@ -495,11 +504,12 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning_once(
-        "Using default MoE config. Performance might be sub-optimal! "
-        "Config file not found at %s",
-        ", ".join(config_file_paths),
-    )
+    if not down_moe:
+        logger.warning_once(
+            "Using default MoE config. Performance might be sub-optimal! "
+            "Config file not found at %s",
+            ", ".join(config_file_paths),
+        )
     return None
 
 

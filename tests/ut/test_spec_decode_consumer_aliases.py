@@ -41,7 +41,7 @@ def test_borrowed_bodies_keep_distinct_provider_globals_and_metadata():
 
     runner, sampler = ModuleType("runner"), ModuleType("sampler")
     for body, provider in (
-        (bodies.may_reinitialize_input_batch, runner),
+        (bodies.rejection_sample, runner),
         (bodies.rejection_sample, sampler),
     ):
         bound = bind_body(body, provider)

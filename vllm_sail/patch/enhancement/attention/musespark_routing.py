@@ -29,7 +29,7 @@ _META = dict(
 try:
     from vllm.models.muse_spark.common.ops import fused_routing as _provider
 
-    _original = _provider.fused_musespark1x_routing
+    _original = _provider.fused_muse_spark_routing
 except (ImportError, AttributeError) as exc:  # no compiled kernels / older vLLM
     _provider = None
     _unavailable = True
@@ -137,9 +137,9 @@ if not _unavailable:
     # validation and Triton call unchanged; only PPU dispatch reaches this body.
     _ppu_routing = bind_body(_routing_body, _provider)
 
-    @patch(_MODULE, 'fused_musespark1x_routing', **_META)
+    @patch(_MODULE, 'fused_muse_spark_routing', **_META)
     @functools.wraps(_original)
-    def fused_musespark1x_routing(*args, **kwargs):
+    def fused_muse_spark_routing(*args, **kwargs):
         if current_platform.is_ppu():
             return _ppu_routing(*args, **kwargs)
         return _original(*args, **kwargs)
@@ -153,8 +153,8 @@ if not _unavailable:
         _consumer = sys.modules.get(_name)
         if (
             _consumer is not None
-            and getattr(_consumer, 'fused_musespark1x_routing', None) is _original
+            and getattr(_consumer, 'fused_muse_spark_routing', None) is _original
         ):
-            patch(_name, 'fused_musespark1x_routing', **_META)(
-                fused_musespark1x_routing
+            patch(_name, 'fused_muse_spark_routing', **_META)(
+                fused_muse_spark_routing
             )

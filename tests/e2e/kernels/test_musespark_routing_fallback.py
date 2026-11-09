@@ -14,7 +14,7 @@ def test_musespark_ppu_routing_and_changed_input_graph(normalization):
 
     vllm_sail.register_out_of_tree()
     from vllm.models.muse_spark.common.ops.fused_routing import (
-        fused_musespark1x_routing,
+        fused_muse_spark_routing,
     )
 
     generator = torch.Generator().manual_seed(7321)
@@ -25,7 +25,7 @@ def test_musespark_ppu_routing_and_changed_input_graph(normalization):
     ids = torch.empty(4, 8, dtype=torch.int32, device="cuda")
 
     def run():
-        return fused_musespark1x_routing(
+        return fused_muse_spark_routing(
             logits,
             bias,
             8,

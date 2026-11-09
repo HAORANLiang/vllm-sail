@@ -7,10 +7,10 @@ Sources in vLLM:
 - vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py: rejection_sample
 
 Moved from SAIL main 3bdf760342984f7d0987f3d27e674a2fd4ddd5d6, including
-its draft-logits cache row-mapping support. The selected upstream pin is
-8b10bda57ceab3a741d2fb3718af48cef691023e. This records provenance, not runtime
-version selection. Retain the target-source body drift check when reviewing
-upgrades. Globals are supplied separately by bind_body.
+its draft-logits cache row-mapping support. The body is synced with the
+upstream pin 8db73f26c16afa748e9796e37d60f2e266ec281d. This records provenance,
+not runtime version selection. Retain the target-source body drift check when
+reviewing upgrades. Globals are supplied separately by bind_body.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ def rejection_sample(
     fly_window_size: int = 0,
     fly_entropy_threshold: float = 0.3,
     fly_entropy_top_k: int = 3,
+    skip_masked_vocab_blocks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     draft_logits = None
@@ -334,6 +335,7 @@ def rejection_sample(
         CONTEXT_WIDTH=context_width,
         WATERMARK=watermark,
         DEDUPLICATE_CONTEXTS=watermarking_skip_mask is not None,
+        SKIP_MASKED_BLOCKS=skip_masked_vocab_blocks,
     )
 
     # Insert the resampled tokens into the output sampled.
@@ -350,7 +352,9 @@ def rejection_sample(
         expanded_idx_mapping,
         temperature,
         PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        # PPU MODIFICATION: begin
         # Keep the PPU sampled-count update within one warp.
+        # PPU MODIFICATION: end
         num_warps=1,
     )
     return sampled, num_sampled
