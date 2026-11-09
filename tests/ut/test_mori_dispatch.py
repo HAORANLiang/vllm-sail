@@ -27,7 +27,8 @@ def check_dispatch(factory, case):
         use_deepep_ll_kernels=False,
         use_deepep_v2_kernels=False,
         use_moonep_kernels=False,
-        use_mori_kernels=True,
+        use_mori_epv2_kernels=False,
+        use_mori_epv1_kernels=True,
         hidden_dim=4096,
         in_dtype="bf16",
         max_num_tokens=256,
@@ -94,6 +95,74 @@ def test_copied_factory_preserves_dispatch_buffer_contract(case):
     )
 
 
+def check_epv2(factory, num_experts):
+    buffers, constructors = [], []
+    handle, expected = object(), object()
+    moe = NS(
+        moe_parallel_config=NS(use_passthrough_all2all=False, use_all2all_kernels=True),
+        use_deepep_ht_kernels=False,
+        use_deepep_ll_kernels=False,
+        use_deepep_v2_kernels=False,
+        use_moonep_kernels=False,
+        use_mori_epv2_kernels=True,
+        hidden_dim=4096,
+        max_num_tokens=256,
+        num_experts=num_experts,
+        experts_per_token=8,
+    )
+
+    def get_handle(arguments):
+        buffers.append(arguments)
+        return handle
+
+    def prepare(*args, **kwargs):
+        constructors.append((args, kwargs))
+        return expected
+
+    namespace = {"MoriEPv2PrepareAndFinalize": prepare}
+    manager = NS(rank=3, world_size=8, get_handle=get_handle)
+    assert factory(namespace)(moe, None, all2all_manager=manager) is expected
+    assert buffers == [
+        dict(
+            hidden_dim=4096,
+            max_num_inp_token_per_rank=256,
+            num_experts_per_rank=16,
+            num_experts_per_token=8,
+        )
+    ]
+    assert constructors == [
+        (
+            (handle,),
+            dict(
+                max_tokens_per_rank=256,
+                num_dispatchers=8,
+                num_local_experts=16,
+                rank_expert_offset=48,
+            ),
+        )
+    ]
+
+
+def test_copied_factory_routes_mori_epv2_through_expert_offset():
+    check_epv2(lambda ns: function(PATCH, "_maybe_make_prepare_finalize_body", ns), 128)
+
+
+def test_copied_factory_rejects_uneven_mori_epv2_experts():
+    factory = function(PATCH, "_maybe_make_prepare_finalize_body", {})
+    moe = NS(
+        moe_parallel_config=NS(use_passthrough_all2all=False, use_all2all_kernels=True),
+        use_deepep_ht_kernels=False,
+        use_deepep_ll_kernels=False,
+        use_deepep_v2_kernels=False,
+        use_moonep_kernels=False,
+        use_mori_epv2_kernels=True,
+        num_experts=100,
+    )
+    manager = NS(rank=3, world_size=8, get_handle=lambda arguments: object())
+    with pytest.raises(ValueError, match="split evenly"):
+        factory(moe, None, all2all_manager=manager)
+
+
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("case", CASES)
 def test_actual_upstream_factory_has_same_dispatch_buffer_contract(
@@ -103,3 +172,18 @@ def test_actual_upstream_factory_has_same_dispatch_buffer_contract(
         upstream_source_root / "vllm/model_executor/layers/fused_moe/all2all_utils.py"
     )
     check_dispatch(lambda ns: function(path, "maybe_make_prepare_finalize", ns), case)
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("copied", [False, True])
+def test_mori_epv2_routes_identically(upstream_source_root, copied):
+    path, name = (
+        (PATCH, "_maybe_make_prepare_finalize_body")
+        if copied
+        else (
+            upstream_source_root
+            / "vllm/model_executor/layers/fused_moe/all2all_utils.py",
+            "maybe_make_prepare_finalize",
+        )
+    )
+    check_epv2(lambda ns: function(path, name, ns), 128)

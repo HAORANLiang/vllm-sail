@@ -12,30 +12,22 @@ from functools import lru_cache
 
 
 @lru_cache(maxsize=4)
-def _weight_permutation(num_bits: int, is_a_8bit: bool) -> tuple[int, ...]:
+def _weight_permutation(num_bits: int) -> tuple[int, ...]:
     if num_bits not in (4, 8):
         raise ValueError("Marlin repacking supports 4 or 8 bits")
     permutation = []
     for thread in range(32):
         col = thread // 4
-        rows = (
-            [4 * (thread % 4) + i for i in range(4)]
-            + [4 * (thread % 4 + 4) + i for i in range(4)]
-            if is_a_8bit
-            else [
-                2 * (thread % 4),
-                2 * (thread % 4) + 1,
-                2 * (thread % 4 + 4),
-                2 * (thread % 4 + 4) + 1,
-            ]
-        )
+        rows = [
+            2 * (thread % 4),
+            2 * (thread % 4) + 1,
+            2 * (thread % 4 + 4),
+            2 * (thread % 4 + 4) + 1,
+        ]
         tile = [16 * row + col + 8 * block for block in (0, 1) for row in rows]
-        for offset in range(2 if is_a_8bit else 4):
-            permutation.extend(p + (512 if is_a_8bit else 256) * offset for p in tile)
-    if num_bits == 4:
-        interleave = (0, 4, 1, 5, 2, 6, 3, 7) if is_a_8bit else (0, 2, 4, 6, 1, 3, 5, 7)
-    else:
-        interleave = (0, 1, 2, 3) if is_a_8bit else (0, 2, 1, 3)
+        for offset in range(4):
+            permutation.extend(p + 256 * offset for p in tile)
+    interleave = (0, 2, 4, 6, 1, 3, 5, 7) if num_bits == 4 else (0, 2, 1, 3)
     width = len(interleave)
     return tuple(
         permutation[start + i]
@@ -44,15 +36,13 @@ def _weight_permutation(num_bits: int, is_a_8bit: bool) -> tuple[int, ...]:
     )
 
 
-def gptq_marlin_repack(
-    b_q_weight, size_k: int, size_n: int, num_bits: int, is_a_8bit: bool
-):
+def gptq_marlin_repack(b_q_weight, size_k: int, size_n: int, num_bits: int):
     import torch
 
     if num_bits not in (4, 8):
         raise ValueError("Marlin repacking supports 4 or 8 bits")
     pack = 32 // num_bits
-    tile_k = 32 if is_a_8bit else 16
+    tile_k = 16
     if size_k % tile_k or size_n % 64:
         raise ValueError(
             "Marlin repacking requires aligned K tiles and N divisible by 64"
@@ -68,9 +58,7 @@ def gptq_marlin_repack(
     ).reshape(size_k, size_n)
     tiled = unpacked.reshape(size_k // tile_k, tile_k, size_n // 16, 16)
     tiled = tiled.permute(0, 2, 1, 3).reshape(size_k // 16, size_n * 16)
-    order = torch.tensor(
-        _weight_permutation(num_bits, is_a_8bit), device=b_q_weight.device
-    )
+    order = torch.tensor(_weight_permutation(num_bits), device=b_q_weight.device)
     tiled = (
         tiled.reshape(-1, order.numel())
         .index_select(1, order)
@@ -106,7 +94,7 @@ def install() -> None:
     if not hasattr(torch.ops._C, "gptq_marlin_repack"):
         library = torch.library.Library("_C", "FRAGMENT")
         library.define(
-            "gptq_marlin_repack(Tensor b_q_weight, SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor"
+            "gptq_marlin_repack(Tensor b_q_weight, SymInt size_k, SymInt size_n, int num_bits) -> Tensor"
         )
         library.impl("gptq_marlin_repack", gptq_marlin_repack, "CUDA")
         _libraries.append(library)

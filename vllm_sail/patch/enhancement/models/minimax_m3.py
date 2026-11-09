@@ -28,6 +28,8 @@ def init_mlp(
     quant_config=None,
     reduce_results=True,
     disable_tp=False,
+    use_sequence_parallel=False,
+    run_gemm_rs=False,
     prefix="",
 ):
     function = _ppu_mlp_init if current_platform.is_ppu() else _original_mlp_init
@@ -38,6 +40,8 @@ def init_mlp(
         quant_config,
         reduce_results,
         disable_tp,
+        use_sequence_parallel,
+        run_gemm_rs,
         prefix,
     )
 

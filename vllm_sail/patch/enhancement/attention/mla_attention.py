@@ -204,7 +204,7 @@ def _forward_impl_body(
             N, B, P = mqa_q_nope.shape
             L = self.kv_lora_rank
             mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
-            ops.bmm_cpu(
+            cpu_ops.bmm_cpu(
                 mqa_ql_nope,
                 mqa_q_nope,
                 self.impl._w_uk_packed,  # type: ignore[attr-defined]
@@ -243,6 +243,8 @@ def _forward_impl_body(
         else:
             mqa_q = (mqa_ql_nope, mqa_q_pe)
         # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)
+        shardq = getattr(attn_metadata, "shardq", None)
+        mqa_metadata = attn_metadata
         if self.impl.dcp_world_size > 1:
             assert self.dcp_manager is not None
             if self.use_pcp:
@@ -257,18 +259,29 @@ def _forward_impl_body(
                 if not qrep_decode:
                     assert self.dcp_manager.query_gather is not None
                     mqa_q = self.dcp_manager.query_gather(mqa_q)
+        if shardq is not None:
+            decode_q, mqa_q = shard_q(mqa_q, shardq)
+            decode_out = None
+            if decode_q.shape[0]:
+                # Decode tokens attend head-sharded.
+                decode_out, _ = self.impl.forward_mqa(  # type: ignore[attr-defined]
+                    decode_q, kv_cache, attn_metadata, self
+                )
+            mqa_metadata = shardq.attn_metadata
 
         # call decode attn
         if not self.impl.is_sparse:
             assert attn_metadata.decode is not None
-        attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
+        attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, mqa_metadata, self)  # type: ignore[attr-defined]
+        if shardq is not None:
+            attn_out = unshard_out(attn_out, shardq, decode_out)
 
         # correct dcp attn_out with lse.
         if self.impl.dcp_world_size > 1:
             assert lse is not None
             assert self.dcp_manager is not None
             decode_metadata = getattr(attn_metadata, "decode", None)
-            if not use_mha:
+            if not use_mha and not self.use_pcp:
                 seq_lens = cast(torch.Tensor, attn_metadata.seq_lens)  # type: ignore[attr-defined]
                 query_start_loc = attn_metadata.query_start_loc
             else:
@@ -282,17 +295,39 @@ def _forward_impl_body(
                 query_start_loc = attn_metadata.query_start_loc[
                     : attn_metadata.num_decodes + 1
                 ]
-            attn_out = self.dcp_manager.combine(
-                attn_out,
-                lse,
-                seq_lens=seq_lens,
-                query_start_loc=query_start_loc,
-            )
+            # Under PCP+DCP the prefill rows attended over the gathered KV,
+            # so only the decode rows carry an LSE and take part in the merge.
+            num_merge_rows = lse.shape[0]
+            if self.W_UV_dcp is not None:
+                assert self.dcp_manager.v_up_proj_combine is not None
+                self.dcp_manager.v_up_proj_combine(
+                    attn_out,
+                    lse,
+                    self.W_UV_dcp,
+                    mqa_output_slice,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
+            elif num_merge_rows == attn_out.shape[0]:
+                attn_out = self.dcp_manager.combine(
+                    attn_out,
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
+            elif num_merge_rows > 0:
+                attn_out[:num_merge_rows] = self.dcp_manager.combine(
+                    attn_out[:num_merge_rows],
+                    lse,
+                    seq_lens=seq_lens,
+                    query_start_loc=query_start_loc,
+                )
             if self.use_pcp:
                 attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)
 
-        # v_up projection
-        self._v_up_proj(attn_out, out=mqa_output_slice)
+        # v_up projection, unless the DCP merge already applied it
+        if self.W_UV_dcp is None:
+            self._v_up_proj(attn_out, out=mqa_output_slice)
 
     if quant_key is not None:
         quant_idx = num_mqa_tokens if mha_use_quant_output else num_actual_toks

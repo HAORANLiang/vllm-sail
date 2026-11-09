@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         QuantizationConfig,
         RowParallelLinear,
         SiluAndMulWithClamp,
+        _bind_gemm_rs,
         current_platform,
         envs,
     )
@@ -26,9 +27,12 @@ def init_mlp(
     quant_config: QuantizationConfig | None = None,
     reduce_results: bool = True,
     disable_tp: bool = False,
+    use_sequence_parallel: bool = False,
+    run_gemm_rs: bool = False,
     prefix: str = "",
 ) -> None:
     super(MiniMaxM3MLP, self).__init__()
+    self.use_sequence_parallel = use_sequence_parallel
     self.gate_up_proj = MergedColumnParallelLinear(
         config.hidden_size,
         [intermediate_size] * 2,
@@ -42,19 +46,19 @@ def init_mlp(
         config.hidden_size,
         bias=False,
         quant_config=quant_config,
-        reduce_results=reduce_results,
+        # Under SP the forward reduce-scatters the output itself.
+        reduce_results=reduce_results and not use_sequence_parallel,
         disable_tp=disable_tp,
         prefix=f"{prefix}.down_proj",
     )
-    if config.hidden_act != "swigluoai":
-        raise ValueError(
-            f"Unsupported activation: {config.hidden_act}. Only swigluoai is supported."
-        )
-    # gate * sigmoid(alpha * gate) * (up + beta), with both halves clamped.
+    self.gemm_rs = (
+        _bind_gemm_rs(self.down_proj) if use_sequence_parallel and run_gemm_rs else None
+    )
+    # gate * sigmoid(alpha * gate) * (up + 1), with both halves clamped.
     self.act_fn = SiluAndMulWithClamp(
         swiglu_limit=config.swiglu_limit,
         alpha=config.swiglu_alpha,
-        beta=config.swiglu_beta,
+        beta=1.0,
     )
     # At or below the shared-experts stream threshold the persistent kernel
     # would contend with the routed experts on the aux stream.

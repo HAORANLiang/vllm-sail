@@ -95,8 +95,14 @@ def test_humming_converter_retains_checkpoint_key_unless_explicit_override(
         key_calls.append(value)
         return schema
 
+    staged = []
+
+    def stage(*args):
+        staged.append(args)
+
     module.convert_to_humming_moe_kernel_format = convert
     module.quant_key_to_input_schema = to_schema
+    module.stage_moe_weights_for_humming = stage
     monkeypatch.setitem(sys.modules, module.__name__, module)
     layer = NS(
         w13_weight=object(),
@@ -114,15 +120,22 @@ def test_humming_converter_retains_checkpoint_key_unless_explicit_override(
         "get_current_vllm_config": lambda: NS(
             model_config=NS(quantization_config=None)
         ),
+        "get_current_vllm_config_or_none": lambda: NS(
+            model_config=NS(quantization_config=None)
+        ),
+        "user_activation_override": lambda kind, config: (None, False),
     }
     for name in (
         "_user_moe_activation_override",
+        "_user_moe_activation_override_is_set",
         "_resolve_activation_key",
         "_humming_input_schema",
     ):
         function(path, name, namespace)
     converter = function(path, "convert_weight_to_mxfp4_moe_kernel_format", namespace)
-    converter("humming", layer, *[object() for _ in range(4)], activation_key=key)
+    weights = [object() for _ in range(4)]
+    converter("humming", layer, *weights, activation_key=key)
+    assert staged == [(layer, *weights)]
     assert key_calls == ([] if override else [key])
     assert conversions == [
         (

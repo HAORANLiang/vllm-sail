@@ -22,7 +22,6 @@ def install_loader(monkeypatch):
         helper,
         *,
         torch=None,
-        completeness=lambda: False,
         spec_layer=lambda config, name: 0,
         resolved_shared=False,
         global_shared=False,
@@ -79,10 +78,6 @@ def install_loader(monkeypatch):
         register(
             "vllm.model_executor.layers.fused_moe",
             fused_moe_make_expert_params_mapping=expert_mapping,
-        )
-        register(
-            "vllm.model_executor.model_loader.mtp_validation",
-            is_mtp_completeness_check_enabled=completeness,
         )
         register(
             "vllm.model_executor.model_loader.weight_utils",
@@ -286,7 +281,7 @@ def test_ignored_kv_scale_preserves_string_name_for_layer_validation(install_loa
         ignored_name,
         ordinary_name,
     }
-    assert classified.count(ignored_name) == 2
+    assert classified == [ignored_name, ordinary_name]
 
 
 @pytest.mark.parametrize("reverse", [False, True])
@@ -298,17 +293,9 @@ def test_real_fp8_helper_pairs_split_calls_and_preserves_fused_padding(
 ):
     torch = pytest.importorskip("torch")
     pytest.importorskip("vllm")
-    from vllm.model_executor.model_loader.mtp_validation import (
-        disable_mtp_completeness_check,
-        is_mtp_completeness_check_enabled,
-    )
     from vllm.model_executor.models.deepseek_v2 import _try_load_fp8_indexer_wk
 
-    target = install_loader(
-        _try_load_fp8_indexer_wk,
-        torch=torch,
-        completeness=is_mtp_completeness_check_enabled,
-    )
+    target = install_loader(_try_load_fp8_indexer_wk, torch=torch)
     prefix = "model.layers.0.self_attn.indexer"
     fused_name = prefix + ".wk_weights_proj.weight"
     parameter = torch.nn.Parameter(
@@ -348,7 +335,7 @@ def test_real_fp8_helper_pairs_split_calls_and_preserves_fused_padding(
     pair = [(prefix + ".wk.weight", weight), (prefix + ".wk.weight_scale_inv", scale)]
     if reverse:
         pair.reverse()
-    with torch.inference_mode(), disable_mtp_completeness_check():
+    with torch.inference_mode():
         assert model.load_weights(pair[:1]) == set()
         assert not writes
         token = object()
@@ -363,7 +350,7 @@ def test_real_fp8_helper_pairs_split_calls_and_preserves_fused_padding(
         parameter[4], torch.full((4,), -777.0, dtype=torch.bfloat16), rtol=0, atol=0
     )
     # A completed pair must not be reused by the next incremental load.
-    with torch.inference_mode(), disable_mtp_completeness_check():
+    with torch.inference_mode():
         assert model.load_weights(pair[:1]) == set()
         assert len(writes) == 1
     with torch.inference_mode():

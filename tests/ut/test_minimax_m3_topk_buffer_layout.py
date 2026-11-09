@@ -47,6 +47,13 @@ def m3_model_cls(monkeypatch):
     monkeypatch.setattr(m3_model, "VocabParallelEmbedding", lambda *a, **k: None)
     monkeypatch.setattr(m3_model, "MiniMAXGemmaRMSNorm", lambda *a, **k: None)
     monkeypatch.setattr(m3_model, "make_layers", lambda n, fn, prefix="": (0, 0, []))
+    # Upstream now wires a CUDA-only fused MoE finalize that needs a live TP
+    # group; this test only exercises the platform-independent buffer layout.
+    monkeypatch.setattr(
+        m3_model,
+        "current_platform",
+        types.SimpleNamespace(is_cuda=lambda: False, is_ppu=lambda: False),
+    )
     return m3_model.MiniMaxM3Model
 
 
@@ -57,10 +64,10 @@ def vllm_config():
         hidden_size=64,
         num_hidden_layers=2,
         rms_norm_eps=1e-6,
-        sparse_attention_config={
-            "sparse_num_index_heads": NUM_INDEX_HEADS,
-            "sparse_topk_blocks": TOPK_BLOCKS,
-        },
+        layer_types=["minimax_m3_sparse"] * 2,
+        mlp_layer_types=["dense"] * 2,
+        index_n_heads=NUM_INDEX_HEADS,
+        index_topk_blocks=TOPK_BLOCKS,
     )
     return types.SimpleNamespace(
         kernel_config=types.SimpleNamespace(moe_backend="auto"),

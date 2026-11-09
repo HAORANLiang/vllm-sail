@@ -41,11 +41,13 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
             "flashinfer_sparse_mla_decode_autotune_warmup",
         ],
         "kimi_k3_triton_warmup": ["kimi_k3_triton_warmup"],
-        "mamba_triton_warmup": ["mamba_triton_warmup"],
         "qwen4_exp_qsa_warmup": ["qwen4_exp_qsa_triton_warmup"],
         "qwen_triton_warmup": ["qwen_triton_warmup"],
         "qwen_vl_triton_warmup": ["qwen_vl_triton_warmup"],
-        "replayssm_warmup": ["replayssm_autotune_warmup"],
+        "replayssm_warmup": [
+            "replayssm_autotune_warmup",
+            "replayssm_lifecycle_warmup",
+        ],
         "watermark_sample_warmup": ["watermark_sample_warmup"],
     }
     for name, names in imports.items():
@@ -109,11 +111,13 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     for callback, label in [
         ("qwen_triton_warmup", "qwen"),
         ("qwen_vl_triton_warmup", "vl"),
-        ("mamba_triton_warmup", "mamba"),
+        ("replayssm_lifecycle_warmup", "replayssm"),
         ("kimi_k3_triton_warmup", "kimi"),
         ("watermark_sample_warmup", "watermark"),
         ("qwen4_exp_qsa_triton_warmup", "qsa"),
         ("_warmup_gemm_rs_ar", "gemm_rs_ar"),
+        ("_warmup_skinny_gemm", "skinny"),
+        ("_warmup_flashinfer_attention", "flashinfer_attn"),
         ("flashinfer_sparse_mla_decode_autotune_warmup", "sparse_decode"),
         ("deepseek_v4_sparse_mla_attention_warmup", "dsv4"),
         ("b12x_warmup", "b12x"),
@@ -183,15 +187,19 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     expected = ["sampler"] if ppu else []
     if jit:
         expected += ["registry", "triton"]
-    expected += ["qwen", "vl", "mamba"]
+    expected += ["qwen", "vl", "replayssm"]
     if jit:
         expected += ["kimi", "watermark", "qsa"]
     expected += ["gemm_rs_ar"]
+    expected += ["skinny"]
     if not ppu:
         expected += ["legacy"]
     if not local:
         expected += ["sparse_decode", "dsv4", "step5", "b12x"]
-        expected += [("ppu_deepgemm", "model", 64)] if ppu else ["msa"]
+        if ppu:
+            expected += ["flashinfer_attn", ("ppu_deepgemm", "model", 64)]
+        else:
+            expected += ["msa", "flashinfer_attn"]
     assert calls == expected
     assert worker.vllm_config.kernel_config.enable_jit_warmup is jit
     assert worker.vllm_config.kernel_config.enable_cutedsl_warmup is True

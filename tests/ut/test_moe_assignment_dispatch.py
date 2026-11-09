@@ -143,6 +143,7 @@ def context(modules, resident, source_root=None, copied=True, functional=False):
         "vllm.model_executor.layers.fused_moe.config",
         _get_config_dtype_str=lambda **kw: None,
     )
+    modules("vllm.model_executor.layers.fused_moe", get_config=lambda: None)
     return NS(
         namespace=namespace,
         hidden=hidden,
@@ -198,6 +199,7 @@ def check_apply(modules, resident, router, source_root=None, copied=True):
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
             config_name=lambda dtype: None,
+            act_scale_is_tensor_wide=lambda scale: False,
         ),
         expects_unquantized_inputs=False,
         quant_dtype=None,

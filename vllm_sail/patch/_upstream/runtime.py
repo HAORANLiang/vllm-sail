@@ -4,7 +4,6 @@
 """Maintained upstream bodies with limited PPU adaptations; not generated.
 
 Sources in vLLM:
-- vllm/v1/worker/gpu_model_runner.py: GPUModelRunner.may_reinitialize_input_batch
 - vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py: rejection_sample
 
 Moved from SAIL main 3bdf760342984f7d0987f3d27e674a2fd4ddd5d6, including
@@ -15,79 +14,6 @@ upgrades. Globals are supplied separately by bind_body.
 """
 
 from __future__ import annotations
-
-
-def may_reinitialize_input_batch(self, kv_cache_config: KVCacheConfig) -> None:
-    """Re-initialize the input batch if the block sizes are different from
-    what it was originally created with. This happens when the final
-    block size (determined after model loading) differs from the
-    placeholder used during __init__, or when there are multiple
-    KV cache groups.
-
-    Args:
-        kv_cache_config: The KV cache configuration.
-
-    """
-    block_sizes = []
-    max_num_blocks = []
-    slot_mapping_modes = []
-    max_model_len = max(self.max_model_len, self.max_encoder_len)
-    for kv_cache_group in kv_cache_config.kv_cache_groups:
-        kv_cache_spec = kv_cache_group.kv_cache_spec
-        kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)
-        if kv_cache_spec_kind == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:
-            continue
-        block_size = kv_cache_spec.block_size
-        block_sizes.append(block_size)
-        if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:
-            slot_mapping_modes.append(SlotMappingMode.NONE)
-        else:
-            slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)
-        max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(
-            self.vllm_config, max_model_len
-        )
-        max_num_blocks.append(max_num_blocks_per_req)
-
-    if (
-        block_sizes != self._init_block_sizes
-        or max_num_blocks != self._init_max_num_blocks
-        or slot_mapping_modes != self._init_slot_mapping_modes
-        or self.cp_kv_cache_interleave_size
-        != self.parallel_config.cp_kv_cache_interleave_size
-        # PPU MODIFICATION: begin
-        or max_model_len != self.input_batch.max_model_len
-        # PPU MODIFICATION: end
-    ):
-        self._init_block_sizes = block_sizes
-        self._init_max_num_blocks = max_num_blocks
-        self._init_slot_mapping_modes = slot_mapping_modes
-        self.cp_kv_cache_interleave_size = (
-            self.parallel_config.cp_kv_cache_interleave_size
-        )
-        # Capture warmup providers registered after final KV-cache geometry is known
-        with self.jit_warmup_registry.activate():  # type: ignore[attr-defined]
-            self.input_batch = InputBatch(
-                max_num_reqs=self.max_num_reqs,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=self.max_num_tokens,
-                device=self.device,
-                vocab_size=self.model_config.get_vocab_size(),
-                block_sizes=block_sizes,
-                max_num_blocks_per_req=max_num_blocks,
-                num_spec_tokens=self.num_spec_tokens,
-                logitsprocs=self.input_batch.logitsprocs,
-                logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
-                is_pooling_model=self.is_pooling_model,
-                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-                reasoning_config=self.vllm_config.reasoning_config,
-                use_replayssm=self.cache_config.use_replayssm,
-                slot_mapping_modes=slot_mapping_modes,
-            )
-
-    assert self._init_block_sizes == block_sizes, (
-        f"InputBatch block_sizes {self._init_block_sizes} != "
-        f"kv_cache block_sizes {block_sizes}"
-    )
 
 
 def rejection_sample(

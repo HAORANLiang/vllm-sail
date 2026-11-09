@@ -24,6 +24,16 @@ def supports_combination(
     use_mm_prefix: bool,
     device_capability: DeviceCapability,
 ) -> str | None:
+    if (
+        device_capability == DeviceCapability(9, 0)
+        and kv_cache_dtype is not None
+        and is_quantized_kv_cache(kv_cache_dtype)
+        and head_size == 512
+    ):
+        if block_size is not None and block_size % 64 != 0:
+            return "SM90 d512 FP8 KV requires a block size divisible by 64"
+        if use_sparse:
+            return "SM90 d512 FP8 KV does not support block sparsity"
     if has_sink and device_capability < DeviceCapability(9, 0):
         # PPU MODIFICATION: begin
         # PPU FA3 takes s_aux (sinks) through flash_attn_3.fwd; FA2 does not.
@@ -39,7 +49,7 @@ def supports_combination(
         and not flash_attn_supports_kv_cache_dtype(
             kv_cache_dtype,
             head_size=head_size,
-            head_size_v=head_size,
+            head_size_v=cls.head_size_v,
             has_sinks=has_sink,
             kv_cache_block_size=block_size,
             supports_fa4_hd256=True,

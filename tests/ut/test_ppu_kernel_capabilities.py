@@ -69,7 +69,6 @@ def complete_warmup_contract(modules, provider, worker, platform, *, entered=Non
     platform.is_cuda = lambda: True
     platform.is_rocm = lambda: False
     platform.is_device_capability_family = lambda _: False
-    worker.use_v2_model_runner = True
     worker.model_runner.attn_groups = []
     worker.vllm_config.model_config = ns()
     worker.vllm_config.compilation_config = ns(cudagraph_capture_sizes=[])
@@ -89,13 +88,16 @@ def complete_warmup_contract(modules, provider, worker, platform, *, entered=Non
     callbacks = {
         "qwen_triton_warmup": lambda runner, config: entered(),
         "qwen_vl_triton_warmup": lambda runner: None,
-        "mamba_triton_warmup": lambda runner: None,
+        "replayssm_lifecycle_warmup": lambda runner: None,
+        "_rocm_aiter_gemm_warmup": lambda worker: None,
         "kimi_k3_triton_warmup": lambda worker: None,
         "watermark_sample_warmup": lambda worker: None,
         "qwen4_exp_qsa_triton_warmup": lambda worker: None,
         "_warmup_bf16x3_router_gemm": lambda model, tokens: None,
         "_warmup_ll_bf16_router_gemm": lambda model: None,
         "_warmup_gemm_rs_ar": lambda: None,
+        "_warmup_skinny_gemm": lambda model: None,
+        "_warmup_flashinfer_attention": lambda worker: None,
         "flashinfer_sparse_mla_decode_autotune_warmup": lambda worker: None,
         "deepseek_v4_sparse_mla_attention_warmup": lambda worker: None,
         "b12x_warmup": lambda worker, sizes: None,
@@ -292,12 +294,16 @@ def test_compressor_constructor_registers_supported_warmup(
         f"{base}.compressor",
         DeepseekCompressor=cls,
         current_platform=types.SimpleNamespace(
-            device_type="cuda", is_cuda=lambda: True, is_ppu=lambda: ppu
+            device_type="cuda",
+            is_cuda=lambda: True,
+            is_cpu=lambda: False,
+            is_ppu=lambda: ppu,
         ),
         torch=types.SimpleNamespace(empty=noop, float32="fp32"),
         nn=types.SimpleNamespace(Parameter=noop),
         _prefer_two_stage_compressor=lambda: False,
         MergedColumnParallelLinear=noop,
+        DeepseekV4CompressorKVScoreLinear=noop,
         RMSNorm=noop,
         CompressorStateCache=noop,
         _SAVE_PARTIAL_STATES_KERNEL=kernel("save"),
@@ -772,54 +778,6 @@ def test_body_binding_preserves_keyword_defaults_and_live_globals(modules):
     assert bound.__annotations__ == namespace.body.__annotations__
 
 
-def test_input_batch_reinitializes_when_only_context_length_changes(modules):
-    platform = types.SimpleNamespace(is_ppu=lambda: True)
-    modules("vllm.platforms", current_platform=platform)
-    cls = type("GPUModelRunner", (), {"may_reinitialize_input_batch": lambda *a: None})
-    modules(
-        "vllm.v1.worker.gpu_model_runner",
-        GPUModelRunner=cls,
-        InputBatch=lambda **kwargs: types.SimpleNamespace(**kwargs),
-    )
-    modules(
-        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
-        rejection_sample=lambda *a: None,
-    )
-    load_patch("vllm_sail/patch/enhancement/runtime.py")
-    runner = cls()
-    runner.__dict__.update(
-        max_model_len=8192,
-        cp_kv_cache_interleave_size=1,
-        jit_warmup_registry=types.SimpleNamespace(
-            activate=__import__("contextlib").nullcontext
-        ),
-        max_encoder_len=0,
-        _init_block_sizes=[],
-        _init_max_num_blocks=[],
-        _init_slot_mapping_modes=[],
-        input_batch=types.SimpleNamespace(
-            max_model_len=4096,
-            logitsprocs=object(),
-            logitsprocs_need_output_token_ids=False,
-        ),
-        max_num_reqs=16,
-        max_num_tokens=2048,
-        device="ppu",
-        model_config=types.SimpleNamespace(get_vocab_size=lambda: 1024),
-        num_spec_tokens=2,
-        is_pooling_model=False,
-        parallel_config=types.SimpleNamespace(cp_kv_cache_interleave_size=1),
-        vllm_config=types.SimpleNamespace(reasoning_config=None),
-        cache_config=types.SimpleNamespace(use_replayssm=False),
-    )
-    old = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is not old and runner.input_batch.max_model_len == 8192
-    new = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is new
-
-
 def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
     class Fp8Config:
         def __init__(self, **kwargs):
@@ -906,7 +864,7 @@ def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
 @pytest.mark.parametrize(
     "consumer_name",
     [
-        "vllm.model_executor.layers.fused_moe.oracle.fp8",
+        "vllm.model_executor.layers.fused_moe.oracle.base",
         "vllm.model_executor.layers.quantization.modelopt_block_quant",
     ],
 )
@@ -1028,6 +986,8 @@ def test_fa_sink_combination_respects_ppu_fa3_and_fp8_gates(
     modules, ppu, arch, version, fp8, expected
 ):
     class Backend:
+        head_size_v = None
+
         @classmethod
         def supports_combination(cls, *args, **kwargs):
             return "original"

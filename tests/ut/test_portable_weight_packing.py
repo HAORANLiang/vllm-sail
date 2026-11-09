@@ -21,16 +21,14 @@ def _portable():
 
 
 @pytest.mark.parametrize("bits", [4, 8])
-@pytest.mark.parametrize("activation8", [False, True])
-def test_weight_layout_permutation_is_bijective(bits, activation8):
-    permutation = _portable()._weight_permutation(bits, activation8)
+def test_weight_layout_permutation_is_bijective(bits):
+    permutation = _portable()._weight_permutation(bits)
     assert len(permutation) == 1024
     assert sorted(permutation) == list(range(1024))
 
 
 @pytest.mark.parametrize("bits", [4, 8])
-@pytest.mark.parametrize("activation8", [False, True])
-def test_packed_weights_match_upstream_independent_reference(bits, activation8):
+def test_packed_weights_match_upstream_independent_reference(bits):
     torch = pytest.importorskip("torch")
     np = pytest.importorskip("numpy")
     source = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm"))
@@ -67,13 +65,12 @@ def test_packed_weights_match_upstream_independent_reference(bits, activation8):
         gptq = torch.zeros((k // pack, n), dtype=torch.int32)
         for i in range(pack):
             gptq |= weights[i::pack] << (bits * i)
-        actual = portable.gptq_marlin_repack(gptq, k, n, bits, activation8)
+        actual = portable.gptq_marlin_repack(gptq, k, n, bits)
         expected = namespace["marlin_weights"](
             weights,
             k,
             n,
             bits,
-            namespace["get_weight_perm"](bits, activation8),
-            activation8,
+            namespace["get_weight_perm"](bits),
         )
         assert torch.equal(actual, expected)

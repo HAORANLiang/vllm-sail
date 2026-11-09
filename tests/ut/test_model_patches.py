@@ -50,7 +50,6 @@ EXPECTED_MODULES = {
     "qwen3_fused_quant",
     "qwen3_moe",
     "qwen3_next",
-    "step3p5_mtp",
 }
 
 REQUIRED_METADATA = ("reason", "affected_versions", "remove_when")
@@ -242,7 +241,6 @@ _EXPECTED_TARGETS = {
     "vllm.model_executor.models.qwen3_moe.Qwen3MoeModel.__init__",
     "vllm.model_executor.models.qwen3_next.th_nvtx_range_push",
     "vllm.model_executor.models.qwen3_next.th_nvtx_range_pop",
-    "vllm.model_executor.models.step3p5_mtp.Step3p5MTP.load_weights",
     (
         "vllm.model_executor.layers.quantization.utils.marlin_utils."
         "check_moe_marlin_supports_config"

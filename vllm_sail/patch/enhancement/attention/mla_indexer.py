@@ -41,6 +41,10 @@ helpers, new parameters, refactors) cannot break this plugin.
 from __future__ import annotations
 
 import torch
+from vllm.model_executor.kernels.attention.dsa.fused_mqa_topk import (
+    FUSED_MQA_TOPK_MAX_KEYS,
+    FUSED_MQA_TOPK_MAX_ROWS,
+)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer as _indexer_module
 from vllm.v1.attention.backends.mla.indexer import (
@@ -184,14 +188,14 @@ def _split_indexer_prefill_chunks_body(
     workspace_size: int,
     max_logits_bytes: int,
     request_offset: int = 0,
+    fused_mqa_topk_eligible: bool = False,
 ) -> list[tuple[slice, slice]]:
     """Upstream chunker with the fork's logits_dtype budget.
 
-    PPU-only delta: neither upstream passes ``logits_dtype`` (both budget a
-    fixed 4 bytes/elem), so the dtype is derived from the builder currently
-    inside ``build`` (see ``_current_builder``). bf16 (fp4 indexer) halves
-    max_logits_elems; fp32 matches upstream. Falls back to fp32 outside
-    ``build``.
+    PPU-only delta: upstream budgets a fixed 4 bytes/elem, so the dtype is
+    derived from the builder currently inside ``build`` (see
+    ``_current_builder``). bf16 (fp4 indexer) halves max_logits_elems; fp32
+    matches upstream. Falls back to fp32 outside ``build``.
     """
     chunks: list[tuple[slice, slice]] = []
     n = len(compressed_seq_lens_cpu)
@@ -216,7 +220,15 @@ def _split_indexer_prefill_chunks_body(
                 compressed_seq_lens_cpu[end].item(),
             )
             new_m, new_n = chunk_m + q, chunk_n + s
-            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+            if fused_mqa_topk_eligible and new_n <= FUSED_MQA_TOPK_MAX_KEYS:
+                fits = new_m <= FUSED_MQA_TOPK_MAX_ROWS
+            else:
+                # fused_mqa_topk planning never packs past the key limit.
+                fits = (
+                    not fused_mqa_topk_eligible
+                    and new_m * new_n <= max_logits_elems
+                )
+            if new_n <= workspace_size and fits:
                 chunk_m, chunk_n = new_m, new_n
                 end += 1
             else:
@@ -232,7 +244,14 @@ def _split_indexer_prefill_chunks_body(
             end += 1
 
         req_slice = slice(start + request_offset, end + request_offset)
-        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
+        # PPU MODIFICATION: begin -- SAIL's logits budget follows logits_dtype
+        # instead of dense_logits_rows()' fixed fp32 element size.
+        max_q = (
+            max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)
+        )
+        # PPU MODIFICATION: end
+        if fused_mqa_topk_eligible and chunk_n <= FUSED_MQA_TOPK_MAX_KEYS:
+            max_q = FUSED_MQA_TOPK_MAX_ROWS
         for q_off in range(0, chunk_m, max_q):
             sub_m = min(max_q, chunk_m - q_off)
             chunks.append((req_slice, slice(q_off, q_off + sub_m)))

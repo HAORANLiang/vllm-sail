@@ -4,7 +4,8 @@
 The plugin does not copy ``select_mxfp4_moe_backend``: ``map_mxfp4_backend``
 returns each standard PPU candidate followed by its batched family and
 upstream's shared activation-format check picks one. These tests therefore run
-upstream's selector body against the patched PPU helpers.
+upstream's selector body against the patched PPU helpers, with upstream's kernel
+oracle base class reduced to the probing semantics it documents.
 """
 
 import ast
@@ -18,6 +19,7 @@ from tests.support.source import ROOT, definition, function
 from vllm_sail.registry.moe_backends._extend import extend_enum
 
 PATCH = "vllm_sail/registry/moe_backends/mxfp4.py"
+_UNSET = object()
 Backend = Enum(
     "Backend",
     {
@@ -29,6 +31,8 @@ Backend = Enum(
             "XPU",
             "PPU_DEEPGEMM_MXFP4",
             "BATCHED_PPU_DEEPGEMM_MXFP4",
+            "PPU_DEEPGEMM_MXFP4_FP8",
+            "BATCHED_PPU_DEEPGEMM_MXFP4_FP8",
             "PPU_DEEPGEMM_MXFP4_BF16",
             "BATCHED_PPU_DEEPGEMM_MXFP4_BF16",
             "PPU_DEEPGEMM_MXFP4_BF16_MMA",
@@ -58,7 +62,8 @@ def selection(
 ):
     """Run upstream's selector body with the PPU helpers installed as globals."""
     calls, warnings = [], []
-    standard, batch = object(), object()
+    standard, batch = NS(is_batched=False), NS(is_batched=True)
+    activation_format = batch if batched else standard
 
     def own_format(backend):
         return batch if backend.name.startswith("BATCHED_") else standard
@@ -66,12 +71,12 @@ def selection(
     def kernel(backend):
         class Experts:
             @staticmethod
-            def is_supported_config(cls, config, weight, activation, activation_format):
-                calls.append((backend, weight, activation, activation_format))
+            def is_supported_config(cls, config, weight, activation, fmt):
+                calls.append((backend, weight, activation, fmt))
                 # Upstream's FusedMoEExperts.is_supported_config() rejects a
                 # kernel whose activation format differs from the MoE layout,
                 # which is what drops the sibling PPU candidate.
-                if activation_format is not own_format(backend):
+                if fmt is not own_format(backend):
                     return False, "activation format fixture"
                 return supports(backend, activation), "unsupported candidate fixture"
 
@@ -86,6 +91,57 @@ def selection(
                 expanded.append(Backend[sibling])
         return expanded
 
+    class FakeOracle:
+        """The probing half of ``MoEKernelOracle`` the selector calls."""
+
+        def __init__(self, moe_config, weight_key=None, activation_key=None):
+            self.moe_config = moe_config
+            self.weight_key = weight_key
+            self.activation_key = activation_key
+
+        def backend_to_kernel_cls(self, backend):
+            return [kernel(backend)]
+
+        def make_log_backend(self, backend, available_backends=None, is_lora=False):
+            return f"Using '{backend.value}' Mxfp4 MoE."
+
+        def make_log_unsupported(self, backend, reason, is_lora=False):
+            return reason or backend.value
+
+        def try_backend(self, backend, kernel_classes=None, activation_key=_UNSET):
+            key = self.activation_key if activation_key is _UNSET else activation_key
+            if kernel_classes is None:
+                kernel_classes = self.backend_to_kernel_cls(backend)
+            rejected = []
+            for kernel_cls in kernel_classes:
+                supported, reason = kernel_cls.is_supported_config(
+                    kernel_cls,
+                    self.moe_config,
+                    self.weight_key,
+                    key,
+                    self.moe_config.activation_format,
+                )
+                if supported:
+                    return kernel_cls, rejected
+                rejected.append((kernel_cls, reason))
+            return None, rejected
+
+        def return_or_raise(
+            self,
+            backend,
+            available_backends=None,
+            kernel_classes=None,
+            activation_key=_UNSET,
+            is_lora=False,
+        ):
+            kernel_cls, rejected = self.try_backend(
+                backend, kernel_classes, activation_key
+            )
+            if kernel_cls is None:
+                reason = rejected[-1][1] if rejected else None
+                raise ValueError(self.make_log_unsupported(backend, reason, is_lora))
+            return backend, kernel_cls
+
     namespace = {
         "Mxfp4MoeBackend": Backend,
         "mk": NS(FusedMoEActivationFormat=NS(Standard=standard, BatchedExperts=batch)),
@@ -98,12 +154,12 @@ def selection(
         "oracle": NS(kMxfp4Dynamic="mxfp4"),
         "map_mxfp4_backend": map_backend,
         "backend_to_kernel_cls": lambda backend: [kernel(backend)],
+        "Mxfp4MoEKernelOracle": FakeOracle,
         # The auto path reads the patched priority list; expanding the
         # requested candidates keeps one candidate source for both paths.
         "_get_priority_backends_for_gpt_oss": lambda: map_backend(None),
         "_resolve_activation_key": lambda key: key,
-        "_make_log_backend": lambda backend: f"Using '{backend.value}' Mxfp4 MoE.",
-        "_make_log_unsupported": lambda backend, reason: reason or backend.value,
+        "_user_moe_activation_override": lambda: None,
         "logger": NS(
             info_once=lambda *a, **kw: None,
             warning_once=lambda *a, **kw: warnings.append(Backend(a[-1])),
@@ -133,22 +189,17 @@ def selection(
         "_get_requested_backends",
         "_warn_on_bf16_fallback",
         "_requested_kernel_cls",
-        "_return_or_raise",
     ):
-        if helper != "_requested_kernel_cls" or any(
-            isinstance(node, ast.FunctionDef) and node.name == helper
-            for node in ast.parse(upstream.read_text()).body
-        ):
-            function(upstream, helper, namespace)
+        function(upstream, helper, namespace)
     config = NS(
         moe_backend="explicit" if explicit else "auto",
-        moe_parallel_config=NS(use_batched_activation_format=batched),
+        activation_format=activation_format,
         is_lora_enabled=lora,
     )
     result = function(upstream, "select_mxfp4_moe_backend", namespace)(
         config, activation_key=requested
     )
-    return result, calls, warnings, batch if batched else standard
+    return result, calls, warnings, activation_format
 
 
 def test_plugin_does_not_copy_the_selector_body() -> None:

@@ -151,20 +151,24 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
         "_upstream_kernel_warmup",
         lambda worker, **kwargs: calls.append("upstream"),
     )
+    vllm_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(),
+        kernel_config=types.SimpleNamespace(
+            enable_jit_warmup=False,
+            enable_cutedsl_warmup=False,
+            enable_flashinfer_autotune=False,
+        ),
+        compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[]),
+        use_flashinfer_replayssm=False,
+    )
     worker = types.SimpleNamespace(
-        use_v2_model_runner=True,
         model_runner=types.SimpleNamespace(
-            jit_warmup_registry=None, is_pooling_model=True, attn_groups=[]
+            jit_warmup_registry=None,
+            is_pooling_model=True,
+            attn_groups=[],
+            vllm_config=vllm_config,
         ),
-        vllm_config=types.SimpleNamespace(
-            model_config=types.SimpleNamespace(),
-            kernel_config=types.SimpleNamespace(
-                enable_jit_warmup=False,
-                enable_cutedsl_warmup=False,
-                enable_flashinfer_autotune=False,
-            ),
-            compilation_config=types.SimpleNamespace(cudagraph_capture_sizes=[]),
-        ),
+        vllm_config=vllm_config,
         get_model=lambda: calls.append("get_model") or object(),
         scheduler_config=types.SimpleNamespace(max_num_batched_tokens=512),
     )
@@ -184,7 +188,7 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
     )
     for name in (
         "qwen_vl_triton_warmup",
-        "mamba_triton_warmup",
+        "_warmup_flashinfer_attention",
         "_warmup_gemm_rs_ar",
         "flashinfer_sparse_mla_decode_autotune_warmup",
         "deepseek_v4_sparse_mla_attention_warmup",

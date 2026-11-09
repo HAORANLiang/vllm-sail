@@ -64,6 +64,9 @@ def resolve(monkeypatch):
         pla=True,
         capability=89,
         mi3xx=False,
+        gfx1151=False,
+        hip_available=True,
+        hip_reasons=(),
         unsupported_reasons=(),
         helper=None,
         body=PATCH,
@@ -110,8 +113,11 @@ def resolve(monkeypatch):
             return list(unsupported_reasons)
 
         namespace["_aiter_flydsl_unsupported_reasons"] = reasons
+        namespace["is_hip_gdn_available"] = lambda: hip_available
+        namespace["_hip_gdn_unsupported_reasons"] = lambda *_args: list(hip_reasons)
         rocm = ModuleType("vllm.platforms.rocm")
         rocm.on_mi3xx = lambda: mi3xx
+        rocm.on_gfx1151 = lambda: gfx1151
         monkeypatch.setitem(sys.modules, rocm.__name__, rocm)
         result = function(body, "_resolve_gdn_prefill_backend", namespace)(config)
         return result, warnings
@@ -149,8 +155,37 @@ def test_rocm_unsupported_aiter_shapes_warn_and_fall_back(resolve, shape):
     "device", ["ppu", "cuda", "cpu"], ids=["fake-ppu", "fake-cuda", "fake-cpu"]
 )
 def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device):
-    with pytest.raises(RuntimeError, match="ROCm AITER backend"):
+    with pytest.raises(RuntimeError, match="it is a ROCm backend"):
         resolve(device, "aiter_flydsl")
+
+
+def test_rocm_explicit_hip_prefill_uses_supported_kernel(resolve):
+    result, warnings = resolve("rocm", " hip ")
+    assert result == ("hip", "hip")
+    assert not warnings
+
+
+def test_rocm_explicit_hip_prefill_requires_built_kernel(resolve):
+    with pytest.raises(RuntimeError, match="rdna35_gdn_chunked is unavailable"):
+        resolve("rocm", "hip", hip_available=False)
+
+
+def test_rocm_explicit_hip_unsupported_model_falls_back(resolve):
+    result, warnings = resolve("rocm", "hip", hip_reasons=["unsupported dtype"])
+    assert result == ("hip", "triton")
+    assert len(warnings) == 1
+    assert "Falling back to Triton/FLA" in warnings[0][0]
+
+
+def test_rocm_auto_prefers_hip_on_gfx1151(resolve):
+    result, warnings = resolve("rocm", gfx1151=True)
+    assert result == ("auto", "hip")
+    assert not warnings
+
+
+def test_rocm_auto_hip_needs_the_built_kernel(resolve):
+    result, _ = resolve("rocm", gfx1151=True, hip_available=False)
+    assert result == ("auto", "triton")
 
 
 @pytest.mark.parametrize(
@@ -163,6 +198,10 @@ def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device):
         ("ppu", "flashinfer", {"capability": 90}, "triton"),
         ("cuda", "auto", {"capability": 90}, "flashinfer"),
         ("cuda", "cutedsl", {"capability": 100}, "cutedsl"),
+        ("cuda", "cutedsl", {"capability": 110}, "cutedsl"),
+        ("cuda", "auto", {"capability": 110}, "triton"),
+        ("cuda", "cutedsl", {"capability": 120}, "triton"),
+        ("cuda", "auto", {"capability": 120}, "flashinfer"),
         ("cuda", "auto", {}, "triton"),
     ],
 )
@@ -256,6 +295,9 @@ def test_constructor_selects_the_resolved_forward_method(active):
 
         def forward_aiter_flydsl(self):
             return "aiter_flydsl"
+
+        def forward_hip(self):
+            return "hip"
 
         def forward_pla(self):
             return "pla"

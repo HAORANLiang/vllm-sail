@@ -85,6 +85,11 @@ def builder_factory(modules, patch_utils_module):
             get_paged_mqa_logits_metadata=lambda *args: None,
         )
         modules(
+            "vllm.model_executor.kernels.attention.dsa.fused_mqa_topk",
+            FUSED_MQA_TOPK_MAX_KEYS=1 << 20,
+            FUSED_MQA_TOPK_MAX_ROWS=16384,
+        )
+        modules(
             "vllm_sail.patch.utils",
             patch_value=patch_utils_module.patch_value,
         )

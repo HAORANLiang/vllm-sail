@@ -35,6 +35,11 @@ def installed_indexer(modules, patch_utils_module):
         )
         modules("vllm_sail.patch.utils", patch_value=patch_utils_module.patch_value)
         modules("vllm_sail.utils.deep_gemm")
+        modules(
+            "vllm.model_executor.kernels.attention.dsa.fused_mqa_topk",
+            FUSED_MQA_TOPK_MAX_KEYS=1 << 20,
+            FUSED_MQA_TOPK_MAX_ROWS=16384,
+        )
 
         class Builder:
             def __init__(self, *args):

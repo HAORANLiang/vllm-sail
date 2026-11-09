@@ -152,8 +152,12 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
         modules(name, dense_gemm1_mxfp8=dense)
     load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
     disable = threshold == 64
-    mlp = provider.MiniMaxM3MLP(config, 16, quant, not disable, disable, "layers.0.mlp")
+    mlp = provider.MiniMaxM3MLP(
+        config, 16, quant, not disable, disable, prefix="layers.0.mlp"
+    )
     assert mlp.initialized
+    assert mlp.use_sequence_parallel is False
+    assert mlp.gemm_rs is None
     assert mlp.gate_up_proj.args == (8, [16, 16])
     assert mlp.gate_up_proj.kwargs == dict(
         bias=False,
@@ -192,13 +196,45 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("ppu", [False, True])
-def test_registered_mlp_retains_activation_validation(
-    modules, monkeypatch, upstream_source_root, ppu
+@pytest.mark.parametrize("run_gemm_rs", [False, True])
+def test_registered_mlp_binds_gemm_rs_only_for_sequence_parallel(
+    modules, monkeypatch, upstream_source_root, ppu, run_gemm_rs
 ):
     provider = load_model(modules, monkeypatch, upstream_source_root, ppu)
+    bound = []
     provider.MergedColumnParallelLinear = provider.RowParallelLinear = lambda *a, **k: (
         object()
     )
+    provider.SiluAndMulWithClamp = lambda **kwargs: object()
+    provider.envs = NS(VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=16)
+    provider._bind_gemm_rs = lambda linear: (bound.append(linear), ("gemm_rs", linear))[
+        1
+    ]
+    config = NS(
+        hidden_size=8,
+        hidden_act="swigluoai",
+        swiglu_limit=7,
+        swiglu_alpha=1.702,
+        swiglu_beta=1,
+    )
+    if not ppu:
+        dense = modules(
+            "vllm.models.minimax_m3.nvidia.ops.dense_gemm1_mxfp8",
+            can_fuse_gemm1=lambda *args: False,
+            MIN_TOKENS=32,
+        )
+        modules("vllm.models.minimax_m3.nvidia.ops", dense_gemm1_mxfp8=dense)
     load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
-    with pytest.raises(ValueError, match="Only swigluoai is supported"):
-        provider.MiniMaxM3MLP(NS(hidden_size=8, hidden_act="unsupported"), 16)
+    mlp = provider.MiniMaxM3MLP(
+        config,
+        16,
+        use_sequence_parallel=True,
+        run_gemm_rs=run_gemm_rs,
+    )
+    assert mlp.use_sequence_parallel is True
+    if run_gemm_rs:
+        assert bound == [mlp.down_proj]
+        assert mlp.gemm_rs == ("gemm_rs", mlp.down_proj)
+    else:
+        assert bound == []
+        assert mlp.gemm_rs is None

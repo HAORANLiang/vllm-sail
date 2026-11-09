@@ -18,7 +18,7 @@ schema = 1
 
 # The exact upstream vLLM tag the corpus is translated from. Bumping this means
 # re-running tools/port_upstream_kernels.py and reviewing the diff.
-upstream_ref = "8b10bda57ceab3a741d2fb3718af48cef691023e"
+upstream_ref = "b022bb7a4873a47cdcdf474edf3bd499c221f40d"
 
 # Compiled tiers, in the order CMake receives them. `x` must never appear here.
 # Must stay above [tiers]: a bare key after a table header belongs to that table.
@@ -337,11 +337,74 @@ ops = ["grouped_topk"]
 notes = "Heaviest tier-a file: cooperative groups plus PTX in moeTopKFuncs.cuh. Required because PPU MoE models route through grouped_topk."
 
 [[entry]]
-path = "csrc/moe/topk_softplus_sqrt_kernels.cu"
+path = "csrc/moe/topk_softplus_sqrt.cu"
 tier = "a"
 hazards = ["cub"]
 ops = ["topk_softplus_sqrt"]
-notes = "Promoted from tier b for DeepSeek V4 biased and hash routing, including the FP32 top-6 fast path."
+notes = "Promoted from tier b for DeepSeek V4 biased and hash routing, including the FP32 top-6 fast path. Upstream split the kernels, launchers and explicit instantiations into topk_softplus_sqrt_kernels.cuh plus one unit per (gating dtype, topk_indices dtype) pair."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=float and topk_indices=int32."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int64.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=float and topk_indices=int64."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_uint32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=float and topk_indices=uint32."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=half and topk_indices=int32."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int64.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=half and topk_indices=int64."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_uint32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=half and topk_indices=uint32."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=bfloat16 and topk_indices=int32."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int64.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=bfloat16 and topk_indices=int64."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_uint32.cu"
+tier = "a"
+hazards = []
+ops = []
+notes = "Explicit instantiation of the fused softplus-sqrt topk launcher for gating=bfloat16 and topk_indices=uint32."
 
 [[entry]]
 path = "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
