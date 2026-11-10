@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """FA3's query-sparse attention (QSA) path.
 
-QSA has no dedicated op: ``flash_attn_3.fwd`` selects it from the *rank* of
-``page_table``. A 3-D ``(total_q, 1, topk)`` int32 table of absolute KV-pool
-token indices means QSA; a 2-D table means ordinary paged attention. Getting
-that rank wrong silently produces dense attention, so the wrapper rejects a 2-D
-table instead of passing it through.
+QSA has no dedicated op: FA3 selects it from the *rank* of ``page_table``. A 3-D
+``(total_q, 1, topk)`` int32 table of absolute KV-pool token indices means QSA;
+a 2-D table means ordinary paged attention. Getting that rank wrong silently
+produces dense attention, so the wrapper rejects a 2-D table instead of passing
+it through.
+
+Calls the wheel's public ``flash_attn_with_kvcache`` rather than the raw
+``torch.ops.flash_attn_3.fwd``: that is the entry point FA3's own QSA suite
+(``hopper/test_qsa_cases.py``) validates, and it takes keyword arguments, so a
+wheel that inserts or reorders an ``fwd`` parameter cannot silently change what
+we pass. The raw op's 35 positional arguments offer no such protection, and the
+failure mode of getting one wrong is the silent-dense-attention one above.
 
 Imported lazily: nothing in ``vllm_sail`` reaches this module at package import
 time, so a missing ``flash_attn_3`` wheel costs an unavailable reason string and
@@ -38,6 +45,19 @@ _QSA_MAX_QHEADS_PER_KVHEAD = 32
 
 _FA3_QSA_SUPPORTED: bool | None = None
 _FA3_QSA_UNSUPPORTED_REASON: str | None = None
+
+
+def _fa3_kvcache_api():
+    """The wheel's ``flash_attn_with_kvcache``, resolved on first use.
+
+    Deliberately not a module-scope import: this module has to import cleanly on
+    a host with no FA3 wheel so that ``fa3_qsa_unsupported_reason()`` can return
+    a reason string instead of raising. ``_probe_fa3_qsa`` checks for the module
+    before any call, and reports it as an unsupported reason.
+    """
+    from flash_attn_interface import flash_attn_with_kvcache
+
+    return flash_attn_with_kvcache
 
 
 def fa3_qsa_uses_allow_aiu_flag() -> bool:
@@ -85,6 +105,12 @@ def flash_attn_qsa_varlen_func(
         max_seqlen_q: int. Required together with ``cu_seqlens_q``.
         softmax_scale: defaults to ``1 / sqrt(headdim)``.
         out: ``(total_q, nheads, headdim)``, written in place when given.
+            ``flash_attn_with_kvcache`` has no in-place form -- its own
+            ``register_fake`` rejects a pre-allocated output so the op stays
+            traceable -- so a caller-supplied ``out`` costs one extra device
+            copy of the result. That is the same trade ``_kernels.py``'s FA2
+            path already makes, and at decode shapes it is well under a
+            percent of a step.
         num_splits: ``0`` lets FA3 pick the split-KV count, ``1`` disables
             splitting. Defaults to ``0``: a forced ``1`` serialises every row's
             whole top-k walk onto one tile, which measured slower than the Triton
@@ -96,10 +122,11 @@ def flash_attn_qsa_varlen_func(
             ``topk_table`` lists 16 pool-contiguous tokens. The indexer emits
             scattered lists, so callers must leave this ``False``.
         seqused_k: ``(batch_size,)`` int32, per-batch count of usable top-k
-            columns. Honoured for QSA only together with ``is_causal``; without
-            it FA3 drops causality and walks the padded tail. To express a
-            per-row count, give every query row its own one-token batch
-            (``cu_seqlens_q = arange(total_q + 1)``, ``max_seqlen_q = 1``).
+            columns. Passed as ``cache_seqlens``. Honoured for QSA only together
+            with ``causal``; without it FA3 drops causality and walks the padded
+            tail. To express a per-row count, give every query row its own
+            one-token batch (``cu_seqlens_q = arange(total_q + 1)``,
+            ``max_seqlen_q = 1``).
 
     Returns:
         ``out``, plus ``(nheads, total_q)`` float32 ``softmax_lse`` when
@@ -139,6 +166,7 @@ def flash_attn_qsa_varlen_func(
             "routed off the AIU paged-KV bulk load; gate on is_fa3_qsa_supported()"
         )
 
+    flash_attn_with_kvcache = _fa3_kvcache_api()
     if NVTX_PROFILE:
         th_nvtx_range_push(
             f"[FW_FMHA] --format=flash_attn_3_qsa,Forward,type:QSA,"
@@ -148,47 +176,35 @@ def flash_attn_qsa_varlen_func(
             f"page_size:{k_cache.shape[1]},data_type:{q.dtype}"
         )
 
-    out, softmax_lse, _, _ = torch.ops.flash_attn_3.fwd(
+    # cache_seqlens is FA3's seqused_k. max_seqlen_k stays at its None default:
+    # under QSA seqlen_k is the table width, and a value here would override it.
+    # return_softmax_lse is always requested because the underlying op computes
+    # and returns the lse unconditionally; the flag only selects tuple members.
+    result = flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
-        None,  # k_new: QSA rejects it
-        None,  # v_new: QSA rejects it
-        None,  # q_v
-        out,
-        cu_seqlens_q,
-        None,  # cu_seqlens_k: passing it would make seqlen_k = max_seqlen_k
-        None,  # cu_seqlens_k_new
-        None,  # seqused_q
-        seqused_k,
-        max_seqlen_q,
-        None,  # max_seqlen_k: seqlen_k is already the table width
-        topk_table,  # 3-D -> selects the QSA path
-        None,  # kv_batch_idx: rejected
-        None,  # leftpad_k: rejected, indices are already absolute
-        None,
-        None,
-        None,  # rotary_cos, rotary_sin, seqlens_rotary
-        None,
-        None,
-        None,  # q_descale, k_descale, v_descale
-        softmax_scale,
-        True,  # is_causal: seqused_k is only honoured for QSA under causal
-        -1,  # window_size_left
-        -1,  # window_size_right
-        0,  # attention_chunk
-        0.0,  # softcap
-        True,  # is_rotary_interleaved
-        scheduler_metadata,
-        num_splits,
-        True,  # pack_gqa: QSA carries qhead_per_khead rows in one kBlockM
-        0,  # sm_margin
-        None,  # s_aux
+        cache_seqlens=seqused_k,
+        page_table=topk_table,  # 3-D -> selects the QSA path
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        # causal: seqused_k is only honoured for QSA under causal.
+        causal=True,
+        scheduler_metadata=scheduler_metadata,
+        num_splits=num_splits,
+        # QSA carries qhead_per_khead rows in one kBlockM.
+        pack_gqa=True,
+        return_softmax_lse=True,
         qsa_allow_aiu=qsa_allow_aiu,
     )
     if NVTX_PROFILE:
         th_nvtx_range_pop()
-    return (out, softmax_lse) if return_softmax_lse else out
+    fa_out, softmax_lse = result[0], result[1]
+    if out is not None:
+        out.copy_(fa_out)
+        fa_out = out
+    return (fa_out, softmax_lse) if return_softmax_lse else fa_out
 
 
 def _probe_fa3_qsa(device=None) -> tuple[bool, str | None]:
@@ -234,6 +250,10 @@ def _probe_fa3_qsa(device=None) -> tuple[bool, str | None]:
             "flash_attn_3.fwd has no qsa_allow_aiu argument, so QSA cannot be routed "
             "off the AIU paged-KV bulk load"
         )
+    try:
+        _fa3_kvcache_api()
+    except ImportError as exc:
+        return _fail(f"cannot import flash_attn_with_kvcache: {exc}")
 
     softmax_scale = _QSA_HEAD_DIM**-0.5
     width = len(_QSA_PROBE_TOPK)
