@@ -134,3 +134,72 @@ def test_export_dispatch_preserves_bf16_and_per_layer_precision(
     config.fp8_channelwise_layers.remove("layers.0.attn.wkv")
     with pytest.raises(ValueError, match="some but not all shards"):
         dispatch(config, Linear(), "language_model.model.layers.0.attn.fused_wqa_wkv")
+
+
+@pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
+@pytest.mark.parametrize("bias", [False, True])
+def test_fp8_linear_preserves_native_route_without_software_gemm(ppu, cap, bias):
+    calls = []
+
+    def native(a, b, **kwargs):
+        calls.append((a, b, kwargs))
+        return SimpleNamespace(view=lambda *shape: ("native", shape))
+
+    platform = SimpleNamespace(
+        is_ppu=lambda: ppu,
+        is_device_capability=lambda expected: cap == expected,
+    )
+    supported = function(
+        "vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py",
+        "PPUCutlassFP8ScaledMMLinearKernel.is_supported",
+        {"current_platform": platform},
+    )
+    ok, reason = supported(None, cap[0] * 10 + cap[1])
+    assert ok is ppu
+    assert reason is None if ppu else "requires PPU" in reason
+    apply = function(
+        "vllm_sail/model_executor/kernels/linear/scaled_mm/ppu.py",
+        "PPUCutlassFP8ScaledMMLinearKernel.apply_scaled_mm",
+        {"ops": SimpleNamespace(cutlass_scaled_mm=native)},
+    )
+    a, b, as_, bs = (object() for _ in range(4))
+    bias_tensor = object() if bias else None
+    assert apply(
+        None,
+        A=a,
+        B=b,
+        As=as_,
+        Bs=bs,
+        bias=bias_tensor,
+        out_dtype="bf16",
+        output_shape=[1, 2, 3],
+    ) == ("native", (1, 2, 3))
+    assert calls == [
+        (a, b, dict(out_dtype="bf16", scale_a=as_, scale_b=bs, bias=bias_tensor))
+    ]
+
+
+@pytest.mark.parametrize("ppu,cap", [(True, (8, 0)), (True, (8, 9)), (False, (8, 0))])
+@pytest.mark.parametrize("clean", [False, True])
+def test_fp8_paged_logits_keeps_sdk_route_without_ppu_emulation(ppu, cap, clean):
+    calls = []
+
+    def sdk(*args, **kwargs):
+        calls.append(("sdk", args, kwargs))
+        return "sdk"
+
+    wrapper = function(
+        "vllm_sail/utils/deep_gemm.py",
+        "fp8_paged_mqa_logits",
+        {
+            "current_platform": SimpleNamespace(
+                is_ppu=lambda: ppu,
+                is_device_capability=lambda expected: cap == expected,
+            ),
+            "_lazy_init": lambda: calls.append(("lazy",)),
+            "_fp8_paged_mqa_logits_impl": sdk,
+        },
+    )
+    args = tuple(range(7))
+    assert wrapper(*args, clean) == "sdk"
+    assert calls == [("lazy",), ("sdk", args, dict(clean_logits=clean))]

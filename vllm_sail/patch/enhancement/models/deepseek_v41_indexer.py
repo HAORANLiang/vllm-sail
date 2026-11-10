@@ -18,7 +18,7 @@ _AFFECTED = ">=0.31.0,<0.32.0"
     "vllm.models.deepseek_v41.attention",
     "DeepseekV4IndexerCache.get_kv_cache_spec",
     reason=(
-        "SAIL paged FP8 logits requires 64 stored rows per page. V4.1 C1 and "
+        "SAIL paged indexer logits require 64 stored rows per page. V4.1 C1 and "
         "C2 indexers therefore need independent 64- and 128-token cache blocks; "
         "splitting the main cache's shared padded pages cannot express this."
     ),

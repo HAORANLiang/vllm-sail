@@ -428,7 +428,15 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
     )
     modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
-    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: True))
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=object)
+    modules("torch", int8="int8")
+    modules("vllm_sail.models.deepseek_v41.config", int8_w8a8_enabled=lambda: False)
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True, is_device_capability=lambda cap: False
+        ),
+    )
     module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
     attn = module.DeepseekV41FlashMLAAttention()
     attn.__dict__.update(
@@ -450,6 +458,130 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     assert attn.wo_a.weight is loaded
     assert attn.forward_mqa is Upstream.forward_mqa
     assert attn._forward_prefill is Upstream._forward_prefill
+
+
+@pytest.mark.parametrize(
+    "ppu,capability,contract",
+    [
+        (True, (8, 0), True),
+        (True, (8, 0), False),
+        (True, (8, 9), True),
+        (True, (8, 9), False),
+        (True, (9, 0), True),
+        (False, (8, 0), True),
+        (False, (8, 9), True),
+    ],
+)
+@pytest.mark.parametrize("weight_dtype", ["int8", "bf16"])
+@pytest.mark.parametrize("num_heads", [2, 4, 8, 16, 32, 64])
+def test_v41_projection_dispatches_by_quantization(
+    modules, ppu, capability, contract, weight_dtype, num_heads
+):
+    calls = []
+
+    class Upstream:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return 64
+
+        def _o_proj(self, *args):
+            calls.append(("upstream", args, {}))
+            return "upstream"
+
+    class Backend:
+        @classmethod
+        def supports_compute_capability(cls, cap):
+            return cap.major in (9, 10)
+
+    class PPUV4:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return heads + 128
+
+        def _o_proj(self, *args):
+            calls.append(("ppuv4", args, {}))
+            return "ppuv4"
+
+    class Output:
+        def __getitem__(self, slices):
+            assert slices == (slice(None), slice(None, num_heads))
+            return "actual_heads"
+
+    def int8(*args, **kw):
+        calls.append(("int8", args, kw))
+        return "int8"
+
+    def unavailable(*args):
+        raise AssertionError("FlashMLA must reuse the model's published decision")
+
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=unavailable)
+    # DeepseekV41ForCausalLM publishes is_ppu() and uses_int8_w8a8(config).
+    published = SimpleNamespace(value=ppu and contract)
+    modules(
+        "vllm_sail.models.deepseek_v41.config",
+        uses_int8_w8a8=unavailable,
+        int8_w8a8_enabled=lambda: published.value,
+    )
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(is_ppu=lambda: ppu),
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda *args: None,
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+        deep_gemm_fp8_o_proj=lambda *args: None,
+    )
+    modules("vllm_sail.models.deepseek_v4.ops.o_proj", deep_gemm_int8_o_proj=int8)
+    modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=PPUV4)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
+    )
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=Backend)
+    module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
+    cls = module.DeepseekV41FlashMLAAttention
+    attn = cls()
+    # _o_proj uses the construction-time snapshot, not the current flag.
+    published.value = not published.value
+    attn.__dict__.update(
+        _o_proj_block_size=128,
+        wo_a=SimpleNamespace(weight=SimpleNamespace(dtype=weight_dtype)),
+        _wo_b_proj=object(),
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=num_heads,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+    )
+    expected = (
+        "int8"
+        if ppu and contract and weight_dtype == "int8"
+        else "ppuv4"
+        if ppu
+        else "upstream"
+    )
+    assert attn._o_proj(Output(), object()) == expected
+    if expected == "int8":
+        _, args, kw = calls[-1]
+        assert (
+            args[0] == "actual_heads"
+            and args[3] is attn.wo_a
+            and args[4] is attn._wo_b_proj
+        )
+        assert kw["einsum_recipe"] == (1, 1, 128)
+        assert kw["heads_per_group"] == num_heads // attn.n_local_groups
+    # PPU always uses the PPU V4 padding; the INT8 projection slices actual heads.
+    expected_heads = num_heads + 128 if ppu else 64
+    assert cls.get_padded_num_q_heads(num_heads) == expected_heads
+    backend = module.PPUDeepseekV41FlashMLABackend
+    for major, minor in ((8, 0), (8, 9), (9, 0), (10, 0)):
+        assert backend.supports_compute_capability(
+            SimpleNamespace(major=major, minor=minor)
+        ) is (ppu or major in (9, 10))
 
 
 def test_v41_draft_inherits_its_own_loader_and_execution(modules):
@@ -486,3 +618,66 @@ def test_v41_draft_inherits_its_own_loader_and_execution(modules):
     assert draft.hf_to_vllm_mapper is mapper
     assert mapper_args == [("fp4", "weight_scale")]
     assert draft.packed_modules_mapping["fused_wqa_wkv"] == ["wq_a", "wkv"]
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("int8", [False, True])
+def test_v41_model_resolves_int8_at_construction_like_v4(
+    modules, monkeypatch, ppu, int8
+):
+    calls = []
+    published = []
+    selected = ppu and int8
+    original_mapper, mapped = object(), object()
+    config = SimpleNamespace(quant_config=None)
+
+    class Base:
+        hf_to_vllm_mapper = original_mapper
+
+        def __init__(self, **kwargs):
+            # Upstream layers are built here and must already see the decision.
+            calls.append(("construct", kwargs, list(published)))
+
+        def forward(self, *args, **kwargs):
+            return 17
+
+    def recognize(value):
+        assert value is config
+        calls.append(("recognize",))
+        return int8
+
+    def map_weights(mapper):
+        assert mapper is original_mapper
+        calls.append(("map",))
+        return mapped
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("the V4.1 model must not touch the global config")
+
+    modules(
+        "vllm.config",
+        set_current_vllm_config=unavailable,
+        get_current_vllm_config=unavailable,
+    )
+    modules("vllm.models.deepseek_v41.nvidia.vl_model", DeepseekV41ForCausalLM=Base)
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules(
+        "vllm_sail.models.deepseek_v41.config",
+        uses_int8_w8a8=recognize,
+        set_int8_w8a8=published.append,
+    )
+    module = load_patch("vllm_sail/models/deepseek_v41/model.py")
+    monkeypatch.setattr(module, "int8_weights_mapper", map_weights)
+    model = module.DeepseekV41ForCausalLM(vllm_config=config, prefix="model")
+    assert [call[0] for call in calls] == (
+        (["recognize"] if ppu else []) + ["construct"] + (["map"] if selected else [])
+    )
+    construct = next(call for call in calls if call[0] == "construct")
+    assert construct[1:] == (dict(vllm_config=config, prefix="model"), [selected])
+    assert published == [selected]
+    assert model.hf_to_vllm_mapper is (mapped if selected else original_mapper)
+    assert Base.hf_to_vllm_mapper is original_mapper
+    # Like the PPU V4 model, forward is inherited unchanged.
+    assert "forward" not in vars(module.DeepseekV41ForCausalLM)
+    assert model.forward(1, 2, 3, 4, lookback_token_ids=5) == 17
+    assert not hasattr(model, "_v41_int8_config")

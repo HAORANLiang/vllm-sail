@@ -5,8 +5,8 @@
 
 The fork makes three changes to ``SparseAttnIndexer``:
 
-* ``__init__`` warns instead of raising when DeepGEMM is missing on PPU (the
-  op falls back to a less efficient PyTorch path); upstream raises on CUDA,
+* ``__init__`` warns instead of raising when DeepGEMM is missing on PPU;
+  logits execution still requires SAIL DeepGEMM. Upstream raises on CUDA,
   which PPU inherits via ``PlatformEnum.CUDA``. Verbatim body with markers —
   delegation cannot intercept the upstream raise.
 * ``forward_native`` redirects to ``forward_ppu`` on PPU before the CUDA
@@ -52,11 +52,11 @@ def _with_target_globals(fn):
     _MODULE,
     "SparseAttnIndexer.__init__",
     reason=(
-        "PPU tolerates a missing DeepGEMM in SparseAttnIndexer with a warning "
-        "(falling back to a less efficient PyTorch path), while upstream raises "
-        "on CUDA. PPU inherits the CUDA raise via PlatformEnum.CUDA, so the "
-        "fork's PPU branch must run first. Delegation cannot intercept the "
-        "upstream raise, hence the verbatim body."
+        "PPU warns about a missing DeepGEMM in SparseAttnIndexer, while upstream "
+        "raises on CUDA. PPU inherits the CUDA raise via PlatformEnum.CUDA, so "
+        "the fork's PPU branch must run first. Delegation cannot intercept the "
+        "upstream raise, hence the verbatim body. PPU logits still require SAIL "
+        "DeepGEMM."
     ),
     affected_versions=_AFFECTED,
     remove_when="upstream downgrades the missing-DeepGEMM error to a warning, or PPU always ships DeepGEMM.",
