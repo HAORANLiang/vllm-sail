@@ -444,12 +444,18 @@ def test_ci_uses_separate_pinned_build_and_runtime_stacks():
             assert "image" not in trigger["inputs"]
 
 
-def test_interface_source_contracts_share_the_unit_test_source_job():
+def test_unit_test_workflow_covers_all_contract_tests():
     import yaml
 
-    interface = yaml.safe_load((WORKFLOW.parent / "interface-compat.yaml").read_text())
-    assert set(interface["jobs"]) == {"cpu-interface-compat", "category2-gate"}
     unit_tests = yaml.safe_load((WORKFLOW.parent / "ut.yaml").read_text())
+    cpu = next(
+        step["run"].split()
+        for step in unit_tests["jobs"]["cpu-unit-tests"]["steps"]
+        if "pytest" in step.get("run", "")
+    )
+    assert cpu[:4] == ["python", "-m", "pytest", "tests/ut"]
+    narrowing = {"-m", "-k", "--deselect", "--ignore", "--ignore-glob"}
+    assert not [arg for arg in cpu[4:] if arg.split("=")[0] in narrowing]
     source = unit_tests["jobs"]["vllm-source-contracts"]
     assert source["name"] == "vLLM source (main-verified)"
     upstream = next(
