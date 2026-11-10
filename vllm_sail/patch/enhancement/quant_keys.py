@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 from vllm_sail.patch.utils import patch_value
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _REASON = (
     "PPU's Acext fused-MoE experts declare their supported quantization schemes "
     "with these int8 QuantKey constants. Upstream defines the fp8/nvfp4/mxfp4 "

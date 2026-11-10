@@ -21,7 +21,7 @@ from vllm.utils import import_utils
 
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 _upstream_has_cutedsl = import_utils.has_cutedsl
 _upstream_has_humming = import_utils.has_humming

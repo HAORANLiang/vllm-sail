@@ -9,20 +9,18 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tests.support.source import function
-from tests.ut.test_ppu_kernel_capabilities import modules as _modules
 
-modules = _modules
 NAME = "fused_recurrent_gated_delta_rule_packed_decode"
 PATCH = "vllm_sail/patch/enhancement/attention/gdn.py"
 UPSTREAM = "vllm/third_party/flash_linear_attention/ops/fused_recurrent.py"
 CASES = [
     ("ppu", 80, 16, "fp32", 128, 32),
     ("ppu", 89, 17, "fp32", 128, 32),
-    ("cuda", 90, 16, "fp32", 128, 4),
-    ("cuda", 90, 17, "fp32", 128, 4),
+    ("cuda", 90, 16, "fp32", 128, 32),
+    ("cuda", 90, 17, "fp32", 128, 32),
     ("cuda", 90, 16, "bf16", 128, 32),
     ("cuda", 90, 17, "bf16", 128, 32),
-    ("cuda", 90, 0, "fp32", 128, 4),
+    ("cuda", 90, 0, "fp32", 128, 32),
     ("ppu", 89, 0, "fp32", 128, 32),
     ("cuda", 100, 16, "fp32", 128, 4),
     ("cuda", 100, 17, "fp32", 128, 8),

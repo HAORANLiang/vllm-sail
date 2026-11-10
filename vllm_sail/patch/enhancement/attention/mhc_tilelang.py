@@ -17,7 +17,7 @@ _upstream_prenorm = _tilelang._hc_prenorm_gemm_outputs
     "vllm.model_executor.kernels.mhc.tilelang",
     "_hc_prenorm_gemm_outputs",
     reason="PPU MHC uses SAIL DeepGEMM, one split and zeroed accumulators.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="The upstream MHC prenorm helper supports platform dispatch.",
 )
 def _hc_prenorm_gemm_outputs(

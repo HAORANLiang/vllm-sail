@@ -18,7 +18,7 @@ _upstream = cache_utils.dequantize_and_gather_k_cache
     "vllm.models.deepseek_v4.common.ops.cache_utils",
     "dequantize_and_gather_k_cache",
     reason="PPU 1.0 Triton cannot compile the packed cache's hardware FP8 bitcast; use software E4M3 decoding.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="vLLM exposes packed MLA cache kernel registration or supports software FP8 decoding on PPU 1.0.",
 )
 def dequantize_and_gather_k_cache(
@@ -75,6 +75,6 @@ for _consumer_name in (
             _consumer_name,
             "dequantize_and_gather_k_cache",
             reason="Preloaded V4 cache consumers must use the PPU gather implementation.",
-            affected_versions=">=0.32.0,<0.33.0",
+            affected_versions=">=0.33.0,<0.34.0",
             remove_when="Consumers resolve cache helpers through their provider module.",
         )(dequantize_and_gather_k_cache)

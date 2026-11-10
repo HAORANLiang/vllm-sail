@@ -35,7 +35,7 @@ from vllm.v1.attention.ops import flashmla as _flashmla_ops
 import vllm_sail.envs as ppu_envs
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _MODULE = "vllm.v1.attention.ops.flashmla"
 
 try:  # torch.cuda.nvtx is absent on CPU-only torch builds.

@@ -68,10 +68,10 @@ SDK, mirror and parallelism options. Continue with step 4 for runtime checks.
 
 Install a vLLM build with `VLLM_TARGET_DEVICE=empty` in the same environment.
 This lets the PPU plugin provide the native operations used by the engine.
-The supported release line is `>=0.32.0,<0.33.0`. Build the exact upstream commit
+The supported release line is `>=0.33.0,<0.34.0`. Build the exact upstream commit
 recorded in [the verified pin](../../.github/vllm-main-verified.commit) and
 [kernel manifest](../../csrc/upstream/manifest.toml); both records must agree.
-**v0.32.0** is the release baseline for this line.
+**v0.33.0** is the release baseline for this line.
 
 For a commit-pinned main build, the full upstream SHA establishes compatibility.
 The numeric prefix produced by setuptools-scm or `git describe` can depend on

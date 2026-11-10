@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
 
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _PROVIDER = "vllm.models.glm5next.nvidia.ops.kpool_compress"
 # ``common.attention`` is the live consumer. The legacy
 # ``nvidia/attention.py`` copy imports ``model_executor.layers.

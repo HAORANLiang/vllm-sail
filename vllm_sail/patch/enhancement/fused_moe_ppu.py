@@ -53,7 +53,7 @@ _QUANTIZE_INPUT_CONSUMERS = tuple(
         "prepare_finalize.no_dp_ep",
     )
 ) + ("vllm.model_executor.models.k2_horizon",)
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 
 REASON_DTYPE_STR = (
     "PPU int8 W8A8 MoE flows look up tuned configs by the name int8_w8a8; "

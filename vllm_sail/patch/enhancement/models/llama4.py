@@ -14,7 +14,7 @@ from vllm.model_executor.models.llama4 import Llama4MoE
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 # Captured before patching; torch.compile is lazy, so this is cheap at
 # import time and mirrors the fork's decorator placement.

@@ -24,7 +24,7 @@ REASON = (
     "the DeepEP low-latency buffer kwargs must not carry it. Upstream passes "
     "enable_shrink=self.support_fault_tolerance unconditionally."
 )
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 REMOVE_WHEN = (
     "the PPU deep_ep build implements enable_shrink (shrinkable buffers for "
     "fault tolerance), at which point the upstream kwarg can flow through "

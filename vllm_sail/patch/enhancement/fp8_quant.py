@@ -11,7 +11,7 @@ from vllm_sail.patch.utils import patch
 
 _META = dict(
     reason="PPU QuantFP8 consumes fused residual RMSNorm context and optional optimized group quantization.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="Upstream QuantFP8 exposes a fused norm and platform group-quant hook.",
 )
 _original = _quant.QuantFP8.forward_cuda

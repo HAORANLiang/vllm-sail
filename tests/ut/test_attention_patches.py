@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.ut.test_upstream_version_precheck import SUPPORTED_RANGE
+from tests.support.upstream import SUPPORTED_RANGE
 
 pytest.importorskip("torch", reason="requires torch")
 pytest.importorskip("vllm", reason="requires vLLM")
@@ -112,6 +112,10 @@ _ATTENTION_TARGETS = (
     (
         "vllm.v1.attention.backends.mla.indexer",
         "DeepseekV32IndexerMetadataBuilder.build",
+    ),
+    (
+        "vllm.v1.attention.backends.mla.indexer",
+        "DeepseekV32IndexerMetadataBuilder.update_draft_decode_metadata",
     ),
     (
         "vllm.v1.attention.ops.triton_decode_attention",

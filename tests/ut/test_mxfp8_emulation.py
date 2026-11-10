@@ -6,11 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.support.modules import load_patch
 from tests.support.source import function
-from tests.ut import test_ppu_kernel_capabilities as harness
-
-modules = harness.modules
-load_patch = harness.load_patch
 
 
 @pytest.mark.parametrize("is_ppu", [True, False])
@@ -264,8 +261,7 @@ def test_upstream_dequantizes_at_load_or_per_forward(
         "dequant_mxfp8_to_bf16": dequant,
     }
     utils = upstream_source_root / "vllm/model_executor/utils.py"
-    for name in ("_extent", "_in_own_storage", "replace_parameter"):
-        function(utils, name, namespace)
+    function(utils, "replace_parameter", namespace)
     path = (
         upstream_source_root / "vllm/model_executor/kernels/linear/mxfp8/emulation.py"
     )

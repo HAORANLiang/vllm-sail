@@ -44,7 +44,6 @@ def test_installed_mlp_keeps_unfused_cpu_tensor_identity(monkeypatch, dtype_name
         swiglu_beta=1,
     )
     instance = provider.MiniMaxM3MLP(config, 16, prefix="model.layers.0.mlp")
-    assert instance.fused_gemm1_min_tokens is None
     x = torch.ones(3, 8, dtype=getattr(torch, dtype_name), device="cpu")
     assert instance(x) is x
     assert calls == ["model.layers.0.mlp.gate_up_proj", "model.layers.0.mlp.down_proj"]

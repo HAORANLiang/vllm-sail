@@ -36,7 +36,7 @@ REASON = (
     "are traced into a piecewise graph segment instead of being attention "
     "boundaries."
 )
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 REMOVE_WHEN = (
     "upstream includes the PPU indexer ops in CompilationConfig._attention_ops "
     "itself, or the PPU indexers stop registering their own torch ops and reuse "

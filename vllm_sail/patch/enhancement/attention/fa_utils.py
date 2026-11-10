@@ -14,7 +14,7 @@ from vllm_sail.patch.bodies import bind_body
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _MODULE = "vllm.v1.attention.backends.fa_utils"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 
 def get_flash_attn_version(

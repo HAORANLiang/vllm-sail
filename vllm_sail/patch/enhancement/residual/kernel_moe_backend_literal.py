@@ -35,14 +35,14 @@ from vllm_sail.patch.utils import PATCH_REGISTRY, PatchRecord
 
 _MODULE = "vllm.config.kernel"
 _TARGET = "vllm.config.kernel.MoEBackend"
-PPU_MOE_BACKENDS = ("ppu_deep_gemm", "ppu_acext", "ppu_deep_gemm_w4a16")
+PPU_MOE_BACKENDS = ("ppu_deep_gemm", "ppu_acext", "ppu_deep_gemm_w4a16", "ppu_deep_gemm_w4a8")
 REASON = (
     "KernelConfig validates moe_backend against the MoEBackend Literal, which "
     "upstream does not extend. The PPU backend names must pass validation for "
     "--moe-backend / --kernel-config CLI parity; the env-var knob "
     "VLLM_PPU_MOE_BACKEND bypasses validation and remains the primary knob."
 )
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 REMOVE_WHEN = (
     "upstream gains a register_moe_backend() extension point mirroring "
     "register_linear_kernel (the plugin's #1 upstream RFC), or accepts the "

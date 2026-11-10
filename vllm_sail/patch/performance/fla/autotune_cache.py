@@ -39,7 +39,7 @@ from vllm_sail.patch.utils import patch
 
 logger = init_logger(__name__)
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 #: Upstream FLA ops modules and the autotuned kernels the fork decorates with
 #: cache_results=True. Kept explicit so an upstream rename fails loudly.

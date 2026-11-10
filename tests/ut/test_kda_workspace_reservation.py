@@ -8,11 +8,8 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.ut.test_ppu_kernel_capabilities import load_patch
-from tests.ut.test_ppu_kernel_capabilities import modules as _modules
+from tests.support.modules import load_patch
 from vllm_sail.patch.bodies import bind_body
-
-modules = _modules
 
 
 @dataclass
@@ -35,8 +32,10 @@ def upstream_constructor(
     )
     self.kda_prefill_backend = backend
     self._flashkda_buffer_specs = None
-    if backend == "flashinfer" and is_workspace_manager_initialized():  # noqa: F821
-        current_workspace_manager().get_simultaneous(  # noqa: F821
+    from vllm.v1.worker import workspace
+
+    if backend == "flashinfer" and workspace.is_workspace_manager_initialized():
+        workspace.current_workspace_manager().get_simultaneous(
             (
                 (
                     1,
@@ -80,6 +79,12 @@ def kda_constructor(modules):
             assert initialized
             return NS(get_simultaneous=reserve)
 
+        modules(
+            "vllm.v1.worker.workspace",
+            is_workspace_manager_initialized=lambda: initialized,
+            current_workspace_manager=manager,
+        )
+
         def resolve(backend, head_dim, dtype, state_dtype, lower_bound):
             assert (head_dim, dtype, state_dtype, lower_bound) == (
                 128,
@@ -108,8 +113,6 @@ def kda_constructor(modules):
             is_fused_kda_decode_supported=lambda *args: False,
             _flashkda_prefill=lambda *args: None,
             resolve_kda_prefill_backend=resolve,
-            is_workspace_manager_initialized=lambda: initialized,
-            current_workspace_manager=manager,
             FlashKDAPrefillCheckpointExporter=lambda: "checkpoint-exporter",
             eager_break_during_capture=lambda fn: fn,
             record_ctor=lambda *args: calls.append(args),

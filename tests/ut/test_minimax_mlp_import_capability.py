@@ -2,17 +2,11 @@
 """Run the whole upstream model's MLP across the NVIDIA import boundary."""
 
 import ast
-import importlib.abc
 import importlib.util
 import sys
 from types import SimpleNamespace as NS
 
 import pytest
-
-from tests.ut.test_ppu_kernel_capabilities import load_patch
-from tests.ut.test_ppu_kernel_capabilities import modules as _modules
-
-modules = _modules
 
 
 def load_model(modules, monkeypatch, source, ppu):
@@ -80,11 +74,9 @@ def load_model(modules, monkeypatch, source, ppu):
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("ppu", [False, True])
-@pytest.mark.parametrize("fuse", [False, True])
-@pytest.mark.parametrize("threshold", [16, 64])
-@pytest.mark.parametrize("autotune", [False, True])
-def test_registered_mlp_keeps_constructor_and_forward_contract(
-    modules, monkeypatch, upstream_source_root, ppu, fuse, threshold, autotune
+@pytest.mark.parametrize("reduce_results", [False, True])
+def test_release_mlp_keeps_constructor_and_forward_contract(
+    modules, monkeypatch, upstream_source_root, ppu, reduce_results
 ):
     provider = load_model(modules, monkeypatch, upstream_source_root, ppu)
     calls = []
@@ -94,15 +86,10 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
     class Linear:
         def __init__(self, *args, **kwargs):
             self.args, self.kwargs = args, kwargs
-            calls.append(("linear", self))
 
         def __call__(self, x):
             calls.append(("linear-forward", self, x))
-            return (
-                gate_up
-                if len(self.args) == 2 and isinstance(self.args[1], list)
-                else output
-            ), None
+            return (gate_up if isinstance(self.args[1], list) else output), None
 
     class Activation:
         def __init__(self, **kwargs):
@@ -115,8 +102,6 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
 
     provider.MergedColumnParallelLinear = provider.RowParallelLinear = Linear
     provider.SiluAndMulWithClamp = Activation
-    provider.envs = NS(VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=threshold)
-    provider.is_flashinfer_autotuning = lambda: autotune
     config = NS(
         hidden_size=8,
         hidden_act="swigluoai",
@@ -124,84 +109,37 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
         swiglu_alpha=1.702,
         swiglu_beta=1,
     )
-    name = "vllm.models.minimax_m3.nvidia.ops"
-
-    class Forbidden(importlib.abc.MetaPathFinder):
-        def find_spec(self, fullname, path=None, target=None):
-            if fullname == name or fullname.startswith(name + "."):
-                raise ModuleNotFoundError("NVIDIA-only dense import", name="quack")
-            return None
-
-    def capable(*args):
-        calls.append(("capability", args))
-        return fuse
-
-    def fused(x, linear, act):
-        calls.append(("fused-forward", x, linear, act))
-        return activated
-
-    if ppu:
-        monkeypatch.setattr(sys, "meta_path", [Forbidden(), *sys.meta_path])
-        with pytest.raises(ModuleNotFoundError, match="NVIDIA-only"):
-            provider.MiniMaxM3MLP(config, 16)
-        calls.clear()
-    else:
-        dense = modules(
-            name + ".dense_gemm1_mxfp8",
-            can_fuse_gemm1=capable,
-            MIN_TOKENS=32,
-            fused_gemm1=fused,
-        )
-        modules(name, dense_gemm1_mxfp8=dense)
-    load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
-    disable = threshold == 64
-    mlp = provider.MiniMaxM3MLP(config, 16, quant, not disable, disable, "layers.0.mlp")
+    mlp = provider.MiniMaxM3MLP(config, 16, quant, reduce_results, "layers.0.mlp")
     assert mlp.initialized
     assert mlp.gate_up_proj.args == (8, [16, 16])
     assert mlp.gate_up_proj.kwargs == dict(
-        bias=False,
-        quant_config=quant,
-        disable_tp=disable,
-        prefix="layers.0.mlp.gate_up_proj",
+        bias=False, quant_config=quant, prefix="layers.0.mlp.gate_up_proj"
     )
     assert mlp.down_proj.args == (16, 8)
     assert mlp.down_proj.kwargs == dict(
         bias=False,
         quant_config=quant,
-        reduce_results=not disable,
-        disable_tp=disable,
+        reduce_results=reduce_results,
         prefix="layers.0.mlp.down_proj",
     )
     assert mlp.act_fn.kwargs == dict(swiglu_limit=7, alpha=1.702, beta=1)
-    assert mlp.fused_gemm1_min_tokens == (
-        None if ppu or not fuse else max(32, threshold)
-    )
-    assert len([c for c in calls if c[0] == "capability"]) == (0 if ppu else 1)
-    calls.clear()
     x = NS(shape=(64, 8))
     assert mlp(x) is output
-    if not ppu and fuse and threshold < 64 and not autotune:
-        assert calls == [
-            ("fused-forward", x, mlp.gate_up_proj, mlp.act_fn),
-            ("linear-forward", mlp.down_proj, activated),
-        ]
-    else:
-        assert calls == [
-            ("linear-forward", mlp.gate_up_proj, x),
-            ("act", gate_up),
-            ("linear-forward", mlp.down_proj, activated),
-        ]
+    assert calls == [
+        ("linear-forward", mlp.gate_up_proj, x),
+        ("act", gate_up),
+        ("linear-forward", mlp.down_proj, activated),
+    ]
 
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("ppu", [False, True])
-def test_registered_mlp_retains_activation_validation(
+def test_release_mlp_retains_activation_validation(
     modules, monkeypatch, upstream_source_root, ppu
 ):
     provider = load_model(modules, monkeypatch, upstream_source_root, ppu)
     provider.MergedColumnParallelLinear = provider.RowParallelLinear = lambda *a, **k: (
         object()
     )
-    load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
     with pytest.raises(ValueError, match="Only swigluoai is supported"):
         provider.MiniMaxM3MLP(NS(hidden_size=8, hidden_act="unsupported"), 16)

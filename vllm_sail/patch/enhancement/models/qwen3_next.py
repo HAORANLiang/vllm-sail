@@ -19,7 +19,7 @@ from __future__ import annotations
 import vllm_sail.envs as ppu_envs
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 _nvtx = None  # (range_push, range_pop), resolved lazily on first use
 

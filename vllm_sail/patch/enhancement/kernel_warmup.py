@@ -261,14 +261,14 @@ else:
         _MODULE,
         "cutedsl_warmup",
         reason="Rebind the preloaded legacy CuTeDSL warmup alias to the PPU guard.",
-        affected_versions=">=0.32.0,<0.33.0",
+        affected_versions=">=0.33.0,<0.34.0",
         remove_when="The legacy CuTeDSL warmup gates execution on backend capabilities.",
     )
     @patch(
         _CUTEDSL_MODULE,
         "cutedsl_warmup",
         reason="Legacy CuTeDSL warmup checks is_cuda(), which also accepts PPU.",
-        affected_versions=">=0.32.0,<0.33.0",
+        affected_versions=">=0.33.0,<0.34.0",
         remove_when="The legacy CuTeDSL warmup gates execution on backend capabilities.",
     )
     def cutedsl_warmup() -> None:
@@ -292,7 +292,7 @@ else:
             "configs anyway. Appends the PPU DeepGEMM warmup with the fork's "
             "env gates after the upstream body."
         ),
-        affected_versions=">=0.32.0,<0.33.0",
+        affected_versions=">=0.33.0,<0.34.0",
         remove_when=(
             "upstream gives kernel_warmup a per-platform warmup registry (or "
             "vllm.utils.deep_gemm dispatches on current_platform), so the PPU "
@@ -339,6 +339,6 @@ else:
             "vllm.v1.worker.gpu_worker",
             "kernel_warmup",
             reason="Rebind the preloaded worker alias so PPU avoids NVIDIA-only MSA warmup imports.",
-            affected_versions=">=0.32.0,<0.33.0",
+            affected_versions=">=0.33.0,<0.34.0",
             remove_when="The worker resolves warmups through a platform-aware registry.",
         )(kernel_warmup)

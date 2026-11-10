@@ -208,6 +208,10 @@ _bf16_grouped_masked_impl: Callable[..., Any] | None = None
 _fp4_grouped_nopad_impl: Callable[..., Any] | None = None
 _fp4_grouped_fused_impl: Callable[..., Any] | None = None
 _fp4_grouped_masked_impl: Callable[..., Any] | None = None
+_fp8_fp4_grouped_nopad_impl: Callable[..., Any] | None = None
+_fp8_fp4_grouped_fused_impl: Callable[..., Any] | None = None
+_fp8_fp4_grouped_masked_impl: Callable[..., Any] | None = None
+_preprocess_weights_and_scales_impl: Callable[..., Any] | None = None
 _w4a16_grouped_nopad_impl: Callable[..., Any] | None = None
 _w4a16_grouped_fused_impl: Callable[..., Any] | None = None
 _w4a16_grouped_masked_impl: Callable[..., Any] | None = None
@@ -231,9 +235,16 @@ _get_compile_mode_impl: Callable[..., Any] | None = None
 _moe_align_block_size_impl: Callable[..., Any] | None = None
 
 # fused activation (+ optional quant)
-_activation_quant_mode_impl: Any | None = None
-_silu_and_mul_impl: Callable[..., Any] | None = None
-_situ_and_mul_impl: Callable[..., Any] | None = None
+#
+# `ActivationMode` picks the gate/up math, `QuantMode` the epilogue:
+#   * `activation_and_mul(activation_mode, quant_mode, input, ...)` -- dense.
+#   * `activation_and_mul_masked(activation_mode, quant_mode, input[E, T, 2N],
+#     masked_m, ...)` -- the latter additionally skips every row beyond each
+#     expert's valid token count.
+_activation_mode_impl: Any | None = None
+_quant_mode_impl: Any | None = None
+_activation_and_mul_impl: Callable[..., Any] | None = None
+_activation_and_mul_masked_impl: Callable[..., Any] | None = None
 
 
 def _lazy_init() -> None:
@@ -246,6 +257,11 @@ def _lazy_init() -> None:
     global _bf16_gemm_nt_impl
     global _bf16_grouped_nopad_impl, _bf16_grouped_masked_impl
     global _fp4_grouped_nopad_impl, _fp4_grouped_fused_impl, _fp4_grouped_masked_impl
+    global \
+        _fp8_fp4_grouped_nopad_impl, \
+        _fp8_fp4_grouped_fused_impl, \
+        _fp8_fp4_grouped_masked_impl
+    global _preprocess_weights_and_scales_impl
     global \
         _w4a16_grouped_nopad_impl, \
         _w4a16_grouped_fused_impl, \
@@ -260,7 +276,11 @@ def _lazy_init() -> None:
     global _get_mk_alignment_for_contiguous_layout_impl
     global _transform_sf_into_required_layout_impl
     global _moe_align_block_size_impl
-    global _activation_quant_mode_impl, _silu_and_mul_impl, _situ_and_mul_impl
+    global \
+        _activation_mode_impl, \
+        _quant_mode_impl, \
+        _activation_and_mul_impl, \
+        _activation_and_mul_masked_impl
 
     # fast path
     if (
@@ -278,6 +298,10 @@ def _lazy_init() -> None:
         or _fp4_grouped_nopad_impl is not None
         or _fp4_grouped_fused_impl is not None
         or _fp4_grouped_masked_impl is not None
+        or _fp8_fp4_grouped_nopad_impl is not None
+        or _fp8_fp4_grouped_fused_impl is not None
+        or _fp8_fp4_grouped_masked_impl is not None
+        or _preprocess_weights_and_scales_impl is not None
         or _w4a16_grouped_nopad_impl is not None
         or _w4a16_grouped_fused_impl is not None
         or _w4a16_grouped_masked_impl is not None
@@ -292,7 +316,7 @@ def _lazy_init() -> None:
         or _get_mk_alignment_for_contiguous_layout_impl is not None
         or _transform_sf_into_required_layout_impl is not None
         or _moe_align_block_size_impl is not None
-        or _silu_and_mul_impl is not None
+        or _activation_and_mul_impl is not None
     ):
         return
 
@@ -351,15 +375,30 @@ def _lazy_init() -> None:
     _fp4_grouped_masked_impl = getattr(
         _dg, "m_grouped_gemm_fp4_fp4_bf16_nt_masked", None
     )
+    _fp8_fp4_grouped_nopad_impl = getattr(
+        _dg, "m_grouped_gemm_fp8_fp4_bf16_nt_nopad", None
+    )
+    _fp8_fp4_grouped_fused_impl = getattr(
+        _dg, "m_grouped_gemm_fp8_fp4_bf16_nt_fused", None
+    )
+    _fp8_fp4_grouped_masked_impl = getattr(
+        _dg, "m_grouped_gemm_fp8_fp4_bf16_nt_masked", None
+    )
+    _preprocess_weights_and_scales_impl = getattr(
+        _dg, "preprocess_weights_and_scales", None
+    )
     _w4a16_grouped_nopad_impl = getattr(_dg, "m_grouped_gemm_w4a16_nopad", None)
     _w4a16_grouped_fused_impl = getattr(_dg, "m_grouped_gemm_w4a16_fused", None)
     _w4a16_grouped_masked_impl = getattr(_dg, "m_grouped_gemm_w4a16_masked", None)
     _get_compile_mode_impl = getattr(_dg, "get_compile_mode", None)
     _set_compile_mode_impl = getattr(_dg, "set_compile_mode", None)
     _moe_align_block_size_impl = getattr(_dg, "moe_align_block_size", None)
-    _activation_quant_mode_impl = getattr(_dg, "ActivationQuantMode", None)
-    _silu_and_mul_impl = getattr(_dg, "silu_and_mul", None)
-    _situ_and_mul_impl = getattr(_dg, "situ_and_mul", None)
+    _activation_mode_impl = getattr(_dg, "ActivationMode", None)
+    _quant_mode_impl = getattr(_dg, "QuantMode", None)
+    _activation_and_mul_impl = getattr(_dg, "activation_and_mul", None)
+    _activation_and_mul_masked_impl = getattr(
+        _dg, "activation_and_mul_masked", None
+    )
     DeepGemmQuantScaleFMT.init_oracle_cache()
 
 
@@ -491,6 +530,58 @@ def bf16_m_grouped_gemm_nt_masked(*args, **kwargs):
     return _bf16_grouped_masked_impl(*args, **kwargs)
 
 
+def m_grouped_fp8_fp4_gemm_nt_nopad(*args, **kwargs):
+    """Grouped GEMM with FP8 per-token activations and W4A8-MXFP4 weights.
+
+    lhs is ``(a_fp8, a_scales)`` with per-token FP8 scales [M, 1]; rhs is
+    ``(packed_weight, preprocessed_scales)`` as returned by
+    `preprocess_weights_and_scales(W4A8_MXFP4_MMA, ...)`. Pass the returned
+    weight inverse scale as the ``inv_scale`` argument; the kernel applies it
+    to the activation row scales, so they must stay plain ``amax / 448``.
+    """
+    _lazy_init()
+    if _fp8_fp4_grouped_nopad_impl is None:
+        return _missing(*args, **kwargs)
+    return _fp8_fp4_grouped_nopad_impl(*args, **kwargs)
+
+
+def m_grouped_fp8_fp4_gemm_nt_fused(*args, **kwargs):
+    _lazy_init()
+    if _fp8_fp4_grouped_fused_impl is None:
+        return _missing(*args, **kwargs)
+    return _fp8_fp4_grouped_fused_impl(*args, **kwargs)
+
+
+def fp8_fp4_m_grouped_gemm_nt_masked(*args, **kwargs):
+    _lazy_init()
+    if _fp8_fp4_grouped_masked_impl is None:
+        return _missing(*args, **kwargs)
+    return _fp8_fp4_grouped_masked_impl(*args, **kwargs)
+
+
+def get_preprocess_mode() -> Any:
+    """Return DeepGEMM's `PreprocessMode` enum."""
+    _lazy_init()
+    if _preprocess_weights_and_scales_impl is None:
+        return _missing()
+    return importlib.import_module("deep_gemm").PreprocessMode
+
+
+def preprocess_weights_and_scales(*args, **kwargs):
+    """Preprocess packed W4 weights and raw group scales for DeepGEMM W4 GEMMs.
+
+    For ``PreprocessMode.W4A8_MXFP4_MMA`` returns
+    ``(weight, adjusted_scales, weight_inv_scale)``; the inverse scale must
+    be applied exactly once per GEMM, preferably as that GEMM's ``inv_scale``
+    argument (folding it into the activation row scales is the equivalent
+    alternative).
+    """
+    _lazy_init()
+    if _preprocess_weights_and_scales_impl is None:
+        return _missing(*args, **kwargs)
+    return _preprocess_weights_and_scales_impl(*args, **kwargs)
+
+
 def m_grouped_w4a16_gemm_nt_nopad(*args, **kwargs):
     _lazy_init()
     if _w4a16_grouped_nopad_impl is None:
@@ -530,36 +621,70 @@ def has_fused_act_quant() -> bool:
     """Whether DeepGEMM exposes the fused activation(+quant) kernels.
 
     Older DeepGEMM builds only ship the activation inside the GEMM epilogue and
-    therefore lack the standalone `silu_and_mul` / `situ_and_mul` entry points.
+    therefore lack the standalone `activation_and_mul` entry point.
+    """
+    _lazy_init()
+    return _activation_and_mul_impl is not None and _quant_mode_impl is not None
+
+
+def has_masked_fused_act_quant() -> bool:
+    """Whether DeepGEMM can run activation(+quant) straight from a masked MoE
+    buffer, i.e. `activation_and_mul_masked(..., masked_m, ...)` with per-row
+    expert token counts.
     """
     _lazy_init()
     return (
-        _activation_quant_mode_impl is not None
-        and _silu_and_mul_impl is not None
-        and _situ_and_mul_impl is not None
+        _activation_and_mul_masked_impl is not None
+        and _activation_and_mul_impl is not None
+        and _activation_mode_impl is not None
+        and _quant_mode_impl is not None
     )
 
 
-def get_activation_quant_mode() -> Any:
-    """Return DeepGEMM's `ActivationQuantMode` enum."""
+def get_activation_mode() -> Any:
+    """Return DeepGEMM's current `ActivationMode` enum."""
     _lazy_init()
-    if _activation_quant_mode_impl is None:
+    if _activation_mode_impl is None:
         return _missing()
-    return _activation_quant_mode_impl
+    return _activation_mode_impl
 
 
-def silu_and_mul(*args, **kwargs):
+def get_quant_mode() -> Any:
+    """Return DeepGEMM's current `QuantMode` enum."""
     _lazy_init()
-    if _silu_and_mul_impl is None:
-        return _missing(*args, **kwargs)
-    return _silu_and_mul_impl(*args, **kwargs)
+    if _quant_mode_impl is None:
+        return _missing()
+    return _quant_mode_impl
 
 
-def situ_and_mul(*args, **kwargs):
+def activation_and_mul(*args, **kwargs):
+    """Fused `activation(gate) * up` with the `QuantMode` epilogue.
+
+    Signature: `activation_and_mul(activation_mode, quant_mode, input, *,
+    swiglu_limit=None, beta=None, linear_beta=None, weight_inv_scale=1.0,
+    reorder_scale=None, route_ids=None)`.
+
+    `weight_inv_scale` only shifts the `FP8_CHANNEL` row scales. Prefer the
+    consuming W4A8 GEMM's ``inv_scale`` instead, so the activation scales stay
+    plain per-token ``amax / 448`` and the shift is applied exactly once.
+    """
     _lazy_init()
-    if _situ_and_mul_impl is None:
+    if _activation_and_mul_impl is None:
         return _missing(*args, **kwargs)
-    return _situ_and_mul_impl(*args, **kwargs)
+    return _activation_and_mul_impl(*args, **kwargs)
+
+
+def activation_and_mul_masked(*args, **kwargs):
+    """Dense-layout activation on `[E, T, 2*N]` that only visits valid rows.
+
+    `masked_m` is a contiguous int32 `[E]` device tensor with the per-expert
+    token count; rows `>= masked_m[e]` are never written, so they must be
+    treated as garbage by the caller (the masked GEMMs never read them).
+    """
+    _lazy_init()
+    if _activation_and_mul_masked_impl is None:
+        return _missing(*args, **kwargs)
+    return _activation_and_mul_masked_impl(*args, **kwargs)
 
 
 def fp8_mqa_logits(
@@ -1192,6 +1317,11 @@ __all__ = [
     "m_grouped_fp4_gemm_nt_nopad",
     "m_grouped_fp4_gemm_nt_fused",
     "fp4_m_grouped_gemm_nt_masked",
+    "m_grouped_fp8_fp4_gemm_nt_nopad",
+    "m_grouped_fp8_fp4_gemm_nt_fused",
+    "fp8_fp4_m_grouped_gemm_nt_masked",
+    "preprocess_weights_and_scales",
+    "get_preprocess_mode",
     "m_grouped_w4a16_gemm_nt_nopad",
     "m_grouped_w4a16_gemm_nt_fused",
     "w4a16_m_grouped_gemm_nt_masked",
@@ -1215,7 +1345,9 @@ __all__ = [
     "get_mk_alignment_for_contiguous_layout",
     "moe_align_block_size",
     "has_fused_act_quant",
-    "get_activation_quant_mode",
-    "silu_and_mul",
-    "situ_and_mul",
+    "has_masked_fused_act_quant",
+    "get_activation_mode",
+    "get_quant_mode",
+    "activation_and_mul",
+    "activation_and_mul_masked",
 ]

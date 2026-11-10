@@ -27,7 +27,7 @@ from vllm.v1.engine.core import EngineCore
 from vllm_sail.patch.utils import patch
 from vllm_sail.profiling import nvtx
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 _upstream_init = EngineCore.__init__
 _upstream_step = EngineCore.step

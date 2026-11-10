@@ -122,6 +122,6 @@ forward = patch(
     _qwen.__name__,
     "Qwen3DecoderLayer.forward",
     reason="Fuse residual RMSNorm with supported QuantFP8 input quantization, with norm fallback for other linear kernels.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="Upstream exposes a fused norm/quant producer-consumer interface.",
 )(bind_body(forward, _qwen))

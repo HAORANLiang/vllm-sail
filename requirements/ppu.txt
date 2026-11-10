@@ -4,13 +4,13 @@
 # but not binary-compatible: a PyPI vllm wheel ships compiled CUDA binaries
 # (_C, _moe_C, vllm_flash_attn, ...) that cannot run on PPU. vLLM must be
 # PPU-built from source (or a PPU wheel); vllm_sail/compat.py validates the
-# exact source pin or release version (>=0.32.0,<0.33.0) at runtime instead.
+# exact source pin or release version (>=0.33.0,<0.34.0) at runtime instead.
 apache-tvm-ffi==0.1.9
 fastsafetensors>=0.3.2
 tokenspeed-mla==0.1.2
 # The upstream glm5next model imports Glm5NextTextConfig, which older
 # transformers releases do not ship; the plugin loads that model at install().
-# Range matches the vLLM 0.32 pin and the validated PPU runtime (5.16.1).
+# Range matches the vLLM 0.33 pin and the validated PPU runtime (5.16.1).
 transformers>=5.16.1,<5.20.0
 
 # PPU SDK dependencies — supplied by the SDK and NOT installable from PyPI.

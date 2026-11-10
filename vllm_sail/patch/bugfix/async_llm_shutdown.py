@@ -46,7 +46,7 @@ def install() -> None:
             "can still consume the teardown error, logging EngineDeadError "
             "after otherwise successful requests."
         ),
-        affected_versions=">=0.32.0,<0.33.0",
+        affected_versions=">=0.33.0,<0.34.0",
         remove_when=(
             "AsyncLLM cancels its output task before closing EngineCore during "
             "abort shutdown, while preserving drain-mode output processing."

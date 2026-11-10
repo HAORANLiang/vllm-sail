@@ -16,7 +16,7 @@ from vllm_sail.patch.utils import patch
 logger = init_logger(__name__)
 _META = dict(
     reason="PPU BF16 dense DeepGEMM needs a platform dispatch hook and fake implementation.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="Unquantized dense GEMM supports backend registration.",
 )
 

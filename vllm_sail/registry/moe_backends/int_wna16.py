@@ -16,7 +16,7 @@ from vllm_sail.registry.moe_backends._extend import extend_enum
 _MODULE = "vllm.model_executor.layers.fused_moe.oracle.int_wna16"
 _META = dict(
     reason="The WNA16 oracle needs the plugin's PPU DeepGEMM experts and packed weight layout.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="The MoE oracle supports registering plugin WNA16 backends.",
 )
 WNA16MoEBackend = oracle.WNA16MoEBackend

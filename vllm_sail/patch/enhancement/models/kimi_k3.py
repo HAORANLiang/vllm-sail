@@ -28,7 +28,7 @@ from vllm.utils.torch_utils import aux_stream
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 # Captured before patching so every replacement can fall back to upstream.
 _upstream_runner_init = LatentMoERunner.__init__

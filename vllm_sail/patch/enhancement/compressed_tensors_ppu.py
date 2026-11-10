@@ -39,7 +39,7 @@ _INT8_MOE_MODULE = (
     "vllm.model_executor.layers.quantization.compressed_tensors."
     "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8"
 )
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 
 REASON_CHANNELWISE = (
     "The fork adds fp8_channelwise_layers to CompressedTensorsConfig: dense "

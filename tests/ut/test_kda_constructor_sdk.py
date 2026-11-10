@@ -16,6 +16,7 @@ def test_kda_constructor_reserves_workspace_before_norm(monkeypatch, backend):
 
     vllm_sail.patch.install()
     from vllm.platforms import current_platform
+    from vllm.v1.worker import workspace
     from vllm.v1.worker.workspace import WorkspaceManager
 
     if not current_platform.is_ppu():
@@ -93,8 +94,8 @@ def test_kda_constructor_reserves_workspace_before_norm(monkeypatch, backend):
         monkeypatch.setattr(provider, name, Linear)
     monkeypatch.setattr(provider, "FusedRMSNormGated", Norm)
     monkeypatch.setattr(provider, "is_flashkda_supported", lambda *args: True)
-    monkeypatch.setattr(provider, "is_workspace_manager_initialized", lambda: True)
-    monkeypatch.setattr(provider, "current_workspace_manager", lambda: manager)
+    monkeypatch.setattr(workspace, "is_workspace_manager_initialized", lambda: True)
+    monkeypatch.setattr(workspace, "current_workspace_manager", lambda: manager)
     monkeypatch.setattr(manager, "get_simultaneous", reserve)
     monkeypatch.setattr(builtins, "__import__", guarded_import)
     config = NS(

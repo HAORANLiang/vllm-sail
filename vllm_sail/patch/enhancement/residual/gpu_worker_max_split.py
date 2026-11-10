@@ -28,7 +28,7 @@ REASON = (
     "20 to 32 MiB; upstream's Worker.load_model requests 20, which PPU's "
     "allocator rejects during weight loading."
 )
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.33.0,<0.34.0"
 REMOVE_WHEN = (
     "PPU torch accepts max_split_size_mb=20 again (its CachingAllocator floor "
     "matches stock PyTorch), or upstream makes the floor platform-queryable."

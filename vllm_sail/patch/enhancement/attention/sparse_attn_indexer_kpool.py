@@ -55,7 +55,7 @@ from vllm.utils.torch_utils import _encode_layer_name
 import vllm_sail.ops  # noqa: F401  (registers torch.ops.vllm.ppu_sparse_attn_indexer_kpool)
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _MODULE = "vllm.models.glm5next.nvidia.sparse_indexer"
 
 if not _unavailable:

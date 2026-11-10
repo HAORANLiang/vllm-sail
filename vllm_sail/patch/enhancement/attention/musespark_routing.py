@@ -15,7 +15,7 @@ from vllm_sail.patch.utils import patch
 _MODULE = 'vllm.models.muse_spark.common.ops.fused_routing'
 _META = dict(
     reason='PPU CUDA identity and compute-stub presence must not replace the existing Triton MuseSpark routing path with an unimplemented native operator.',
-    affected_versions='>=0.32.0,<0.33.0',
+    affected_versions='>=0.33.0,<0.34.0',
     remove_when='MuseSpark selects the native router through a platform implementation capability or PPU implements and verifies this native operator.',
 )
 

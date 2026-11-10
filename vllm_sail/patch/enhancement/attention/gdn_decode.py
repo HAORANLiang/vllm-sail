@@ -21,7 +21,7 @@ from vllm_sail.patch.utils import patch
 logger = init_logger(__name__)
 _META = dict(
     reason="PPU GDN decode selects PLA, native CUDA or Triton using real kernel capabilities, not stub schemas.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="GDN exposes a platform decode backend resolver and native implementation capability checks.",
 )
 

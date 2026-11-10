@@ -29,6 +29,8 @@ Backend = Enum(
             "XPU",
             "PPU_DEEPGEMM_MXFP4",
             "BATCHED_PPU_DEEPGEMM_MXFP4",
+            "PPU_DEEPGEMM_MXFP4_FP8",
+            "BATCHED_PPU_DEEPGEMM_MXFP4_FP8",
             "PPU_DEEPGEMM_MXFP4_BF16",
             "BATCHED_PPU_DEEPGEMM_MXFP4_BF16",
             "PPU_DEEPGEMM_MXFP4_BF16_MMA",
@@ -41,6 +43,7 @@ Backend = Enum(
 # its batched family.
 BATCHED_SIBLING = {
     "PPU_DEEPGEMM_MXFP4": "BATCHED_PPU_DEEPGEMM_MXFP4",
+    "PPU_DEEPGEMM_MXFP4_FP8": "BATCHED_PPU_DEEPGEMM_MXFP4_FP8",
     "PPU_DEEPGEMM_MXFP4_BF16": "BATCHED_PPU_DEEPGEMM_MXFP4_BF16",
     "PPU_DEEPGEMM_MXFP4_BF16_MMA": "BATCHED_PPU_DEEPGEMM_MXFP4_BF16_MMA",
 }
@@ -91,6 +94,7 @@ def selection(
         "mk": NS(FusedMoEActivationFormat=NS(Standard=standard, BatchedExperts=batch)),
         "kMxfp4Static": "weights",
         "kFp8Dynamic128Sym": "fp8-block",
+        "kFp8DynamicTokenSym": "fp8-token",
         "kMxfp8Dynamic": "mxfp8",
         "kFp8StaticTensorSym": "fp8",
         "kMxfp4Dynamic": "mxfp4",

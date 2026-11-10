@@ -18,7 +18,7 @@ from vllm_sail.patch.utils import patch
 
 _META = dict(
     reason="PPU tuned configurations require per-projection launch parameters, VALU and PPU Triton kernels.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="Upstream supports registration of the complete Triton MoE launch strategy.",
 )
 

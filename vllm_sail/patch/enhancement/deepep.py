@@ -17,7 +17,7 @@ from vllm_sail.patch.utils import PATCH_MARKER, patch
 _MODULE = "vllm.model_executor.layers.fused_moe.all2all_utils"
 _META = dict(
     reason="The all-to-all factory needs PPU DeepEP quantized dispatch and completion support.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="The prepare/finalize factory supports plugin backend registration.",
 )
 

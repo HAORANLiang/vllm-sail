@@ -499,7 +499,6 @@ __device__ void radix_topk(const float* __restrict__ row_input,
         next_hist[i] = 0;
       }
     }
-    __syncthreads();
 
     if (tx == 0) {
       red_release(&state->arrival_counter, 1);

@@ -17,7 +17,7 @@ from vllm.platforms import current_platform
 from vllm_sail.patch.bodies import bind_body
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _WRAPPER = "vllm.distributed.device_communicators.pynccl_wrapper"
 _COMMUNICATOR = "vllm.distributed.device_communicators.pynccl"
 _upstream_suspend = _pynccl.PyNcclCommunicator.suspend

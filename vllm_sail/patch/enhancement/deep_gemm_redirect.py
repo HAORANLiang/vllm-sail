@@ -34,7 +34,7 @@ from vllm_sail.patch.utils import patch
 
 logger = init_logger(__name__)
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _REASON = (
     "PPU's DeepGEMM requires different TMA alignment and scale-factor layout "
     "transforms than CUDA's. {module} binds these helpers from "

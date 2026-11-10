@@ -27,7 +27,7 @@ from vllm_sail.patch.utils import patch
 _MODULE = "vllm.models.kimi_k3.nvidia.kda"
 _META = dict(
     reason="Kimi KDA must select PPU PLA kernels instead of NVIDIA FlashKDA/native decode.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="Kimi KDA supports platform kernel registration for prefill and decode.",
 )
 
@@ -245,6 +245,8 @@ def _init(
         _upstream_init(self, config, vllm_config, prefix, aux_stream, run_gemm_rs_ar)
         return
 
+    from vllm.v1.worker import workspace
+
     # Upstream's FlashKDA prefill branch exists to size an ``vllm._flashkda_C``
     # workspace, which PPU cannot import. Build the layer as if upstream had
     # picked Triton, then restore the FlashKDA prefill contract that the PLA
@@ -266,8 +268,8 @@ def _init(
             )
             # The demoted upstream branch skips its reservation. Reserve the
             # whole simultaneous layout here, before norm and KV sizing.
-            if _kda.is_workspace_manager_initialized():
-                _kda.current_workspace_manager().get_simultaneous(*specs)
+            if workspace.is_workspace_manager_initialized():
+                workspace.current_workspace_manager().get_simultaneous(*specs)
             demoted_specs.append(specs)
             return "triton"
         return backend

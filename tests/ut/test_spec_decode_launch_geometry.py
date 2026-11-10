@@ -7,9 +7,9 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tests.support.source import function
-from tests.ut.test_spec_decode_dispatch import Kernel, Tensor
+from tests.support.spec_decode import Kernel, Tensor
 
-PATCH = "vllm_sail/patch/enhancement/runtime.py"
+PATCH = "vllm_sail/patch/_upstream/runtime.py"
 UPSTREAM = "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
 
 
@@ -53,7 +53,7 @@ def check_launches(body, block, draft, fp64, upstream=None):
     sampler = function(body, "rejection_sample", namespace)
     sampled, count = sampler(
         Tensor(13, 8193),
-        NS(values=Tensor(2, 7, 8193), row_mapping=None) if draft else None,
+        Tensor(2, 7, 8193) if draft else None,
         Tensor(13),
         Tensor(3),
         Tensor(13),

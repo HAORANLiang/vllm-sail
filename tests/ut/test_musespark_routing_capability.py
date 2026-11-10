@@ -8,10 +8,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from tests.ut.test_ppu_kernel_capabilities import load_patch
-from tests.ut.test_ppu_kernel_capabilities import modules as _modules
-
-modules = _modules
+from tests.support.modules import load_patch
 
 
 @pytest.mark.upstream_source
@@ -141,19 +138,15 @@ def test_registered_router_preserves_fallback_and_preloaded_aliases(
     )
     assert outputs[0].root is weights and outputs[1].root is ids
     assert len(calls) == 1
-    if not ppu and experts == 256 and normalization == "sigmoid":
-        assert calls[0][0] == "native"
-        assert calls[0][1][-1] is mask
-    else:
-        kind, bound, options = calls[0]
-        assert kind == "triton" and bound["is_padding"] is mask
-        assert bound["bias_ptr"].dtype == "float32"
-        assert bound["TOPK"] == 8 and bound["NUM_EXPERTS_PADDED"] == experts
-        assert bound["NORMALIZATION_MODE"] == int(normalization == "softmax")
-        assert bound["router_output_multiplier"] == 1.25
-        assert bound["division_eps"] == 1e-6 and bound["route_scale"] == 0.5
-        assert bound["USE_PDL"] is False and "launch_pdl" not in options
-        assert options["num_warps"] == (1 if experts == 256 else 4)
+    kind, bound, options = calls[0]
+    assert kind == "triton" and bound["is_padding"] is mask
+    assert bound["bias_ptr"].dtype == "float32"
+    assert bound["TOPK"] == 8 and bound["NUM_EXPERTS_PADDED"] == experts
+    assert bound["NORMALIZATION_MODE"] == int(normalization == "softmax")
+    assert bound["router_output_multiplier"] == 1.25
+    assert bound["division_eps"] == 1e-6 and bound["route_scale"] == 0.5
+    assert bound["USE_PDL"] is False and "launch_pdl" not in options
+    assert options["num_warps"] == (1 if experts == 256 else 4)
 
 
 def test_unimportable_provider_skips_with_a_warning(modules, monkeypatch):

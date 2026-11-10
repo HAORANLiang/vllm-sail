@@ -44,7 +44,7 @@ except (OSError, TypeError):
         "unchanged and the PPU experts' workspace/shape derivation would run "
         "with a halved K."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when=(
         "upstream derives K from the weight/quant metadata instead of the "
         "packed activation extent, or the PPU MXFP4 experts override "
@@ -76,7 +76,7 @@ _upstream_supported = FusedMoEExperts.is_supported_config
     "FusedMoEExperts._supports_bias",
     allow_missing=True,
     reason="PPU expert classes declare whether their GEMM supports expert bias.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="FusedMoEExperts exposes a bias capability method.",
 )
 @staticmethod
@@ -88,7 +88,7 @@ def _supports_bias():
     "vllm.model_executor.layers.fused_moe.modular_kernel",
     "FusedMoEExperts.is_supported_config",
     reason="Explicit and automatic DeepGEMM selection must reject unsupported bias.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="FusedMoEExperts checks its bias capability during configuration selection.",
 )
 def is_supported_config(cls, moe_config, weight_key, activation_key, activation_format):

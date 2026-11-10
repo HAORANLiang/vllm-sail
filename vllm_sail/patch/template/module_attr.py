@@ -27,7 +27,7 @@ from vllm_sail.patch.utils import patch
     # TODO: why this patch exists. Be specific about what PPU needs and what
     # upstream does instead. One or two sentences.
     reason="TODO",
-    # TODO: vLLM versions this applies to, e.g. ">=0.32.0,<0.33.0".
+    # TODO: vLLM versions this applies to, e.g. ">=0.33.0,<0.34.0".
     affected_versions="TODO",
     # TODO: a VERIFIABLE removal condition — an upstream PR number, a named API,
     # or a capability. "When upstream fixes it" is not acceptable.

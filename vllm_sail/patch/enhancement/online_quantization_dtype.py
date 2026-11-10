@@ -16,7 +16,7 @@ _upstream_get_dtype = model._get_and_verify_dtype
         "PPU FP8 compatibility loading decodes to BF16; auto dtype must resolve "
         "before ModelConfig validates quantization, earlier than platform defaults."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="ModelConfig exposes a platform hook for checkpoint-aware auto dtype.",
 )
 def get_and_verify_dtype(model_id, config, dtype, **kwargs):

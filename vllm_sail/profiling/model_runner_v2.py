@@ -46,7 +46,7 @@ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm_sail.patch.utils import patch
 from vllm_sail.profiling import nvtx
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 _UPSTREAM_MODULE = "vllm.v1.worker.gpu.model_runner"
 

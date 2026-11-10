@@ -25,7 +25,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm_sail.patch.utils import patch
 from vllm_sail.profiling import nvtx
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 _upstream_schedule = Scheduler.schedule
 _upstream_update_after_schedule = Scheduler._update_after_schedule

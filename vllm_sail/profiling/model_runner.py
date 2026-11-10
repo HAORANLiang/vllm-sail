@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_sail.patch.utils import patch
 from vllm_sail.profiling import nvtx
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 #: Where the execute_model wrapper stashes the scheduler output so the
 #: _model_forward wrapper can label the forward range like the fork did.

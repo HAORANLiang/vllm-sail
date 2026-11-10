@@ -38,7 +38,7 @@ from vllm_sail.patch.bodies import bind_body
 from vllm_sail.patch.utils import patch
 from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _MODULE = "vllm.model_executor.layers.sparse_attn_indexer"
 
 logger = init_logger(__name__)

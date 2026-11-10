@@ -70,6 +70,6 @@ patch(
     "vllm.v1.attention.backends.flash_attn",
     "FlashAttentionBackend.supports_combination",
     reason="The upstream sink combination gate assumes only NVIDIA SM90 supports FA3 sinks.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.33.0,<0.34.0",
     remove_when="FlashAttentionBackend gates sinks through the selected implementation's capabilities.",
 )(bind_body(supports_combination, _flash_attn))

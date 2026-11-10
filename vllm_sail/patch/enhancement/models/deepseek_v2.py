@@ -56,7 +56,7 @@ from vllm.platforms import current_platform
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 
 # Captured before patching so delegating replacements can call upstream.
 _upstream_indexer_init = Indexer.__init__
@@ -341,7 +341,11 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
         num_experts=self.config.n_routed_experts
-        + (self.config.n_shared_experts if self.fused_shared_expert_layers else 0),
+        + (
+            self.config.n_shared_experts
+            if self.is_fused_shared_expert_enabled
+            else 0
+        ),
         num_redundant_experts=self.num_redundant_experts,
     )
 
@@ -367,9 +371,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             continue  # this layer has no indexer; drop its checkpoint weights
 
         is_fusion_moe_shared_experts_layer = (
-            "mlp.shared_experts" in name
-            and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
-            and extract_layer_index(name) in self.fused_shared_expert_layers
+            self.is_fused_shared_expert_enabled and ("mlp.shared_experts" in name)
         )
 
     # PPU MODIFICATION: begin

@@ -41,7 +41,7 @@ from vllm_sail.patch.utils import patch
 
 _MODULE = "vllm.models.glm5next.common.model"
 _TARGET = "_try_load_fp8_attn_proj"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.33.0,<0.34.0"
 _installed = False
 #: True when the upstream glm5next model cannot be imported (older transformers).
 _unavailable = False
