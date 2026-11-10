@@ -187,6 +187,7 @@
   "vllm.model_executor.models.qwen3_next.th_nvtx_range_push": "additive",
   "vllm.model_executor.models.step3p5_mtp.Step3p5MTP.load_weights": "483aefd1e730ff5d3484e7904ba122c6b8e3573b52c69c24392519445ef82b7a",
   "vllm.model_executor.warmup.cutedsl_warmup.cutedsl_warmup": "eed1bdc061c1c66cb1cd4d05d765bde479bb273150aab9871a12332a3fc4b9b6",
+  "vllm.model_executor.warmup.jit_warmup_triton_helper.VllmTritonJitKernel.compile_many": "7369386a069d1b528cdfa1b2a30391e63db95a66530cae4c7af0078c86218947",
   "vllm.model_executor.warmup.kernel_warmup.cutedsl_warmup": "eed1bdc061c1c66cb1cd4d05d765bde479bb273150aab9871a12332a3fc4b9b6",
   "vllm.model_executor.warmup.kernel_warmup.kernel_warmup": "9e8c5d8e3463979f59a7236e7ca0a09474bdb231a3cd024dfe98a86615e29c84",
   "vllm.models.deepseek_v4.attention.DeepseekV4Indexer.__init__": "28272510eaa4ec35393c7a48a353d69f93bad6f9b1f5990ae14fc13e601e042b",

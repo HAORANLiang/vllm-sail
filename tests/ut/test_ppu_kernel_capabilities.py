@@ -559,8 +559,8 @@ def test_warmup_excludes_fp8_kernels_without_native_fp8(
     assert len(compiled) == 3 - 2 * skipped
 
 
-def test_warmup_tolerates_signature_level_fp8_on_sm80(modules):
-    """A compile key that passes an E4M3 tensor only fails at trace time."""
+def test_warmup_does_not_suppress_unclassified_fp8_errors(modules):
+    """An error without inspectable Triton inputs must still propagate."""
     compiled = []
     signature_only = _fixture_kernel(
         "SignatureFp8Kernel", _bf16_only, compiled, error=_FP8_COMPILE_ERROR
@@ -568,11 +568,9 @@ def test_warmup_tolerates_signature_level_fp8_on_sm80(modules):
     clean = _fixture_kernel("PackSeqTritonKernel", _bf16_only, compiled)
 
     registrations = {signature_only: [((), {})], clean: [((), {})]}
-    assert _run_ppu_warmup(modules, True, (8, 0), registrations) is None
-
-    # Source inspection cannot see the dtype, so the registration is kept and
-    # the guard turns the resulting compile error into a warning.
-    assert compiled == ["SignatureFp8Kernel", "PackSeqTritonKernel"]
+    with pytest.raises(ValueError, match="fp8e4nv"):
+        _run_ppu_warmup(modules, True, (8, 0), registrations)
+    assert compiled == ["SignatureFp8Kernel"]
     assert signature_only in registrations
 
 
@@ -584,6 +582,25 @@ def test_warmup_propagates_other_compile_errors(modules):
 
     with pytest.raises(RuntimeError, match="fused build failed"):
         _run_ppu_warmup(modules, True, (8, 0), {broken: [((), {})]})
+
+
+def test_warmup_keeps_a_read_only_owner_unchanged(modules):
+    compiled = []
+
+    class FrozenOwner:
+        __slots__ = ()
+        kernel = staticmethod(_bf16_only)
+
+        def compile_many(self, keys):
+            compiled.append("attempted")
+            raise _FP8_COMPILE_ERROR
+
+    owner = FrozenOwner()
+    with pytest.raises(ValueError, match="fp8e4nv"):
+        _run_ppu_warmup(modules, True, (8, 0), {owner: [((), {})]})
+    assert compiled == ["attempted"]
+    with pytest.raises(ValueError, match="fp8e4nv"):
+        owner.compile_many([0])
 
 
 def _run_ppu_warmup(modules, ppu, arch, registrations):
