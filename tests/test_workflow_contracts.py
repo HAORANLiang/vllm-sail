@@ -77,6 +77,21 @@ class TestWorkflowContracts(unittest.TestCase):
         self.assertIn("control/.github/vllm-main-verified.commit", text)
         self.assertNotIn("git push", text)
 
+    def test_partial_retries_download_the_producer_artifact_name(self):
+        for name, producer, stem in (
+            ("nightly-tests.yaml", "prepare", "nightly-candidate"),
+            ("dockerfile-ci.yaml", "resolve", "dockerfile-ci-inputs"),
+        ):
+            text = workflow(name)
+            self.assertIn(
+                f"name: ${{{{ needs.{producer}.outputs.artifact_name }}}}", text
+            )
+            self.assertIn(
+                f'echo "name={stem}-${{GITHUB_RUN_ID}}-${{GITHUB_RUN_ATTEMPT}}"', text
+            )
+            # Only the producer may encode its own attempt in the artifact name.
+            self.assertNotIn(f"name: {stem}-${{{{ github.run_id }}}}", text)
+
     def test_only_preview_distribution_is_called(self):
         text = workflow("promote-nightly.yaml")
         self.assertIn("workflows: ['Nightly regression (minimum)']", text)

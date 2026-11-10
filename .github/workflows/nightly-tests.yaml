@@ -60,6 +60,7 @@ jobs:
       upstream_sha: ${{ steps.fetch.outputs.upstream_sha }}
       upstream_run_id: ${{ steps.fetch.outputs.upstream_run_id }}
       image: ${{ steps.candidate.outputs.image }}
+      artifact_name: ${{ steps.artifact.outputs.name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -150,9 +151,12 @@ jobs:
             --build-metadata "$flow/build.json" --image-repository "$IMAGE_REPOSITORY" \
             --control-sha "$CONTROL_SHA" --dockerfile control/docker/Dockerfile.ci \
             --output "$flow/candidate.json"
+      - name: Name the candidate artifact for partial retries
+        id: artifact
+        run: echo "name=nightly-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: nightly-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.artifact.outputs.name }}
           path: |
             flow-${{ github.run_id }}-${{ github.run_attempt }}/plan.json
             flow-${{ github.run_id }}-${{ github.run_attempt }}/selection.json
@@ -179,7 +183,9 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: nightly-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          # The prepare job keeps its own attempt: a rerun that only retries
+          # failed jobs must still download the artifact that really exists.
+          name: ${{ needs.prepare.outputs.artifact_name }}
           path: flow-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:

@@ -985,17 +985,47 @@ def load_baseline(api, repo):
     return baseline, release, assets
 
 
-def recover_baseline(api, repo, bundle, candidate, evidence):
-    """Publisher-only recovery; never reinterpret an incomplete fixed release as absent.
+def latest_published_immutable(api, repo):
+    """Return the highest published immutable baseline, or None when none exists.
 
-    An archived marker is a non-downgrade fence. Verify its published immutable
-    release and wheel bytes BEFORE any repair. On a markerless first draft, use
-    the highest published immutable identity, never the retry's incoming run.
-    This repair is itself non-atomic and safely repeatable by serialized publishers.
+    The fixed preview-baseline is a mutable pointer that can be missing while an
+    immutable publication already completed. Only the immutable record is a
+    durable statement that a preview was distributed.
     """
-    fixed = publisher_lookup_release(api, repo, "preview-baseline")
+    releases = []
+    for release in api.pages(f"/repos/{repo}/releases"):
+        identity = re.fullmatch(
+            r"preview-nightly-([1-9][0-9]*)-test-([1-9][0-9]*)",
+            str(release.get("tag_name", "")),
+        )
+        if identity and release.get("draft") is False and release.get("published_at"):
+            releases.append(((int(identity[1]), int(identity[2])), release))
+    if not releases:
+        return None
+    identity, latest = max(releases, key=lambda item: item[0])
+    validate_publisher_release(latest, repo, latest["tag_name"])
+    marker = named_asset(release_assets(api, repo, latest), "preview-baseline.json")
+    restore = decode_json(api.bytes(f"/repos/{repo}/releases/assets/{marker['id']}"))
+    validate_baseline(restore)
+    require(
+        restore["immutable_release_tag"] == latest["tag_name"]
+        and (restore["source"]["upstream_run_id"], restore["test_run_id"]) == identity,
+        "draft recovery immutable identity mismatch",
+    )
+    return restore
+
+
+def fixed_restore_point(api, repo, fixed, candidate):
+    """Choose what a fixed release must be restored to, or None on a fresh start.
+
+    A marker (or an archived marker) is a non-downgrade fence and always wins
+    over the retry's incoming bundle. Without a fence only a first draft, or a
+    missing fixed release, may fall back to the highest published immutable
+    identity. This function only reads: creating a missing fixed release is
+    deferred until that immutable record verifies.
+    """
     if fixed is None:
-        return None, None, []
+        return latest_published_immutable(api, repo)
     records = release_assets(api, repo, fixed)
     marker = asset_record(records, "preview-baseline.json", optional=True)
     asset_record(records, "preview-wheels.zip", optional=True)
@@ -1036,55 +1066,45 @@ def recover_baseline(api, repo, bundle, candidate, evidence):
             == candidate["source"]["upstream_workflow"],
             "recovery upstream identity mismatch",
         )
-    if fences:
-        restore = max(
-            fences, key=lambda b: (b["source"]["upstream_run_id"], b["test_run_id"])
-        )
-        require(
-            all(
-                b == restore
-                for b in fences
-                if b["source"]["upstream_run_id"]
-                == restore["source"]["upstream_run_id"]
-                and b["test_run_id"] == restore["test_run_id"]
-            ),
-            "conflicting recovery markers",
-        )
-    else:
+    if not fences:
         require(
             fixed["draft"], "missing recovery marker; refusing to reset baseline fence"
         )
         # A first draft may have no marker at all. The caller's bundle is NOT a
-        # fence: a later retry may carry an older or newer run. Find the highest
-        # published immutable identity, then verify it below without falling back.
-        releases = []
-        for release in api.pages(f"/repos/{repo}/releases"):
-            identity = re.fullmatch(
-                r"preview-nightly-([1-9][0-9]*)-test-([1-9][0-9]*)",
-                str(release.get("tag_name", "")),
-            )
-            if (
-                identity
-                and release.get("draft") is False
-                and release.get("published_at")
-            ):
-                releases.append(((int(identity[1]), int(identity[2])), release))
-        require(bool(releases), "recovery requires a published immutable release")
-        identity, latest = max(releases, key=lambda item: item[0])
-        validate_publisher_release(latest, repo, latest["tag_name"])
-        latest_marker = named_asset(
-            release_assets(api, repo, latest), "preview-baseline.json"
-        )
-        restore = decode_json(
-            api.bytes(f"/repos/{repo}/releases/assets/{latest_marker['id']}")
-        )
-        validate_baseline(restore)
-        require(
-            restore["immutable_release_tag"] == latest["tag_name"]
-            and (restore["source"]["upstream_run_id"], restore["test_run_id"])
-            == identity,
-            "draft recovery immutable identity mismatch",
-        )
+        # fence: a later retry may carry an older or newer run.
+        restore = latest_published_immutable(api, repo)
+        require(restore is not None, "recovery requires a published immutable release")
+        return restore
+    restore = max(
+        fences, key=lambda b: (b["source"]["upstream_run_id"], b["test_run_id"])
+    )
+    require(
+        all(
+            b == restore
+            for b in fences
+            if b["source"]["upstream_run_id"] == restore["source"]["upstream_run_id"]
+            and b["test_run_id"] == restore["test_run_id"]
+        ),
+        "conflicting recovery markers",
+    )
+    return restore
+
+
+def recover_baseline(api, repo, bundle, candidate, evidence):
+    """Publisher-only recovery; never reinterpret an incomplete fixed release as absent.
+
+    An archived marker is a non-downgrade fence. Verify its published immutable
+    release and wheel bytes BEFORE any repair. On a markerless first draft, use
+    the highest published immutable identity, never the retry's incoming run.
+    A missing fixed release is not a fresh start either: the immutable publication
+    may predate it, and restoring first keeps a retry from retagging the same
+    immutable identity to a new digest that its release would never describe.
+    This repair is itself non-atomic and safely repeatable by serialized publishers.
+    """
+    fixed = publisher_lookup_release(api, repo, "preview-baseline")
+    restore = fixed_restore_point(api, repo, fixed, candidate)
+    if restore is None:
+        return None, None, []
     validate_baseline(restore)
     require(
         restore["source"]["upstream_repository"].casefold()
@@ -1121,12 +1141,21 @@ def recover_baseline(api, repo, bundle, candidate, evidence):
     work = bundle / f"baseline-recovery-{time.time_ns()}"
     archive = work / "preview-wheels.zip"
     api.download(f"/repos/{repo}/releases/assets/{immutable_wheels['id']}", archive)
-    safe_extract(archive, work / "wheelhouse")
+    try:
+        safe_extract(archive, work / "wheelhouse")
+    except zipfile.BadZipFile as error:
+        raise AssetError("recovery immutable wheels are not a ZIP archive") from error
     validate_wheels(work / "wheelhouse", restore["source"])
     require(
         sha256_file(archive) == api.asset_hash(repo, immutable_wheels["id"]),
         "recovery immutable wheels changed",
     )
+    if fixed is None:
+        # Create the fixed pointer only after the immutable record verified, so a
+        # conflicting publication leaves no partial release behind.
+        fixed = ensure_release(
+            api, repo, "preview-baseline", restore["control_sha"], immutable=False
+        )
     restored_marker = work / "preview-baseline.json"
     write_json(restored_marker, restore)
     upload_asset(

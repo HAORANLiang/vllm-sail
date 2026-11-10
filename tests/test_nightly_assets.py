@@ -499,9 +499,15 @@ class TestNightlyAssets(unittest.TestCase):
         self.api = FakeAPI()
 
     def bundle(
-        self, run_id=100, results=True, *, wheel_bytes=None, upstream_sha=UP_SHA
+        self,
+        run_id=100,
+        results=True,
+        *,
+        wheel_bytes=None,
+        upstream_sha=UP_SHA,
+        suffix="",
     ):
-        bundle = self.root / f"bundle-{run_id}"
+        bundle = self.root / f"bundle-{run_id}{suffix}"
         wheelhouse = bundle / "wheelhouse"
         manifest = make_wheels(wheelhouse)
         if wheel_bytes is not None:
@@ -521,6 +527,24 @@ class TestNightlyAssets(unittest.TestCase):
             counts, hashes = self.results(bundle / "results")
             evidence["counts"] = counts
             evidence["results"] = hashes
+        assets.write_json(bundle / "test-evidence.json", evidence)
+        return bundle, candidate, evidence
+
+    def retry_bundle(self, run_id, digest):
+        """Build a retry bundle whose only difference is the image digest."""
+        bundle, candidate, _ = self.bundle(run_id, suffix=f"-{digest[-4:]}")
+        candidate = {
+            **candidate,
+            "image_digest": digest,
+            "image": f"{IMAGE_REPO}@{digest}",
+        }
+        assets.write_json(bundle / "candidate.json", candidate)
+        counts, hashes = assets.validate_results(bundle / "results")
+        evidence = {
+            **make_evidence(candidate),
+            "counts": counts,
+            "results": hashes,
+        }
         assets.write_json(bundle / "test-evidence.json", evidence)
         return bundle, candidate, evidence
 
@@ -2204,6 +2228,133 @@ class TestNightlyAssets(unittest.TestCase):
                         for _, p, _ in self.api.mutations
                     )
                 )
+
+    def test_interruption_before_first_fixed_release_blocks_a_new_digest_retry(self):
+        bundle, candidate, evidence = self.bundle()
+        args = argparse.Namespace(
+            consumer_repository=FORK, bundle=bundle, test_run_id=500
+        )
+        mutate = self.api.mutate
+
+        def fail_fixed_creation(method, path, value):
+            if (
+                method == "POST"
+                and path == f"/repos/{FORK}/releases"
+                and value.get("tag_name") == "preview-baseline"
+            ):
+                raise assets.APIError(503)
+            return mutate(method, path, value)
+
+        with mock.patch.object(self.api, "mutate", side_effect=fail_fixed_creation):
+            with self.assertRaises(assets.APIError):
+                assets.publish(self.api, args)
+        # The immutable publication completed; only the fixed release is missing.
+        self.assertIn((FORK, "preview-nightly-100-test-500"), self.api.releases)
+        self.assertNotIn((FORK, "preview-baseline"), self.api.releases)
+        retry, _, _ = self.retry_bundle(100, "sha256:" + "9" * 64)
+        self.api.mutations.clear()
+        with (
+            mock.patch.object(assets, "GitHub", return_value=self.api),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(
+                assets.main(
+                    [
+                        "check-preview",
+                        "--consumer-repository",
+                        FORK,
+                        "--bundle",
+                        str(retry),
+                        "--test-run-id",
+                        "500",
+                    ]
+                ),
+                0,
+            )
+        self.assertEqual(out.getvalue(), "promote=false\n")
+        self.assertEqual(
+            assets.load_baseline(self.api, FORK)[0], make_baseline(candidate, evidence)
+        )
+
+    def published_immutable_without_fixed(self):
+        """Publish an immutable release, then die before the fixed release exists."""
+        bundle, candidate, evidence = self.bundle()
+        archive = bundle / "preview-wheels.zip"
+        assets.pack_wheels(
+            bundle / "wheelhouse",
+            archive,
+            assets.validate_wheels(bundle / "wheelhouse"),
+            candidate["source"],
+        )
+        unique = self.api.install_release(
+            "preview-nightly-100-test-500",
+            make_baseline(candidate, evidence),
+            archive.read_bytes(),
+        )
+        self.assertIsNone(
+            self.api.optional(f"/repos/{FORK}/releases/tags/preview-baseline")
+        )
+        return bundle, candidate, evidence, unique
+
+    def test_missing_fixed_release_recovers_published_immutable_before_retag(self):
+        _, candidate, evidence, unique = self.published_immutable_without_fixed()
+        ids = {r["id"] for r in assets.release_assets(self.api, FORK, unique)}
+        retry, _, _ = self.retry_bundle(100, "sha256:" + "9" * 64)
+        self.api.mutations.clear()
+        with (
+            mock.patch.object(assets, "GitHub", return_value=self.api),
+            redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertEqual(
+                assets.main(
+                    [
+                        "check-preview",
+                        "--consumer-repository",
+                        FORK,
+                        "--bundle",
+                        str(retry),
+                        "--test-run-id",
+                        "500",
+                    ]
+                ),
+                0,
+            )
+        # This runs before any registry retag: the retry must see the published
+        # identity instead of its own rebuilt candidate digest.
+        self.assertEqual(out.getvalue(), "promote=false\n")
+        self.assertEqual(
+            assets.load_baseline(self.api, FORK)[0], make_baseline(candidate, evidence)
+        )
+        self.assertEqual(
+            ids, {r["id"] for r in assets.release_assets(self.api, FORK, unique)}
+        )
+        self.assertFalse(
+            any(
+                p.startswith(f"uploads/{unique['id']}/")
+                for _, p, _ in self.api.mutations
+            )
+        )
+
+    def test_missing_fixed_release_restores_before_advancing_a_newer_run(self):
+        _, older, older_evidence, _ = self.published_immutable_without_fixed()
+        bundle, candidate, evidence = self.bundle(150)
+        self.api.mutations.clear()
+        with redirect_stdout(io.StringIO()) as out:
+            assets.publish(
+                self.api,
+                argparse.Namespace(
+                    consumer_repository=FORK, bundle=bundle, test_run_id=500
+                ),
+            )
+        self.assertIn("promote=true\n", out.getvalue())
+        # The interrupted fixed pointer is repaired, then advanced to the newer run.
+        self.assertEqual(
+            assets.load_baseline(self.api, FORK)[0], make_baseline(candidate, evidence)
+        )
+        self.assertNotEqual(
+            assets.load_baseline(self.api, FORK)[0],
+            make_baseline(older, older_evidence),
+        )
 
     def test_markerless_draft_recovers_original_run_not_retry_candidate(self):
         bundle, candidate, evidence = self.bundle()

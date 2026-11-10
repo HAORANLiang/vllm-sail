@@ -81,6 +81,7 @@ jobs:
       pr_number: ${{ steps.authorize.outputs.pr_number }}
       head_sha: ${{ steps.authorize.outputs.head_sha }}
       base_sha: ${{ steps.authorize.outputs.base_sha }}
+      artifact_name: ${{ steps.artifact.outputs.name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -132,9 +133,12 @@ jobs:
           python3 control/scripts/ci/nightly_assets.py fetch-preview \
             --consumer-repository "$CONSUMER" \
             --output "flow-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Name the resolved inputs artifact for partial retries
+        id: artifact
+        run: echo "name=dockerfile-ci-inputs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: dockerfile-ci-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.artifact.outputs.name }}
           path: |
             flow-${{ github.run_id }}-${{ github.run_attempt }}/plan.json
             flow-${{ github.run_id }}-${{ github.run_attempt }}/pr.json
@@ -160,7 +164,9 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: dockerfile-ci-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          # The resolve job keeps its own attempt: a rerun that only retries
+          # failed jobs must still download the artifact that really exists.
+          name: ${{ needs.resolve.outputs.artifact_name }}
           path: flow-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Invalidate stale approvals before checking out the PR
         env:
