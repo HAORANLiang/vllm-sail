@@ -414,7 +414,7 @@ def test_pr_pipeline_structure():
     for job_id, name, target in (
         ("pin-unit-tests", "PPU pin UT", "_ppu-pin-ut.yaml"),
         ("model-tests", "PPU model tests", "_ppu-model-tests.yaml"),
-        ("upstream-reuse", "CPU and M890 upstream reuse", "upstream-reuse.yaml"),
+        ("upstream-reuse", "PPU upstream reuse", "_ppu-upstream-reuse.yaml"),
     ):
         job = jobs[job_id]
         assert job["name"] == name
@@ -713,7 +713,7 @@ def test_workflow_filenames_distinguish_reusable_calls_from_entrypoints():
         triggers = workflow(path.name)[True]
         if path.name == "ppu-build-and-test.yaml":
             assert set(triggers) == {"workflow_call", "pull_request"}
-        elif path.name.startswith("_") or path.name == "upstream-reuse.yaml":
+        elif path.name.startswith("_"):
             assert set(triggers) == {"workflow_call"}, path.name
         else:
             assert "workflow_call" not in triggers, path.name
@@ -901,16 +901,9 @@ def test_labeled_preview_propagates_merge_sha_to_build_and_test_checkouts(
     pipeline = workflow("ppu-build-and-test.yaml")["jobs"]
     assert expression(pipeline["build"]["if"], context)
     caller = pipeline[caller_id]
-    expected_workflow = (
-        "upstream-reuse.yaml" if caller_id == "upstream-reuse" else leaf_name
-    )
-    assert caller["uses"] == f"./.github/workflows/{expected_workflow}"
+    assert caller["uses"] == f"./.github/workflows/{leaf_name}"
     context["inputs.pr_head_sha"] = expression(caller["with"]["pr_head_sha"], context)
     assert context["inputs.pr_head_sha"] == merge_sha
-    if caller_id == "upstream-reuse":
-        for reuse in workflow(expected_workflow)["jobs"].values():
-            assert reuse["uses"] == f"./.github/workflows/{leaf_name}"
-            assert expression(reuse["with"]["pr_head_sha"], context) == merge_sha
     if caller_id != "build":
         assert caller["with"]["pr_mode"] is True
         assert expression(caller["with"]["wheel_source_sha"], context) == ""
@@ -1299,40 +1292,29 @@ def test_runtime_workflows_use_the_checked_in_docker_wrapper():
 
 
 def test_upstream_reuse_only_runs_in_the_authorized_pipeline():
-    config = workflow("upstream-reuse.yaml")
-    assert set(config[True]) == {"workflow_call"}
-    assert config["permissions"] == {"contents": "read", "actions": "read"}
-    assert set(config["jobs"]) == {"cpu-reuse", "m890-reuse"}
-    for job_id, target in (("cpu-reuse", "cpu"), ("m890-reuse", "890p")):
-        job = config["jobs"][job_id]
-        assert job["uses"] == "./.github/workflows/_ppu-upstream-reuse.yaml"
-        assert "secrets" not in job
-        assert job["with"] == {
-            "target": target,
-            "pr_mode": "${{ inputs.pr_mode }}",
-            "pr_head_sha": "${{ inputs.pr_head_sha }}",
-            "build_run_id": "${{ inputs.build_run_id }}",
-            "wheel_source_sha": "${{ inputs.wheel_source_sha }}",
-        }
-    assert config["jobs"]["m890-reuse"]["needs"] == "cpu-reuse"
-    assert config["jobs"]["m890-reuse"]["if"] == "${{ !cancelled() }}"
-    text = (WORKFLOWS / "upstream-reuse.yaml").read_text()
-    assert "pip install" not in text
-    assert "nightly" not in text
-    assert "resolve-build" not in text
+    texts = {path.name: path.read_text() for path in WORKFLOWS.glob("*.y*ml")}
+    callers = {
+        name for name, text in texts.items() if "_ppu-upstream-reuse.yaml" in text
+    }
+    assert callers == {"ppu-build-and-test.yaml"}
+    runners = {
+        name
+        for name, text in texts.items()
+        if "tests/upstream_reuse" in text
+        or 'ppu_runtime_container.sh" upstream-reuse' in text
+    }
+    assert runners == {"_ppu-upstream-reuse.yaml"}
 
 
 def test_upstream_reuse_leaf_uses_exact_pin_and_dual_source_identity():
     config = workflow("_ppu-upstream-reuse.yaml")
     assert set(config[True]) == {"workflow_call"}
     assert set(config[True]["workflow_call"]["inputs"]) == {
-        "target",
         "pr_mode",
         "pr_head_sha",
         "build_run_id",
         "wheel_source_sha",
     }
-    assert config[True]["workflow_call"]["inputs"]["target"]["required"]
     assert set(config["jobs"]) == {"upstream-reuse"}
     job = config["jobs"]["upstream-reuse"]
     assert "container" not in job and "strategy" not in job
@@ -1351,16 +1333,12 @@ def test_upstream_reuse_leaf_uses_exact_pin_and_dual_source_identity():
     runtime = next(
         s for s in job["steps"] if "ppu_runtime_container.sh" in s.get("run", "")
     )
-    assert "cpu) mode=upstream-reuse-cpu" in runtime["run"]
-    assert "890p) mode=upstream-reuse" in runtime["run"]
-    assert runtime["env"]["REUSE_TARGET"] == "${{ inputs.target }}"
+    assert runtime["run"].endswith('" upstream-reuse')
     assert runtime["env"]["HF_HOME"] == "/nas_aisw/datasets/hf_cache"
     assert runtime["env"]["PPU_CI_REUSE_CHECKPOINT_ROOT"] == (
         "/nas_aisw/datasets/checkpoints/LLM"
     )
-    assert runtime["env"]["PPU_CI_DEVICE_COUNT"] == (
-        "${{ inputs.target == 'cpu' && '0' || '1' }}"
-    )
+    assert runtime["env"]["PPU_CI_DEVICE_COUNT"] == "1"
     assert (
         runtime["env"]["PPU_CI_UPSTREAM_DIR"] == "${{ steps.runtime.outputs.upstream }}"
     )
@@ -1387,39 +1365,19 @@ def test_upstream_reuse_leaf_uses_exact_pin_and_dual_source_identity():
     )
 
 
-@pytest.mark.parametrize("target,count", [("cpu", "0"), ("890p", "1")])
-def test_reuse_target_selects_the_expected_visible_device_count(target, count):
-    steps = workflow("_ppu-upstream-reuse.yaml")["jobs"]["upstream-reuse"]["steps"]
-    runtime = next(
-        step
-        for step in steps
-        if "REUSE_TARGET" in step.get("env", {})
-        and "PPU_CI_DEVICE_COUNT" in step["env"]
-    )
-    assert (
-        expression(runtime["env"]["PPU_CI_DEVICE_COUNT"], {"inputs.target": target})
-        == count
-    )
-
-
 @pytest.mark.parametrize(
-    "mode,upstream_sha,count,missing_cache,accepted",
+    "upstream_sha,count,missing_cache,accepted",
     [
-        ("upstream-reuse", "b" * 40, "1", None, True),
-        ("upstream-reuse", "c" * 40, "1", None, False),
-        ("upstream-reuse", "b" * 40, "2", None, False),
-        ("upstream-reuse-cpu", "b" * 40, "0", None, True),
-        ("upstream-reuse-cpu", "c" * 40, "0", None, False),
-        ("upstream-reuse-cpu", "b" * 40, "1", None, False),
-        ("upstream-reuse", "b" * 40, "0", None, False),
-        ("upstream-reuse-cpu", "b" * 40, "0", "hub", False),
-        ("upstream-reuse-cpu", "b" * 40, "0", "checkpoints", False),
-        ("upstream-reuse", "b" * 40, "1", "hub", False),
-        ("upstream-reuse", "b" * 40, "1", "checkpoints", False),
+        ("b" * 40, "1", None, True),
+        ("c" * 40, "1", None, False),
+        ("b" * 40, "2", None, False),
+        ("b" * 40, "0", None, False),
+        ("b" * 40, "1", "hub", False),
+        ("b" * 40, "1", "checkpoints", False),
     ],
 )
 def test_upstream_reuse_container_mounts_pin_readonly_without_host_sdk_or_token(
-    tmp_path, mode, upstream_sha, count, missing_cache, accepted
+    tmp_path, upstream_sha, count, missing_cache, accepted
 ):
     source, upstream, wheels, artifacts, binaries = [
         tmp_path / name for name in ("source", "upstream", "wheels", "artifacts", "bin")
@@ -1485,7 +1443,7 @@ def test_upstream_reuse_container_mounts_pin_readonly_without_host_sdk_or_token(
         "DOCKER_LOG": str(log),
     }
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts/ci/ppu_runtime_container.sh"), mode],
+        ["bash", str(ROOT / "scripts/ci/ppu_runtime_container.sh"), "upstream-reuse"],
         env=env,
         capture_output=True,
         text=True,
@@ -1525,15 +1483,8 @@ def test_upstream_reuse_container_mounts_pin_readonly_without_host_sdk_or_token(
     assert "EXPECTED_VLLM_COMMIT=" + "b" * 40 in args
     assert "VLLM_SOURCE_ROOT=/upstream" in args
     assert args[-1] == "/source/scripts/ci/ppu_upstream_reuse.sh"
-    if mode == "upstream-reuse-cpu":
-        assert "UPSTREAM_REUSE_TARGET=cpu" in args
-        assert "CUDA_VISIBLE_DEVICES=" in args
-        assert "--ipc=private" in args
-        assert not any(arg.startswith("--device=") for arg in args)
-    else:
-        assert "UPSTREAM_REUSE_TARGET=890p" in args
-        assert "--ipc=host" in args
-        assert sum(arg.startswith("--device=/dev/alixpu_ppu") for arg in args) == 1
+    assert "--ipc=host" in args
+    assert sum(arg.startswith("--device=/dev/alixpu_ppu") for arg in args) == 1
     assert not any(
         "TOKEN" in arg or "never-pass" in arg or "PPU_SDK" in arg for arg in args
     )
@@ -1554,10 +1505,9 @@ def test_upstream_reuse_script_protects_image_and_wheel_imports_and_is_fail_clos
     assert "requirements/upstream-reuse.txt" in text
     assert "requirements/dev.txt" not in text
     assert "current_platform.is_ppu()" in text
-    assert "current_platform.is_cpu()" in text
-    assert 'export VLLM_TARGET_DEVICE=cpu VLLM_PLUGINS=""' in text
+    assert "export VLLM_PLUGINS=ppu" in text
+    assert "VLLM_TARGET_DEVICE" not in text
     assert "import torchvision" in text
-    assert "assert count == 0" in text
     assert "torch.cuda.is_available()" in text
     assert "assert count == 1" in text
     assert "capability == (8, 9)" in text
@@ -1567,9 +1517,9 @@ def test_upstream_reuse_script_protects_image_and_wheel_imports_and_is_fail_clos
     assert 'cd "${WORK_DIR}"' in text
     assert "cp -a /upstream" not in text and "PYTHONPATH=" not in text
     for arg in (
-        'tests/upstream_reuse -q -rs -m "${reuse_markers}"',
+        "tests/upstream_reuse -q -rs -m upstream_source",
         "--require-upstream-source --strict-upstream-reuse",
-        '--upstream-reuse-target="${UPSTREAM_REUSE_TARGET}"',
+        "--upstream-reuse-target=890p",
         "--upstream-reuse-report-dir=/artifacts/reuse",
     ):
         assert arg in text
@@ -1588,34 +1538,13 @@ def test_upstream_reuse_script_protects_image_and_wheel_imports_and_is_fail_clos
         ({"name": "NVIDIA RTX 4090"}, "non-M890"),
         ({"vllm_path": "/upstream/vllm/__init__.py"}, "vllm"),
         ({"sail_path": "/source/vllm_sail/__init__.py"}, "vllm_sail"),
-        (
-            {
-                "target": "cpu",
-                "is_cpu": True,
-                "is_ppu": False,
-                "available": False,
-                "count": 0,
-            },
-            None,
-        ),
-        (
-            {"target": "cpu", "is_cpu": False, "available": False, "count": 0},
-            "namespace",
-        ),
-        ({"target": "cpu", "is_cpu": True, "available": True}, "must not access"),
-        (
-            {"target": "cpu", "is_cpu": True, "available": False, "count": 1},
-            "zero visible",
-        ),
     ],
 )
 def test_reuse_preflight_rejects_wrong_device_and_checkout_imports(
     tmp_path, monkeypatch, change, reason
 ):
     values = {
-        "target": "890p",
         "is_ppu": True,
-        "is_cpu": False,
         "available": True,
         "count": 1,
         "capability": (8, 9),
@@ -1626,11 +1555,9 @@ def test_reuse_preflight_rejects_wrong_device_and_checkout_imports(
         **change,
     }
     platform = types.SimpleNamespace(
-        is_cpu=lambda: values["is_cpu"],
+        is_ppu=lambda: values["is_ppu"],
         get_device_capability=lambda _: values["platform_capability"],
     )
-    if values["target"] == "890p":
-        platform.is_ppu = lambda: values["is_ppu"]
     torch = types.SimpleNamespace(
         __file__="/site-packages/torch/__init__.py",
         __version__="2.13+sail",
@@ -1659,7 +1586,6 @@ def test_reuse_preflight_rejects_wrong_device_and_checkout_imports(
         "TESTED_SAIL_COMMIT": "a" * 40,
         "EXPECTED_SAIL_COMMIT": "b" * 40,
         "EXPECTED_VLLM_COMMIT": "c" * 40,
-        "UPSTREAM_REUSE_TARGET": values["target"],
         "HF_HOME": "/nas_aisw/datasets/hf_cache",
         "HF_HUB_CACHE": "/nas_aisw/datasets/hf_cache/hub",
         "REUSE_CHECKPOINT_ROOT": "/nas_aisw/datasets/checkpoints/LLM",
@@ -1677,10 +1603,9 @@ def test_reuse_preflight_rejects_wrong_device_and_checkout_imports(
         identity = json.loads((tmp_path / "runtime-identity.json").read_text())
         assert identity["tested_sha"] == "a" * 40
         assert identity["wheel_source_sha"] == "b" * 40
-        assert identity["target"] == values["target"]
-        assert identity["is_ppu"] == (values["target"] == "890p")
-        assert identity["device_count"] == values["count"]
-        assert identity["capability"] == (None if values["target"] == "cpu" else [8, 9])
+        assert identity["is_ppu"] is True
+        assert identity["device_count"] == 1
+        assert identity["capability"] == [8, 9]
         assert identity["torchvision_version"] == "0.28.0"
         assert identity["hf_home"] == "/nas_aisw/datasets/hf_cache"
         assert identity["hf_hub_cache"] == "/nas_aisw/datasets/hf_cache/hub"

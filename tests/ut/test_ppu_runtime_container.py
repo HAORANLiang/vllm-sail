@@ -48,9 +48,7 @@ def test_runtime_wrapper_mounts_inputs_read_only_and_artifacts_writable():
     assert "/source/scripts/ci/ppu_e2e_smoke.sh" in text
 
 
-@pytest.mark.parametrize(
-    "branch", ["upstream-reuse|upstream-reuse-cpu", "model-test", "model-accuracy"]
-)
+@pytest.mark.parametrize("branch", ["upstream-reuse", "model-test", "model-accuracy"])
 def test_runtime_wrapper_keeps_dynamic_module_cache_writable(branch):
     text = SCRIPT.read_text()
     assert "hf_modules_cache=/tmp/hf-modules" in text

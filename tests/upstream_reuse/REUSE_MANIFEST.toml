@@ -22,8 +22,8 @@
 #               "adapted" -> run with node selection / env / expected-xfail
 #                            applied by test_reuse_adapted.py
 #   chips       applicable targets, subset of {"cpu", "810e", "890p"}.
-#               "cpu" entries are collected by the PR CPU lane; entries with no
-#               "cpu" are marked `ppu` and run in the authorized device lane.
+#               CI runs the "890p" entries on M890; "cpu" entries can also run on
+#               a device-less host. Entries without "cpu" are marked `ppu`.
 #   category    free-form grouping (params / config / core / sample / ...)
 #   reason      why this entry is direct|adapted (audited on every bump)
 #   min_tests   minimum number of upstream test cases that must be collected;

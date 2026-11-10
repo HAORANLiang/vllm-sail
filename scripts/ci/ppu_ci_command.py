@@ -22,7 +22,7 @@ CI_REUSE_FILES = set(
     f".github/workflows/{WORKFLOW} .github/workflows/ppu-build-and-test.yaml "
     ".github/workflows/_ppu-build.yaml .github/workflows/_ppu-pin-ut.yaml "
     ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-upstream-reuse.yaml "
-    ".github/workflows/upstream-reuse.yaml scripts/ci/ppu_ci_command.py "
+    "scripts/ci/ppu_ci_command.py "
     "scripts/ci/ppu_runtime_container.sh scripts/ci/ppu_runtime_image.sh "
     "scripts/ci/ppu_upstream_reuse.sh scripts/ci/ppu_image_stack.py "
     "scripts/ci/ppu_wheel_manifest.py requirements/upstream-reuse.txt "

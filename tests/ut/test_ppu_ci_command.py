@@ -1650,7 +1650,6 @@ def test_ci_reuse_files_cover_controller_and_reachable_reusable_workflows():
     "path",
     [
         ".github/workflows/_ppu-upstream-reuse.yaml",
-        ".github/workflows/upstream-reuse.yaml",
         "scripts/ci/ppu_upstream_reuse.sh",
         "scripts/ci/ppu_runtime_container.sh",
         "scripts/ci/ppu_image_stack.py",

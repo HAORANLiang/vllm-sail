@@ -92,7 +92,7 @@ class ReuseEntry(NamedTuple):
 
     @property
     def device_only(self) -> bool:
-        """True when the entry needs a real PPU (excluded from the CPU lane)."""
+        """True when the entry needs a real PPU (excluded from device-less runs)."""
         return not self.cpu_runnable
 
 
@@ -253,7 +253,7 @@ def entry_marks(entry: ReuseEntry) -> list[pytest.MarkDecorator]:
 
     Every reused upstream test is an ``upstream_source`` check (it needs the
     selected checkout). Entries that cannot run on a device-less host are also
-    marked ``ppu`` -- so the PR CPU lane's ``-m "upstream_source and not ppu"``
+    marked ``ppu`` -- so a device-less run's ``-m "upstream_source and not ppu"``
     excludes them and ``tests/conftest.py`` auto-skips them without a real
     device. Chip-exclusive entries additionally carry ``cap80`` / ``cap89``.
     """

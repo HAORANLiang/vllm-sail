@@ -85,7 +85,7 @@ def test_adapted_entries_justify_their_adaptation() -> None:
 
     Otherwise it should be ``direct``. Valid justifications: a narrowing knob
     (markers/keywords/deselect), an env override, a declared xfail, a parking
-    skip_reason, or being device-only (excluded from the CPU lane).
+    skip_reason, or being device-only (excluded from device-less runs).
     """
     unjustified = []
     for entry in ADAPTED_ENTRIES:

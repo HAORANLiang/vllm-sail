@@ -100,15 +100,13 @@ jobs runs PPU inference or `tests/e2e`.
 
 ### Upstream test reuse
 
-Upstream reuse runs through the authorized PPU pipeline, not automatically on
-PRs or a nightly schedule. CPU and M890 reuse run sequentially using
-runner-configured Docker runtimes and the same validated CI wheels. CPU reuse exposes no
-PPU devices, selects `VLLM_TARGET_DEVICE=cpu` and disables plugin loading. Both
-targets preserve the image's torch/torchvision stack; only the dedicated
-`requirements/upstream-reuse.txt` tooling is installed. CPU reuse is an upstream
-runtime diagnostic, not PPU qualification. `requirements/dev.txt` stays unchanged.
+Upstream reuse runs on a single M890 card in the authorized PPU pipeline, not
+automatically on PRs or a nightly schedule. It uses the runner-configured Docker
+runtime and the validated CI wheels with the SAIL plugin enabled, preserves the
+image's torch/torchvision stack and installs only the dedicated
+`requirements/upstream-reuse.txt` tooling. `requirements/dev.txt` stays unchanged.
 
-Both containers read `HF_HOME=/nas_aisw/datasets/hf_cache` in offline mode. The
+The container reads `HF_HOME=/nas_aisw/datasets/hf_cache` in offline mode. The
 cache and `/nas_aisw/datasets/checkpoints/LLM` are mounted read-only at their host
 paths, so snapshot symlinks into the checkpoint tree remain valid. Imported
 model code uses a writable temporary `HF_MODULES_CACHE`; no checkpoints are
@@ -116,7 +114,9 @@ downloaded or modified. Missing model files still fail strict reuse, including
 cache entries whose snapshot directory exists but is empty. Diagnostics record
 the cache and checkpoint paths.
 
-In a prepared CPU environment with the exact upstream checkout:
+For a local diagnostic in a prepared CPU environment with the exact upstream
+checkout, run the CPU entries with plugin loading disabled. This checks upstream
+behavior only and is not PPU qualification:
 
 ```bash
 VLLM_PLUGINS='' VLLM_TARGET_DEVICE=cpu VLLM_SOURCE_ROOT=/path/to/pinned/vllm \
@@ -140,7 +140,7 @@ SDK/Torch stack. 810E is explicitly deferred because no CI runner is available.
 The authorized `/ci run` dispatcher uses default-branch workflow definitions;
 new reusable-job wiring becomes active after merge. Before merge, the existing
 `ci-preview` PR path can execute the changed pipeline for validation. Neither a
-CPU green check nor a deferred device establishes M890 or 810E correctness.
+local CPU run nor a deferred device establishes M890 or 810E correctness.
 
 ## 3. Run device correctness tests
 
