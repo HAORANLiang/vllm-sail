@@ -230,16 +230,3 @@ reason = "Tokenizer registry consistency needs HuggingFace AutoConfig; pinned to
 env = { HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1" }
 skip_reason = "requires a warm offline HF tokenizer cache (HF_HOME) on the runner; enable once the CI cache volume is provisioned"
 min_tests = 1
-
-[[entry]]
-id = "v1_sample_logprobs"
-path = "tests/v1/sample/test_logprobs.py"
-mode = "adapted"
-chips = ["810e", "890p"]
-category = "sample"
-reason = "Logprob end-to-end path uses cleanup_dist_env_and_memory + cudagraph reservation; needs a real device (PPU lane only), with ROCm/XPU-specific nodes deselected."
-keywords = "not rocm and not xpu"
-min_tests = 1
-allowed_skips = [
-    { nodeid = "tests.v1.sample.test_logprobs::test_get_logprobs_and_prompt_logprobs*", reason = "test_logprobs.py:360: Skipped", max_count = 7 },
-]

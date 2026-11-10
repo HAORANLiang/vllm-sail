@@ -716,7 +716,18 @@ def test_strict_runtime_view_cannot_shadow_installed_packages(upstream, monkeypa
 
 
 def test_reviewed_apc_skip_retains_source_location_and_count_limit(tmp_path):
-    entry = next(e for e in harness.load_manifest() if e.id == "v1_sample_logprobs")
+    entry = make_entry(
+        "tests/v1/sample/test_logprobs.py",
+        mode="adapted",
+        allowed_skips=(
+            {
+                "nodeid": "tests.v1.sample.test_logprobs::"
+                "test_get_logprobs_and_prompt_logprobs*",
+                "reason": "test_logprobs.py:360: Skipped",
+                "max_count": 7,
+            },
+        ),
+    )
     report = tmp_path / "report.xml"
     report.write_text(
         '<testsuites><testsuite tests="2" skipped="1">'
