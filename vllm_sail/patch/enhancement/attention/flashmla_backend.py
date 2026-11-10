@@ -17,6 +17,17 @@ in ``FlashMLAImpl.forward_mqa`` — is not patched here: the plugin emits it fro
 ``vllm.v1.attention.ops.flashmla.flash_mla_with_kvcache`` (see
 ``flashmla_ops``), i.e. around the very call the fork brackets, without wrapping
 ``forward_mqa`` or handling its untuple ``q``.
+
+A plugin-only fourth patch, ``FlashMLAMetadataBuilder._build_decode``, enables
+the FP8 dense path on PPU. Upstream's FP8 branch calls
+``get_mla_metadata_dense_fp8`` for int32 tile-scheduler tensors and copies them
+into CUDA-graph buffers; PPU builds no ``_flashmla_extension_C`` and the sail
+kernel instead fills its metadata lazily from a ``FlashMLASchedMeta``. On PPU FP8
+the patch therefore delegates to upstream's non-FP8 branch (which already builds
+``scheduler_metadata`` as a sail ``FlashMLASchedMeta``) and attaches a lazy sched
+meta to ``scheduler_metadata.tile_scheduler_metadata`` — the field
+``forward_mqa``'s FP8 branch forwards to ``flash_mla_with_kvcache_fp8`` — leaving
+``num_splits`` ``None`` as the sail kernel requires.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ _upstream_supports_compute_capability = (
     _flashmla_backend.FlashMLABackend.supports_compute_capability
 )
 _upstream_builder_init = _flashmla_backend.FlashMLAMetadataBuilder.__init__
+_upstream_build_decode = _flashmla_backend.FlashMLAMetadataBuilder._build_decode
 
 
 @patch(
@@ -84,3 +96,66 @@ def builder_init(
             device=self.device,
             dtype=torch.int32,
         )
+
+
+@patch(
+    _MODULE,
+    "FlashMLAMetadataBuilder._build_decode",
+    reason=(
+        "PPU builds no _flashmla_extension_C, so upstream's FP8 dense metadata "
+        "path (get_mla_metadata_dense_fp8 -> int32 tensors -> CUDA-graph copies) "
+        "cannot run. The sail dense FP8 kernel fills its tile-scheduler metadata "
+        "lazily from a FlashMLASchedMeta, the same object the non-FP8 "
+        "get_mla_metadata returns. On PPU FP8 this delegates to upstream's "
+        "non-FP8 branch to build scheduler_metadata, then attaches a lazy sched "
+        "meta (from the patched get_mla_metadata_dense_fp8) to "
+        "scheduler_metadata.tile_scheduler_metadata, which forward_mqa's FP8 "
+        "branch forwards to flash_mla_with_kvcache_fp8; num_splits stays None as "
+        "the sail kernel requires."
+    ),
+    affected_versions=_AFFECTED,
+    remove_when="PPU builds the FP8 dense FlashMLA metadata extension natively.",
+)
+def _build_decode(
+    self,
+    block_table_tensor,
+    seq_lens_device,
+    max_seq_len,
+    query_start_loc_cpu,
+    query_start_loc_device,
+    num_decode_tokens,
+    max_query_len,
+    dcp_tot_seq_lens_device,
+):
+    kwargs = dict(
+        block_table_tensor=block_table_tensor,
+        seq_lens_device=seq_lens_device,
+        max_seq_len=max_seq_len,
+        query_start_loc_cpu=query_start_loc_cpu,
+        query_start_loc_device=query_start_loc_device,
+        num_decode_tokens=num_decode_tokens,
+        max_query_len=max_query_len,
+        dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
+    )
+    if not (current_platform.is_ppu() and self.is_fp8_kvcache):
+        return _upstream_build_decode(self, **kwargs)
+
+    # Run upstream's non-FP8 branch: get_mla_metadata (sail) already returns a
+    # lazy FlashMLASchedMeta and the FP8 int32/CUDA-graph block is skipped.
+    # is_fp8_kvcache only gates that block and the sail-ignored flag passed to
+    # get_mla_metadata, so flipping it for the delegated call is safe; the
+    # branch is entered only when it is True, so restore it to True afterwards.
+    self.is_fp8_kvcache = False
+    try:
+        metadata = _upstream_build_decode(self, **kwargs)
+    finally:
+        self.is_fp8_kvcache = True
+
+    from vllm.v1.attention.ops.flashmla import get_mla_metadata_dense_fp8
+
+    # The sail get_mla_metadata ignores its args and returns a fresh lazy
+    # FlashMLASchedMeta; forward_mqa's FP8 branch reads it back off this field.
+    fp8_sched, _ = get_mla_metadata_dense_fp8(seq_lens_device, 1, 1)
+    metadata.scheduler_metadata.tile_scheduler_metadata = fp8_sched
+    metadata.scheduler_metadata.num_splits = None
+    return metadata

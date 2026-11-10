@@ -8,10 +8,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tests.support.source import assert_accepts_upstream_keywords
-from tests.ut.test_ppu_kernel_capabilities import load_patch
-from tests.ut.test_ppu_kernel_capabilities import modules as _modules
-
-modules = _modules
+from tests.support.modules import load_patch
 
 PATCH = "vllm_sail/patch/enhancement/attention/mla_indexer.py"
 TARGET = "vllm.v1.attention.backends.mla.indexer"
@@ -78,11 +75,13 @@ def builder_factory(modules, patch_utils_module):
             DSA_INDEXER_KV_DTYPES=("fp8", "mxfp4"),
             get_paged_mqa_logits_metadata=lambda *args, **kwargs: None,
             dsa_indexer_uses_fp4=lambda config: False,
+            _supports_flattened_device_query_lens=lambda: "upstream-query-lengths",
         )
         modules(
             "vllm_sail.utils.deep_gemm",
             get_num_sms=lambda: 7,
             has_deep_gemm=lambda: True,
+            is_deep_gemm_supported=lambda: True,
             get_paged_mqa_logits_metadata=lambda *args: None,
         )
         modules(

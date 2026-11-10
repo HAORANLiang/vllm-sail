@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.ut.test_upstream_version_precheck import SUPPORTED_RANGE
+from tests.support.upstream import SUPPORTED_RANGE
 
 pytest.importorskip("torch", reason="requires torch")
 pytest.importorskip("vllm", reason="requires vLLM")
@@ -77,6 +77,10 @@ _ATTENTION_TARGETS = (
         "FlashMLABackend.supports_compute_capability",
     ),
     ("vllm.v1.attention.backends.mla.flashmla", "FlashMLAMetadataBuilder.__init__"),
+    (
+        "vllm.v1.attention.backends.mla.flashmla",
+        "FlashMLAMetadataBuilder._build_decode",
+    ),
     (
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         "FlashMLASparseBackend.supports_compute_capability",

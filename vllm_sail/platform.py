@@ -47,19 +47,21 @@ def _get_attn_backend_class(backend: AttentionBackendEnum) -> type[AttentionBack
 def _retarget_dense_draft_backend(
     speculative_config: SpeculativeConfig,
 ) -> None:
-    """Point a dense MLA draft at PPU's fp8 MLA decoder.
+    """Point a dense MLA draft at PPU's native fp8 FlashMLA decoder.
 
     Upstream's Kimi K3 config hook (``configure_dense_draft``) pins a dense
     EAGLE3/DSpark MLA draft to ``FLASHINFER_MLA`` on an fp8 KV cache: the draft
     holds no cache of its own, it keeps plain fp8 rows at the head of the
-    target's merged pages. PPU can honour neither half of that pin -- FlashInfer
-    is absent, and the dense FlashMLA has no FP8 decode path -- so the draft
-    dies in the selector with "compute capability not supported".
+    target's merged pages. PPU has no FlashInfer, so that pin dies in the
+    selector with "compute capability not supported".
 
-    ``TRITON_MLA`` reads the same fp8 rows, dequantizes in-kernel from the
-    layer's ``_k_scale``, takes the real page stride of the cross-layer view and
-    flattens the draft's non-causal block to one decode row per query token.
-    Only the decode backend changes: the KV format, the page binding and
+    The dense FlashMLA now has an FP8 decode path on PPU -- the patched
+    get_mla_metadata_dense_fp8 forwards to the sail get_mla_metadata, the
+    _build_decode patch attaches a lazy FlashMLASchedMeta, and
+    flash_mla_with_kvcache_fp8 folds the q/k scales into the sail dense kernel
+    -- so the draft retargets to ``FLASHMLA``, the same native decoder the
+    target model uses, instead of the previous ``TRITON_MLA`` fallback. Only the
+    decode backend changes: the KV format, the page binding and
     ``kv_cache_dtype="fp8"`` stay exactly as upstream set them.
     """
     if (
@@ -68,10 +70,10 @@ def _retarget_dense_draft_backend(
     ):
         logger.info(
             "Retargeting the dense %s draft from FLASHINFER_MLA (unavailable on "
-            "PPU) to TRITON_MLA; the fp8 KV rows and page binding are unchanged.",
+            "PPU) to FLASHMLA; the fp8 KV rows and page binding are unchanged.",
             speculative_config.method,
         )
-        speculative_config.attention_backend = AttentionBackendEnum.TRITON_MLA
+        speculative_config.attention_backend = AttentionBackendEnum.FLASHMLA
 
 
 class _BackendCandidate(NamedTuple):
@@ -237,6 +239,10 @@ class PPUPlatform(NvmlCudaPlatform):
         # Registering PPU custom ops here (rather than at plugin import) keeps
         # the registration after torch and the platform are both initialised.
         from vllm_sail import ops  # noqa: F401
+
+        from vllm_sail.models.deepseek_v41.config import normalize_expert_dtype
+
+        normalize_expert_dtype(vllm_config)
 
         if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
             raise ValueError(

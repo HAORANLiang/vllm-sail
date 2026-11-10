@@ -31,8 +31,9 @@ kernel source instead of a fixed deny-list: any registration whose Triton
 function names ``float8e4nv`` is dropped. Devices with native FP8 (PPU 890P and
 up) keep the upstream warmup. A registration whose *signature* needs the dtype
 (passed as a ``torch.float8_e4m3fn`` tensor) is invisible to source inspection,
-so a narrow per-kernel guard turns exactly that compile error into a warning
-rather than a dead worker.
+so enhancement.triton_warmup filters those compile keys by their input metadata
+before submitting them to the unchanged shared async compiler pool. Compilation
+errors are not suppressed after submission.
 
 The target module imports the full worker/warmup stack at module scope. On
 hosts where that chain cannot run (e.g. a minimal test venv without vLLM's
@@ -68,7 +69,6 @@ _CUTEDSL_MODULE = "vllm.model_executor.warmup.cutedsl_warmup"
 # the filter independent of how a kernel was registered (class, decorated
 # function, or a subclass/wrapper defined by this plugin).
 _UNSUPPORTED_FP8_DTYPE = "float8e4nv"
-_UNSUPPORTED_FP8_ERRORS = ("fp8e4nv", "not supported in this architecture")
 
 
 def _called_name(node: ast.expr) -> str | None:
@@ -121,40 +121,6 @@ def _kernel_needs_unsupported_fp8(kernel) -> bool:
     return jit_fn is not None and _names_unsupported_fp8(jit_fn)
 
 
-def _is_unsupported_fp8_error(exc: BaseException) -> bool:
-    message = str(exc)
-    return all(marker in message for marker in _UNSUPPORTED_FP8_ERRORS)
-
-
-def _tolerate_unsupported_fp8(kernel) -> None:
-    """Skip a warmup whose compile key needs E4M3 as an argument dtype.
-
-    Source inspection cannot see this case: the rejected dtype only appears in
-    the signature Triton derives from a ``torch.float8_e4m3fn`` tensor, and the
-    error is raised while tracing the function definition. Warmup is optional,
-    so warn with the kernel name and let the worker continue.
-    """
-    compile_many = kernel.compile_many
-
-    def guarded(compile_keys) -> None:
-        try:
-            compile_many(compile_keys)
-        except Exception as exc:
-            if not _is_unsupported_fp8_error(exc):
-                raise
-            logger.warning(
-                "Skipping JIT warmup for %s: this PPU architecture cannot "
-                "compile fp8e4nv. %s",
-                type(kernel).__name__,
-                exc,
-            )
-
-    try:
-        kernel.compile_many = guarded
-    except AttributeError:  # frozen kernel wrappers
-        pass
-
-
 def _exclude_ppu_cutedsl_registrations(worker) -> None:
     from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
         VllmCuTeDSLJitKernel,
@@ -200,8 +166,6 @@ def _exclude_sm80_fp8_registrations(worker) -> None:
             _UNSUPPORTED_FP8_DTYPE,
             ", ".join(type(kernel).__name__ for kernel in unsupported),
         )
-    for kernel in registrations:
-        _tolerate_unsupported_fp8(kernel)
 
 
 def _register_ppu_sampler_warmups(worker) -> None:
