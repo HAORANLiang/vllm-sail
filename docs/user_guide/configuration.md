@@ -78,10 +78,12 @@ at layer construction rather than falling back silently. Selection is per layer,
 so a model whose layers disagree on KV-cache dtype resolves each independently.
 
 Note that FA3's hand-tuned QSA kernels require one KV head per rank under the
-interleaved KV-cache layout this pin allocates. Zhenwu M890 reaches a tuned
-kernel only at tensor-parallel size 2; other sizes, including tensor-parallel
-size 1, run FA3's QSA-aware generic kernel. Correctness is unaffected. Use
-`triton` to compare against the Triton kernel on your own shape.
+interleaved KV-cache layout this pin allocates. Per-rank KV heads are
+`max(1, num_key_value_heads // tp_size)`, so with this model's two KV heads any
+even tensor-parallel size of 2 or more replicates them down to one per rank and
+reaches a tuned kernel, while tensor-parallel size 1 keeps two and runs FA3's
+QSA-aware generic kernel. Correctness is unaffected. Use `triton` to compare
+against the Triton kernel on your own shape.
 
 ## DeepSeek V4.1
 

@@ -322,7 +322,9 @@ def _probe_fa3_qsa(device=None) -> tuple[bool, str | None]:
         layouts["interleaved-kv2"] = _interleaved(2)
         # One KV head satisfies FA3's k_batch_stride == page_size * k_row_stride
         # under this layout, so it is the only one that reaches the hand-tuned
-        # QSA kernels. Tensor-parallel size 2 of the target model runs it.
+        # QSA kernels. The target model has two KV heads, so any tensor-parallel
+        # size that replicates them down to one per rank runs it -- 2 and 4 both
+        # do, while tensor-parallel size 1 keeps two and stays on the kv2 pool.
         layouts["interleaved-kv1"] = _interleaved(1)
 
         outs = {}
