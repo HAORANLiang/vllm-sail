@@ -990,11 +990,21 @@ def fp4_paged_mqa_avg_logits(
             value bytes first, then `page_kv` rows of 4 UE8M0 scale bytes. The
             kernel reads scales from `storage_offset + page_kv * head_dim`, so an
             interleaved per-row layout is silently misread.
+            `page_kv` may also be a whole framework block of several 64-row pages
+            (a multiple of 64 that is not itself 32/64/128), which is how the QSA
+            compressed cache arrives: one strided slice of the combined hybrid KV
+            block, so `stride(0)` is the block pitch and spans the other caches
+            sharing it. DeepGEMM then derives the page pitch from `stride(1)` and
+            splits a logical page into (block, page within block) itself, so the
+            cache can be scored in place rather than re-paged into a contiguous
+            copy.
         context_lens: Effective context length per Q row, shape `[B, next_n]`,
             dtype int32. The 2-D form is what selects average mode, and it
             forbids `clean_logits`; mask outside the kernel.
         block_tables: Logical-to-physical page map, shape `[B, max_blocks]`,
-            dtype int32.
+            dtype int32. Entries are page ids, except for the multi-page
+            `kv_cache` form above, where they are framework block ids and
+            `max_blocks` counts framework blocks -- do not expand them.
         schedule_metadata: From `get_paged_mqa_logits_metadata` built with
             `metadata_extra=fp4_avg_metadata_extra(next_n)`. DeepGEMM asserts its
             size matches `get_num_sms() * tb_per_cu` at launch.

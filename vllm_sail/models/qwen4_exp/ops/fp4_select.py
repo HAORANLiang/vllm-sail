@@ -23,9 +23,8 @@ from vllm_sail.models.qwen4_exp.ops.mxfp4 import (
     MXFP4_PAGE_ROWS,
     MXFP4_ROW_BYTES,
     as_qsa_fp4_pages,
-    expand_qsa_fp4_block_table,
+    check_qsa_fp4_cache_layout,
     gather_qsa_fp4_keys,
-    qsa_fp4_pages_per_block,
     qsa_quant_q_mxfp4,
 )
 from vllm_sail.utils.deep_gemm import (
@@ -70,14 +69,6 @@ def _topk(
     )
 
 
-def _fp4_pages_and_table(
-    k_cache: torch.Tensor, page_table: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    fp4_cache = as_qsa_fp4_pages(k_cache)
-    pages_per_block = qsa_fp4_pages_per_block(k_cache.shape[1])
-    return fp4_cache, expand_qsa_fp4_block_table(page_table, pages_per_block)
-
-
 def qsa_select_paged_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -93,6 +84,15 @@ def qsa_select_paged_decode(
     ``visible_blocks`` is each row's committed-group count, which is exactly the
     paged kernel's per-row context length, so decode needs no gather: the kernel
     walks the page table itself and writes request-relative columns.
+
+    ``k_cache`` is passed through exactly as ``bind_kv_cache`` produced it -- a
+    strided slice of the combined hybrid KV block, whose ``stride(0)`` spans the
+    other caches sharing that block -- and ``page_table`` stays in framework block
+    ids. DeepGEMM derives both the block pitch and the 64-row page pitch from that
+    layout and splits a logical page into (block, page within block) itself.
+    Re-paging into contiguous pages instead would copy the whole cache on every
+    call: 71 MB per indexer call at production ``num_blocks``, twelve times per
+    iteration, which is what dominated the fp4 arm's decode regression.
     """
     assert token_topk % compress_ratio == 0
     assert block_indices.shape == (q.shape[0], token_topk // compress_ratio)
@@ -106,8 +106,8 @@ def qsa_select_paged_decode(
     num_requests = q.shape[0] // decode_query_len
     num_heads = q.shape[1]
 
-    fp4_cache, fp4_block_table = _fp4_pages_and_table(k_cache, page_table)
-    columns = fp4_block_table.shape[1] * MXFP4_PAGE_ROWS
+    pages_per_block = check_qsa_fp4_cache_layout(k_cache)
+    columns = page_table.shape[1] * pages_per_block * MXFP4_PAGE_ROWS
     # The kernel and its schedule never see a zero-length row; top-k still uses
     # the raw counts, so an empty row selects nothing.
     context_lens = visible_blocks.view(num_requests, decode_query_len).clamp(min=1)
@@ -120,9 +120,9 @@ def qsa_select_paged_decode(
             ),
             q_sf.view(num_requests, decode_query_len, num_heads),
         ),
-        fp4_cache,
+        k_cache,
         context_lens,
-        fp4_block_table,
+        page_table,
         get_paged_mqa_logits_metadata(
             context_lens,
             MXFP4_PAGE_ROWS,
@@ -193,9 +193,10 @@ def qsa_select_paged_prefill(
     cu_seqlens = torch.zeros(num_requests + 1, dtype=torch.int64, device=device)
     torch.cumsum(keys_per_req, 0, dtype=torch.int64, out=cu_seqlens[1:])
 
-    # The gather reads the framework-block-planar layout the prepare kernel
-    # writes, so prefill takes the bound cache and block table as they are;
-    # re-paging onto 64-row FP4 pages is only what the paged kernel needs.
+    # The gather reads the prepare kernel's page-planar layout at its own
+    # page-relative offsets, so prefill takes the bound cache and framework
+    # block table as they are; re-paging onto 64-row FP4 pages would copy the
+    # whole cache, and only the paged kernel needs it.
     k_values, k_sf = gather_qsa_fp4_keys(
         k_cache, page_table, cu_seqlens, packed_key_capacity
     )

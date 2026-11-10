@@ -182,15 +182,15 @@ def qsa_fp4_pages_per_block(block_rows: int) -> int:
     return block_rows // MXFP4_PAGE_ROWS
 
 
-def as_qsa_fp4_pages(kv_cache: torch.Tensor) -> torch.Tensor:
-    """Reshape a bound compressed cache onto 64-row FP4 pages.
+def check_qsa_fp4_cache_layout(kv_cache: torch.Tensor) -> int:
+    """Validate a bound compressed cache and return its 64-row pages per block.
 
-    ``_QSAIndexerCache.bind_kv_cache`` hands the cache over as
-    ``[num_blocks, block_rows, 1, row_bytes]``; a framework block of several FP4
-    pages becomes that many pages here, and the framework block table is
-    expanded to match by ``expand_qsa_fp4_block_table``.
+    The same geometry contract ``as_qsa_fp4_pages`` enforces, without building the
+    paged view. DeepGEMM's paged kernel splits a framework block into pages itself
+    (see ``block_stride_bytes``/``pages_per_block``), so the decode path hands the
+    cache over exactly as ``bind_kv_cache`` produced it and only needs the checks.
     """
-    num_blocks, block_rows, num_kv_heads, row_bytes = kv_cache.shape
+    _, block_rows, num_kv_heads, row_bytes = kv_cache.shape
     if num_kv_heads != 1:
         raise ValueError(f"QSA MXFP4 pages hold one kv head, got {num_kv_heads}")
     if row_bytes != MXFP4_ROW_BYTES:
@@ -203,8 +203,30 @@ def as_qsa_fp4_pages(kv_cache: torch.Tensor) -> torch.Tensor:
             f"{block_rows} compressed rows per framework block; the QSA block "
             f"size must be a multiple of {MXFP4_PAGE_ROWS} * compress_ratio"
         )
+    return qsa_fp4_pages_per_block(block_rows)
+
+
+def as_qsa_fp4_pages(kv_cache: torch.Tensor) -> torch.Tensor:
+    """Reshape a bound compressed cache onto 64-row FP4 pages.
+
+    ``_QSAIndexerCache.bind_kv_cache`` hands the cache over as
+    ``[num_blocks, block_rows, 1, row_bytes]``; a framework block of several FP4
+    pages becomes that many pages here, and the framework block table is
+    expanded to match by ``expand_qsa_fp4_block_table``.
+
+    WARNING: this reshape copies unless the cache's block pitch is tight. In
+    serving the compressed cache is one strided slice of the combined hybrid KV
+    block, so ``stride(0)`` spans the other caches too and is far larger than
+    ``block_rows * row_bytes``. Splitting ``block_rows`` into pages then needs a
+    uniform page advance that the layout cannot express, and reshape silently
+    materializes the whole cache -- 71 MB per call at production ``num_blocks``.
+    The decode path therefore passes the cache through unreshaped; only callers
+    that genuinely need contiguous pages (or a warmup dummy) should use this.
+    """
+    num_blocks, block_rows, num_kv_heads, row_bytes = kv_cache.shape
+    pages_per_block = check_qsa_fp4_cache_layout(kv_cache)
     return kv_cache.reshape(
-        num_blocks * qsa_fp4_pages_per_block(block_rows),
+        num_blocks * pages_per_block,
         MXFP4_PAGE_ROWS,
         num_kv_heads,
         row_bytes,
@@ -331,6 +353,7 @@ __all__ = [
     "MXFP4_ROW_BYTES",
     "MXFP4_SCALE_BYTES",
     "as_qsa_fp4_pages",
+    "check_qsa_fp4_cache_layout",
     "expand_qsa_fp4_block_table",
     "gather_qsa_fp4_keys",
     "qsa_fp4_pages_per_block",
