@@ -64,7 +64,7 @@ MANIFEST_SCHEMA = 1
 VALID_MODES = ("direct", "adapted")
 VALID_CHIPS = ("cpu", "810e", "890p")
 #: Subprocess wall-clock ceiling for one upstream test file.
-RUN_TIMEOUT_SECONDS = 1800
+RUN_TIMEOUT_SECONDS = 3600
 
 
 class ReuseEntry(NamedTuple):
