@@ -9,9 +9,13 @@ behaviours differ from stock vLLM and all three are asserted here:
 
 * ``FlashMLABackend.supports_compute_capability`` accepts major ``8`` instead
   of ``[9, 10]`` -- without the inversion PPU could never select FlashMLA;
-* the FP8 *dense* decode path is a hard error, because
-  ``get_mla_metadata_dense_fp8`` / ``flash_mla_with_kvcache_fp8`` would call
-  ``torch.ops._flashmla_extension_C``;
+* the FP8 *dense* decode path is routed to the sail kernel, because PPU does
+  not build ``torch.ops._flashmla_extension_C``:
+  ``get_mla_metadata_dense_fp8`` forwards to the sail ``get_mla_metadata`` (a
+  lazy ``FlashMLASchedMeta``, kept off upstream's int32/CUDA-graph path by the
+  ``_build_decode`` patch) and ``flash_mla_with_kvcache_fp8`` dispatches through
+  ``flash_mla.flash_mla_with_kvcache`` (qkv_fp8), folding ``q_scale * k_scale``
+  into ``softmax_scale`` and rescaling the output by ``k_scale``;
 * the packed DeepSeek-V4 K cache is decoded by a software E4M3FN Triton kernel
   on 810E (``torch.ops.vllm.ppu_deepseek_v4_dequant_gather``), since Triton
   refuses ``tl.float8e4nv`` on capability (8, 0).
@@ -307,6 +311,35 @@ def _run_dense_decode(q, cache, block_table, seq_lens_t, query_len: int):
     )
 
 
+def _run_dense_decode_fp8(
+    q, cache_fp8, block_table, seq_lens_t, query_len: int, descale_q, descale_k
+):
+    """Mirror ``FlashMLAImpl.forward_mqa``'s FP8 branch.
+
+    ``q`` is the real (bf16) query and ``cache_fp8`` the stored FP8 cache; the
+    patch quantizes ``q`` with ``descale_q`` internally, exactly as the backend
+    hands it the un-quantized query plus the layer scales.
+    """
+    tile_scheduler_metadata, num_splits = mla_ops.get_mla_metadata_dense_fp8(
+        seq_lens_t,
+        query_len * NUM_Q_HEADS,  # num_q_tokens_per_head_k = max_query_len * h_q / h_k
+        1,  # MQA for the decode path
+    )
+    return mla_ops.flash_mla_with_kvcache_fp8(
+        q=q,
+        k_cache=cache_fp8.unsqueeze(-2),  # add the single KV head, as upstream does
+        block_table=block_table,
+        cache_seqlens=seq_lens_t,
+        head_dim_v=KV_LORA_RANK,
+        tile_scheduler_metadata=tile_scheduler_metadata,
+        num_splits=num_splits,
+        softmax_scale=SOFTMAX_SCALE,
+        causal=True,
+        descale_q=descale_q,
+        descale_k=descale_k,
+    )
+
+
 def _sparse_golden(q, kv, indices, lengths, scale):
     """fp32 golden for ``flash_mla_sparse_fwd``.
 
@@ -418,34 +451,79 @@ def test_flashmla_availability_probe_follows_the_wheel():
     assert reason is None
 
 
-def test_fp8_dense_flashmla_is_rejected_on_ppu():
-    """PPU has no FP8 dense decode path; both entry points must raise.
+def test_fp8_dense_metadata_returns_sched_meta_on_ppu():
+    """``get_mla_metadata_dense_fp8`` forwards to the sail ``get_mla_metadata``.
 
-    ``_raise_flashmla_unavailable`` reads the reason from
-    ``_is_flashmla_available()``, which returns ``None`` once the wheel is
-    installed, so the message is the generic one rather than the PPU hint.
+    PPU does not build ``_flashmla_extension_C``; the sail kernel fills its
+    scheduling metadata lazily from a ``FlashMLASchedMeta``, so the patch returns
+    ``(FlashMLASchedMeta, None)`` — the same shape the non-FP8 path uses — and
+    the ``_build_decode`` patch keeps upstream's int32/CUDA-graph copies off PPU.
     """
-    seq_lens = torch.tensor([128], dtype=torch.int32, device=DEVICE)
-    with pytest.raises(RuntimeError, match="FlashMLA is not available"):
-        mla_ops.get_mla_metadata_dense_fp8(seq_lens, NUM_Q_HEADS, 1)
+    from flash_mla import FlashMLASchedMeta
 
-    q = _randn(1, 1, NUM_Q_HEADS, MLA_HEAD_DIM, seed=101)
-    cache = _randn(2, BLOCK_SIZE, MLA_HEAD_DIM, seed=102)
-    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=DEVICE)
-    tile_scheduler_metadata = torch.zeros((1, 8), dtype=torch.int32, device=DEVICE)
-    num_splits = torch.zeros((2,), dtype=torch.int32, device=DEVICE)
-    with pytest.raises(RuntimeError, match="FlashMLA is not available"):
-        mla_ops.flash_mla_with_kvcache_fp8(
-            q=q,
-            k_cache=cache.unsqueeze(-2),
-            block_table=block_table,
-            cache_seqlens=seq_lens,
-            head_dim_v=KV_LORA_RANK,
-            tile_scheduler_metadata=tile_scheduler_metadata,
-            num_splits=num_splits,
-            softmax_scale=SOFTMAX_SCALE,
-            causal=True,
-        )
+    seq_lens = torch.tensor([128, 64], dtype=torch.int32, device=DEVICE)
+    sched, splits = mla_ops.get_mla_metadata_dense_fp8(seq_lens, NUM_Q_HEADS, 1)
+    assert isinstance(sched, FlashMLASchedMeta)
+    assert not sched.have_initialized
+    assert splits is None
+
+
+@pytest.mark.cap89
+@pytest.mark.parametrize(("query_len", "seq_lens"), DECODE_CASES)
+def test_fp8_dense_flashmla_matches_golden(query_len, seq_lens):
+    """PPU FP8 dense decode routes to the sail qkv_fp8 kernel (was a hard error).
+
+    The sail kernel exposes no descale parameters, so the patch quantizes ``q``
+    with ``descale_q``, folds ``q_scale * k_scale`` into ``softmax_scale`` (QK
+    part) and rescales the output by ``k_scale`` (V part). The golden runs on
+    the dequantized operands, so the residual is only the kernel's own FP8
+    compute, bounded by the ``mla_fp8_cache`` band. Requires sm89 (the sail FP8
+    dense kernel rejects older capability).
+    """
+    batch = len(seq_lens)
+    total = sum(int(length) for length in seq_lens)
+    q_scale, k_scale = 0.088, 0.064
+
+    q = _randn(batch, query_len, NUM_Q_HEADS, MLA_HEAD_DIM, seed=20250101)
+    tokens = _randn(total, MLA_HEAD_DIM, seed=20250102)
+    block_table, slot_mapping, num_blocks = _paged_layout(seq_lens, BLOCK_SIZE, seed=7)
+    cache = _fill_paged_cache(
+        tokens, slot_mapping, num_blocks, BLOCK_SIZE, torch.bfloat16
+    )
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
+
+    # Quantize q and the cache to fp8_e4m3 with the calibrated scales; the
+    # dequantized operands are exactly what the kernel logically attends over.
+    q_fp8 = (q.to(torch.float32) / q_scale).to(torch.float8_e4m3fn)
+    cache_fp8 = (cache.to(torch.float32) / k_scale).to(torch.float8_e4m3fn)
+    q_dq = q_fp8.to(torch.float32) * q_scale
+    cache_dq = cache_fp8.to(torch.float32) * k_scale
+
+    descale_q = torch.tensor([q_scale], dtype=torch.float32, device=DEVICE)
+    descale_k = torch.tensor([k_scale], dtype=torch.float32, device=DEVICE)
+
+    output, lse = _run_dense_decode_fp8(
+        q, cache_fp8, block_table, seq_lens_t, query_len, descale_q, descale_k
+    )
+
+    assert output.shape == (batch, query_len, NUM_Q_HEADS, KV_LORA_RANK)
+    assert output.dtype == torch.bfloat16
+    assert lse.shape == (batch, NUM_Q_HEADS, query_len)
+    assert lse.dtype == torch.float32
+
+    golden = ref.ref_mla_paged(
+        q_dq,
+        cache_dq,
+        block_table,
+        seq_lens_t,
+        latent=KV_LORA_RANK,
+        causal=True,
+        scale=SOFTMAX_SCALE,
+        query_chunk=QUERY_CHUNK,
+    )
+    ref.assert_close(
+        output, golden, "mla_fp8_cache", msg=f"fp8 dense decode {seq_lens}"
+    )
 
 
 def test_degradation_reason_reaches_the_backend_selector(monkeypatch):
@@ -489,8 +567,9 @@ def test_deepseek_v4_flashmla_keeps_the_native_q_head_count():
     """PPU does not round ``h_q`` up to the FP8 kernel's {64, 128}.
 
     Upstream returns ``64 if num_heads <= 64 else 128`` because its FP8 decode
-    kernel only implements those two widths; PPU has no FP8 dense path, so the
-    override returns ``num_heads`` unchanged and still rejects ``> 128``.
+    kernel only implements those two widths; PPU routes FP8 dense decode to the
+    sail kernel, which does not pad heads, so the override returns ``num_heads``
+    unchanged and still rejects ``> 128``.
     """
     from vllm_sail.models.deepseek_v4.flashmla import (
         DeepseekV4FlashMLAAttention as attention,

@@ -78,6 +78,10 @@ _ATTENTION_TARGETS = (
     ),
     ("vllm.v1.attention.backends.mla.flashmla", "FlashMLAMetadataBuilder.__init__"),
     (
+        "vllm.v1.attention.backends.mla.flashmla",
+        "FlashMLAMetadataBuilder._build_decode",
+    ),
+    (
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         "FlashMLASparseBackend.supports_compute_capability",
     ),

@@ -14,8 +14,17 @@ Upstream's FlashMLA op shims assume the compiled vLLM extensions
   ``VLLM_SAIL_NVTX_PROFILE`` is set. The fork builds that range inside
   ``FlashMLAImpl.forward_mqa`` around ``flash_mla_with_kvcache``; annotating
   the op here keeps the range on the kernel itself and covers every caller;
-* raises from ``get_mla_metadata_dense_fp8`` / ``flash_mla_with_kvcache_fp8`` on
-  PPU ("PPU flash mla limit" — no FP8 dense path).
+* routes ``get_mla_metadata_dense_fp8`` / ``flash_mla_with_kvcache_fp8`` on PPU
+  to the sail dense FP8 kernel. PPU does not build ``_flashmla_extension_C``, so
+  the metadata call forwards to the sail ``get_mla_metadata`` (returning a lazy
+  ``FlashMLASchedMeta`` exactly like the non-FP8 path) and the FP8 decode is
+  dispatched through ``flash_mla.flash_mla_with_kvcache`` (qkv_fp8), which fills
+  its scheduling metadata lazily from that ``FlashMLASchedMeta``. The paired
+  ``_build_decode`` patch (see ``flashmla_backend``) keeps upstream's dense-FP8
+  int32/CUDA-graph metadata path off PPU. The sail kernel exposes no descale
+  parameters, so the caller quantizes q with ``descale_q``, folds
+  ``q_scale * k_scale`` into ``softmax_scale`` (QK part) and rescales the output
+  by ``k_scale`` (V part); validated by ``tools/validate_ppu_dense_fp8.py``.
 
 The callables are patched with lazy wrappers (importing ``flash_mla`` on first
 PPU call) because availability is only knowable on the target host; on non-PPU
@@ -285,38 +294,142 @@ def get_mla_metadata(*args, **kwargs):
     _MODULE,
     "get_mla_metadata_dense_fp8",
     reason=(
-        "PPU Note(kai): PPU flash mla limit — PPU has no FP8 dense FlashMLA "
-        "metadata path (it would call the _flashmla_extension_C op PPU does not "
-        "build), so the fork raises 'FlashMLA is not available' on PPU."
+        "PPU does not build the _flashmla_extension_C op upstream uses for the "
+        "FP8 dense FlashMLA metadata. The PPU FP8 decode routes to the sail "
+        "dense kernel, which fills its scheduling metadata lazily from a "
+        "FlashMLASchedMeta -- the same object the non-FP8 get_mla_metadata "
+        "returns -- so this forwards to the sail get_mla_metadata instead of "
+        "producing upstream's int32 tensors. The paired _build_decode patch "
+        "(flashmla_backend) attaches this sched meta to the field forward_mqa's "
+        "FP8 branch reads, keeping upstream's tensor/CUDA-graph copies off PPU."
     ),
     affected_versions=_AFFECTED,
-    remove_when="PPU supports the FP8 dense FlashMLA decode path.",
+    remove_when="PPU builds the FP8 dense FlashMLA metadata extension natively.",
 )
-def get_mla_metadata_dense_fp8(cache_seqlens, num_q_tokens_per_head_k, num_heads_k):
+def get_mla_metadata_dense_fp8(*args, **kwargs):
     if current_platform.is_ppu():
-        # PPU Note(kai): PPU flash mla limit
-        _flashmla_ops._raise_flashmla_unavailable()
-    return _upstream_get_mla_metadata_dense_fp8(
-        cache_seqlens, num_q_tokens_per_head_k, num_heads_k
-    )
+        from flash_mla import get_mla_metadata as _ppu_impl
+
+        # The sail get_mla_metadata ignores its arguments and returns
+        # (FlashMLASchedMeta(), None); the kernel fills the metadata lazily on
+        # the first flash_mla_with_kvcache call. Forwarding *args/**kwargs keeps
+        # this agnostic to upstream's positional signature, like get_mla_metadata.
+        return _ppu_impl(*args, **kwargs)
+    return _upstream_get_mla_metadata_dense_fp8(*args, **kwargs)
+
+
+#: Host-side cache for the folded FP8 dense softmax scale, keyed by the scale
+#: tensors' data_ptrs. The sail kernel takes ``softmax_scale`` as a host float,
+#: but vLLM passes ``descale_q``/``descale_k`` as device tensors; reading them
+#: with ``.item()`` is illegal during CUDA-graph capture, so the value is read
+#: once (vLLM runs an eager warmup before capture) and reused thereafter.
+_PPU_DENSE_FP8_SCALE_CACHE: dict = {}
+
+
+def _ppu_dense_fp8_folded_scale(softmax_scale, descale_q, descale_k) -> float:
+    """Return ``softmax_scale * q_scale * k_scale`` as a host float (cached)."""
+    dq_is_t = isinstance(descale_q, torch.Tensor)
+    dk_is_t = isinstance(descale_k, torch.Tensor)
+    if dq_is_t or dk_is_t:
+        key = (
+            float(softmax_scale),
+            descale_q.data_ptr() if dq_is_t else 0,
+            descale_k.data_ptr() if dk_is_t else 0,
+        )
+        cached = _PPU_DENSE_FP8_SCALE_CACHE.get(key)
+        if cached is not None:
+            return cached
+        q_scale = float(descale_q) if dq_is_t else float(descale_q or 1.0)
+        k_scale = float(descale_k) if dk_is_t else float(descale_k or 1.0)
+        val = float(softmax_scale) * q_scale * k_scale
+        _PPU_DENSE_FP8_SCALE_CACHE[key] = val
+        return val
+    return float(softmax_scale) * float(descale_q or 1.0) * float(descale_k or 1.0)
 
 
 @patch(
     _MODULE,
     "flash_mla_with_kvcache_fp8",
     reason=(
-        "PPU Note(kai): PPU flash mla limit — PPU has no FP8 dense FlashMLA "
-        "kernel (it would call the _flashmla_extension_C op PPU does not "
-        "build), so the fork raises 'FlashMLA is not available' on PPU."
+        "PPU does not build the _flashmla_extension_C op upstream uses for the "
+        "FP8 dense FlashMLA decode kernel. Route it to the sail dense FP8 kernel "
+        "(flash_mla.flash_mla_with_kvcache, qkv_fp8). The sail kernel exposes no "
+        "descale parameters: it treats the FP8 q/k as scale-1 and returns BF16 "
+        "output without dequantizing V, so the caller quantizes q with descale_q, "
+        "folds q_scale*k_scale into softmax_scale (QK part) and rescales the "
+        "output by k_scale (V part). Validated by tools/validate_ppu_dense_fp8.py."
     ),
     affected_versions=_AFFECTED,
-    remove_when="PPU supports the FP8 dense FlashMLA decode path.",
+    remove_when="PPU builds the FP8 dense FlashMLA decode extension natively.",
 )
-def flash_mla_with_kvcache_fp8(*args, **kwargs):
+def flash_mla_with_kvcache_fp8(
+    q,
+    k_cache,
+    block_table,
+    cache_seqlens,
+    head_dim_v,
+    tile_scheduler_metadata,
+    num_splits,
+    softmax_scale=None,
+    causal=False,
+    descale_q=None,
+    descale_k=None,
+):
     if current_platform.is_ppu():
-        # PPU Note(kai): PPU flash mla limit
-        _flashmla_ops._raise_flashmla_unavailable()
-    return _upstream_flash_mla_with_kvcache_fp8(*args, **kwargs)
+        from flash_mla import FlashMLASchedMeta
+        from flash_mla import flash_mla_with_kvcache as _ppu_dense_fwd
+
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        folded_scale = _ppu_dense_fp8_folded_scale(softmax_scale, descale_q, descale_k)
+
+        # The sail dense FP8 kernel requires q and k_cache to share the FP8
+        # dtype; quantize q with descale_q so that q_real == q_fp8 * descale_q.
+        if descale_q is not None:
+            q = q.to(torch.float32) / descale_q
+        q_fp8 = q.to(torch.float8_e4m3fn)
+
+        # tile_scheduler_metadata is the lazy sail FlashMLASchedMeta built by the
+        # patched _build_decode (via get_mla_metadata_dense_fp8); the kernel fills
+        # it on first use and asserts shape consistency on reuse. The sail kernel
+        # asserts this same contract internally, so assert here to fail fast when
+        # the paired patches are missing -- a raw upstream int32 tensor would
+        # otherwise be silently masked by a freshly built sched meta.
+        sched_meta = tile_scheduler_metadata
+        assert isinstance(sched_meta, FlashMLASchedMeta), (
+            "PPU FP8 dense decode expects tile_scheduler_metadata to be a sail "
+            "FlashMLASchedMeta from the patched get_mla_metadata_dense_fp8/"
+            f"_build_decode, got {type(sched_meta).__name__}; the paired "
+            "patches are likely not installed."
+        )
+        o, lse = _ppu_dense_fwd(
+            q_fp8,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            head_dim_v,
+            sched_meta,
+            None,
+            softmax_scale=folded_scale,
+            causal=causal,
+        )
+        # V is not dequantized inside the kernel: rescale the output by k_scale.
+        if descale_k is not None:
+            o = (o.to(torch.float32) * descale_k).to(o.dtype)
+        return o, lse
+    return _upstream_flash_mla_with_kvcache_fp8(
+        q,
+        k_cache,
+        block_table,
+        cache_seqlens,
+        head_dim_v,
+        tile_scheduler_metadata,
+        num_splits,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        descale_q=descale_q,
+        descale_k=descale_k,
+    )
 
 
 def _rebind_loaded_flashmla_aliases() -> None:
