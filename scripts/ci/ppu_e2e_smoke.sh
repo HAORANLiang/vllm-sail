@@ -157,7 +157,7 @@ fi
 log "chat completion request"
 request_body=$(cat <<JSON
 {"model": "${SERVED_NAME}",
- "messages": [{"role": "user", "content": "简单说一下什么是投机采样"}],
+ "messages": [{"role": "user", "content": "Briefly explain what speculative decoding is"}],
  "max_completion_tokens": 100,
  "top_k": 1}
 JSON

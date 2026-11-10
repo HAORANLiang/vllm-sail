@@ -881,8 +881,8 @@ def test_quotes_and_backslashes_survive_the_round_trip(
             r'escaped_schema(str label="a\"b") -> ()',
         ),
         (
-            r'ops.def("escaped_schema(str label=\"真武\") -> ()");',
-            'escaped_schema(str label="真武") -> ()',
+            r'ops.def("escaped_schema(str label=\"Grüße\") -> ()");',
+            'escaped_schema(str label="Grüße") -> ()',
         ),
     ],
 )

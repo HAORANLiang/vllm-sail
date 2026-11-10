@@ -173,8 +173,8 @@ suite. Neither takes part in comparison:
 gate against it, so it carries no timestamp.
 * `baseline_origin` — free text naming where the number came from. The
 currently committed goldens point at rows of the team's shared
-`H20_vllm_evalscope_gsm8k_精度汇总_v2.csv`, using the newest framework version
-recorded for that weight.
+`H20_vllm_evalscope_gsm8k_accuracy_summary_v2.csv`, using the newest framework
+version recorded for that weight.
 
 The first `--update-golden` run against a seeded baseline replaces it with a
 measured record (timestamp filled in, `baseline_origin` gone).

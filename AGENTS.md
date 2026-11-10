@@ -5,7 +5,7 @@ User-facing overview: [README.md](README.md). Contribution workflow:
 
 ## Project terminology
 
-- Display name: **vLLM SAIL**. **SAIL** is the software brand; **Zhenwu (真武)**
+- Display name: **vLLM SAIL**. **SAIL** is the software brand; **Zhenwu**
   is the hardware product name. Document **Zhenwu 810E** and **Zhenwu M890**
   T-Head AI chips.
 - Python distribution: `vllm-sail`; import package: `vllm_sail`.

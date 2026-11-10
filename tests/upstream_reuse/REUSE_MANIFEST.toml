@@ -6,8 +6,9 @@
 # from .github/vllm-main-verified.commit at CI time, or $VLLM_SOURCE_ROOT
 # locally). Paths are relative to the upstream repo root (the directory that
 # contains vllm/__init__.py). The whitelist is seeded from
-# outputs/02_可复用测试分析.html -- high-confidence L1 (直接可用) entries first,
-# plus a few L2 (少量适配) entries whose CPU-runnable core is worth gating.
+# outputs/02_reusable_test_analysis.html -- high-confidence L1 (directly usable)
+# entries first, plus a few L2 (light adaptation) entries whose CPU-runnable
+# core is worth gating.
 #
 # vllm-sail disguises its PPU platform as CUDA (PPUPlatform._enum =
 # PlatformEnum.CUDA, current_platform.is_cuda() is True), so upstream tests
@@ -44,8 +45,8 @@ upstream_pin_file = ".github/vllm-main-verified.commit"
 description = "Whitelist of upstream vLLM tests reused inside the vllm-sail runtime."
 
 # ---------------------------------------------------------------------------
-# L1 直接可用 -- pure data-structure / parameter / config logic. No hardware
-# SDK, no kernel numerics. Zero edits; run verbatim on CPU and on PPU.
+# L1 directly usable -- pure data-structure / parameter / config logic. No
+# hardware SDK, no kernel numerics. Zero edits; run verbatim on CPU and on PPU.
 # ---------------------------------------------------------------------------
 
 [[entry]]
@@ -90,7 +91,7 @@ path = "tests/test_sampling_params.py"
 mode = "direct"
 chips = ["cpu", "810e", "890p"]
 category = "params"
-reason = "SamplingParams validation/defaults; pure CPU. Fast切分 of sampling-vs-logits regressions."
+reason = "SamplingParams validation/defaults; pure CPU. Fast triage of sampling-vs-logits regressions."
 min_tests = 1
 
 [[entry]]
@@ -202,7 +203,7 @@ reason = "Sampler applies top-k/top-p/penalties on current_platform.device_type;
 min_tests = 1
 
 # ---------------------------------------------------------------------------
-# L2 少量适配 -- skeleton reusable, but the file mixes CPU logic with
+# L2 light adaptation -- skeleton reusable, but the file mixes CPU logic with
 # device / distributed / network nodes. test_reuse_adapted.py narrows the run
 # (markers / -k / deselect / env) and records known xfails. Upstream source is
 # NEVER edited; all adaptation lives in the harness + adapted test module.

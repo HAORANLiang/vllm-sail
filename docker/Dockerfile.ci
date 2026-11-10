@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# 使用已有 wheel 组装 Preview 镜像，不编译源码。
+# Assemble the Preview image from prebuilt wheels; nothing is compiled from source.
 # The build context must contain docker/ and wheelhouse/.
 # Install prebuilt wheels only; do not compile vLLM.
 ARG BASE_IMAGE

@@ -38,7 +38,7 @@ def _assert_wheel_licenses(archive: zipfile.ZipFile, root: Path) -> None:
 
 @pytest.mark.parametrize("tag", ["v1.2.3", "1.2.3rc1"])
 def test_preview_tags_do_not_change_scm_version(tmp_path, monkeypatch, tag):
-    """Preview 标签不能改变原有版本标签推导出的 wheel 版本。"""
+    """Preview tags must not change the wheel version derived from a release tag."""
     from setuptools_scm import get_version
 
     for name in tuple(os.environ):
@@ -55,7 +55,8 @@ def test_preview_tags_do_not_change_scm_version(tmp_path, monkeypatch, tag):
             ["git", "-C", str(tmp_path), *args], input="", text=True
         ).strip()
 
-    # 只在临时仓库创建测试对象，不运行提交钩子或修改用户 Git 配置。
+    # Create the test objects only in a temporary repository; run no commit hooks
+    # and leave the user's Git configuration untouched.
     git("init", "-q")
     tree = git("mktree")
     release = git("commit-tree", tree, "-m", "release fixture")

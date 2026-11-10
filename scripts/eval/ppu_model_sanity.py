@@ -28,7 +28,10 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 PROFILES_PATH = Path(__file__).with_name("model_sanity_profiles.json")
 BASELINE_PROFILE = "deepseek-v4-community-tp8"
-PROMPT = "计算 17 + 25。最终答案只输出十进制整数，不要单位或解释。"
+PROMPT = (
+    "Calculate 17 + 25. Output only the decimal integer as the final answer, "
+    "with no units or explanation."
+)
 FATAL_RE = re.compile(
     r"Traceback \(most recent|EngineCore failed|Engine core initialization failed"
     r"|core dumped|Failed to infer device type"

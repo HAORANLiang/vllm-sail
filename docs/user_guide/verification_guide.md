@@ -81,7 +81,7 @@ pushes to `main` or `master`, and manual dispatch. Its jobs run independently:
 | Job | Environment and checks | Failure handling |
 | --- | --- | --- |
 | CPU UT | Python 3.10–3.13; only `requirements/dev.txt`; UT and branch coverage | Test failure fails the workflow; coverage-upload failure does not |
-| CI control contracts | Python 3.12；独立运行 Preview 控制工具的标准库测试、现有算子测试定义校验和 shell 语法检查 | 不分配 PPU；不访问 Registry 或发布资源；任一校验失败则工作流失败 |
+| CI control contracts | Python 3.12; standalone stdlib tests of the Preview control tools, the existing operator-test definition check and shell syntax checks | Allocates no PPU; touches no Registry or release assets; any failed check fails the workflow |
 | vLLM source (main-verified) | Python 3.12; checks out the exact verified main commit; runs `upstream_source` tests with a required source path | Checkout or test failure fails the workflow |
 
 The source job reads the full SHA in
@@ -99,118 +99,159 @@ issue and fails the job. Installation failure stops before that report step.
 This scheduled check does not replace PR checks, and none of these public CPU
 jobs runs PPU inference or `tests/e2e`.
 
-### Preview 镜像与最小回归
+### Preview images and minimum regression
 
-Preview 是独立的镜像验证与分发通道，不替代正式 `PPU CI`、模型精度、性能、
-双芯片算子验证或 `release.yaml`。它不会修改
-[verified main commit](../../.github/vllm-main-verified.commit)，也不会把最小回归
-结果升级为完整软件栈认证；KMD 和 firmware 仍标记为 `not_measured`。
+Preview is a separate image-verification and distribution channel. It does not
+replace the official `PPU CI`, model accuracy, performance, dual-chip operator
+verification or `release.yaml`. It does not modify the
+[verified main commit](../../.github/vllm-main-verified.commit), and it does not
+promote a minimum-regression result into a full software-stack certification;
+KMD and firmware stay marked `not_measured`.
 
-| 工作流 | 输入与输出 |
+| Workflow | Inputs and outputs |
 | --- | --- |
-| [Nightly regression (minimum)](../../.github/workflows/nightly-tests.yaml) | 每日 UTC 00:17 或默认分支手动触发；下载 `vllm-project/vllm-sail` 默认分支 `main` 的 `ppu-accuracy-nightly.yaml` 成功产物，组装并测试 candidate 镜像 |
-| [Distribute nightly previews](../../.github/workflows/promote-nightly.yaml) | 成功 nightly 的 `workflow_run` 或默认分支手动指定 `test_run_id`；复核当前 attempt 的 passed bundle，分发原始 wheel 和相同镜像 digest |
-| [Dockerfile CI](../../.github/workflows/dockerfile-ci.yaml) | PR 自动运行 hosted 静态检查；受信任维护者从默认分支手动申请镜像构建及单卡 smoke，单独报告 `dockerfile-ppu` |
+| [Nightly regression (minimum)](../../.github/workflows/nightly-tests.yaml) | Daily at 00:17 UTC or manual dispatch on the default branch; downloads the successful `ppu-accuracy-nightly.yaml` artifacts of `vllm-project/vllm-sail` `main`, assembles and tests a candidate image |
+| [Distribute nightly previews](../../.github/workflows/promote-nightly.yaml) | `workflow_run` of a successful nightly, or a manual `test_run_id` on the default branch; rechecks the passed bundle of the current attempt and distributes the original wheels and the identical image digest |
+| [Dockerfile CI](../../.github/workflows/dockerfile-ci.yaml) | PRs run the hosted static checks automatically; a trusted maintainer requests an image build and a single-device smoke test from the default branch, reported separately as `dockerfile-ppu` |
 
-来源必须是整个工作流成功的 `schedule` 或 `workflow_dispatch` 运行，而不仅是
-wheel 构建 job 成功。来源运行创建时间必须在 48 小时内，且
-`ppu-wheels-<run_id>` 未过期。缺少符合条件的产物会失败，不会退回源码编译、
-PR preview 或失败运行。精度任务较长，定时时间不保证上一轮已经完成；必要时手动
-选择合格运行，不能把缺失或过期的产物当作成功。
+The source must be a `schedule` or `workflow_dispatch` run in which the whole
+workflow succeeded, not merely the wheel-build job. The source run must have been
+created within 48 hours and its `ppu-wheels-<run_id>` artifact must be unexpired.
+A missing qualifying artifact fails the run; there is no fallback to a source
+build, a PR preview or a failed run. The accuracy lane is long, so the schedule
+does not guarantee that the previous round finished; select a qualifying run
+manually when needed, and never treat a missing or expired artifact as a success.
 
-三个提交身份分别记录：默认分支控制脚本的 control SHA、wheel 的 SAIL SHA、
-wheel 的上游 vLLM SHA。测试源码按 wheel 的 SAIL SHA 检出；上游 vLLM SHA 必须
-匹配控制 checkout 的 reviewed pin。测试旧产物不代表覆盖最新 `main`。
+Three commit identities are recorded separately: the control SHA of the
+default-branch control scripts, the SAIL SHA of the wheels and the upstream vLLM
+SHA of the wheels. Tests check out the source at the wheel's SAIL SHA, and the
+upstream vLLM SHA must match the reviewed pin of the control checkout. Testing an
+old artifact does not mean the latest `main` is covered.
 
-[Dockerfile.ci](../../docker/Dockerfile.ci) 仅将两个原始 wheel 安装到指定运行镜像，
-使用 `--no-deps --force-reinstall` 并执行 `pip check`，不下载模型或编译 vLLM。
-测试阶段先校验已安装 Python/native 文件与原始 wheel 的字节及导入路径，再按
-[固定目录](../../.github/ci/tests/catalog.json) 执行 2 项 patch UT 和 9 项
-`silu_and_mul` 数值测试，使用一张真武 M890。JUnit 和节点报告必须证明全部
-11 项正常执行；skip 不算通过。扩展目录需要同步修改执行与证据校验，不能只增加 JSON 项。
+[Dockerfile.ci](../../docker/Dockerfile.ci) only installs the two original wheels
+into the configured runtime image, with `--no-deps --force-reinstall` followed by
+`pip check`; it downloads no model and compiles no vLLM. The test stage first
+verifies the installed Python/native bytes and import paths against the original
+wheels, then runs the 2 patch UTs and the 9 `silu_and_mul` numerical tests of the
+[fixed catalog](../../.github/ci/tests/catalog.json) on one Zhenwu M890. The JUnit
+and node reports must prove that all 11 items actually executed; a skip is not a
+pass. Extending the catalog also requires changing the runner and the evidence
+checks; adding JSON entries alone is not enough.
 
-#### 管理员配置与首次启用
+#### Administrator configuration and first enablement
 
-默认不提供真实镜像地址或凭证。未配置启用变量时，hosted preflight 失败，
-下游自托管任务不会分配。先将控制文件通过 PR 合入受保护默认分支，再配置：
+No real image address or credential is provided by default. Until the enablement
+variables are configured, the hosted preflight fails and no downstream
+self-hosted job is allocated. Merge the control files into the protected default
+branch through a PR first, then configure:
 
-| Actions Variable | 要求 |
+| Actions Variable | Requirement |
 | --- | --- |
-| `PPU_TRANSITION_ENABLED` | runner 负责人批准持久化主机用途后设为 `true` |
-| `PREVIEW_REGISTRY_HOST` | Registry 主机名，可带端口；不含协议或命名空间 |
-| `PREVIEW_IMAGE_REPOSITORY` | 该 Registry 下专用的无 tag Preview 镜像路径 |
-| `RUNTIME_BASE_IMAGE` | 可读取的 `repository@sha256:<64 hex>`；不能与 Preview 输出仓库相同 |
-| `TRUSTED_PPU_TESTS_ENABLED` | 首次 nightly/分发验证完成且受信任 PR 执行获准后才设为 `true` |
+| `PPU_TRANSITION_ENABLED` | `true` once the runner owner approves using persistent hosts for this purpose |
+| `PREVIEW_REGISTRY_HOST` | Registry host name, optionally with a port; no scheme or namespace |
+| `PREVIEW_IMAGE_REPOSITORY` | A dedicated untagged Preview image path on that registry |
+| `RUNTIME_BASE_IMAGE` | A readable `repository@sha256:<64 hex>`; must differ from the Preview output repository |
+| `TRUSTED_PPU_TESTS_ENABLED` | `true` only after the first nightly/distribution verification and approval of trusted PR execution |
 
-`RUNTIME_BASE_IMAGE` 必须已包含匹配的 SAIL SDK、SAIL PyTorch、CUDA-compatible
-运行依赖、Triton，以及所测源码 `requirements/dev.txt` 的依赖（包括 pytest）。
-现有 runner 的 `PPU_CI_RUNTIME_IMAGE` 不会自动传入此变量。工作流只登录
-`PREVIEW_REGISTRY_HOST`，其他私有 Registry 的 base image 访问需另行安排。
+`RUNTIME_BASE_IMAGE` must already contain the matching SAIL SDK, SAIL PyTorch,
+CUDA-compatible runtime dependencies, Triton, and the dependencies of the tested
+source's `requirements/dev.txt` (including pytest). The existing runners'
+`PPU_CI_RUNTIME_IMAGE` is not propagated to this variable. The workflows log in
+only to `PREVIEW_REGISTRY_HOST`; base images from other private registries must be
+arranged separately.
 
-创建以下 Environments，并限制到默认分支；声明 `environment:` 不会自动安装审批规则：
+Create the following Environments and restrict them to the default branch;
+declaring `environment:` does not install approval rules by itself:
 
-| Environment | Secrets 与保护 |
+| Environment | Secrets and protection |
 | --- | --- |
-| `nightly-registry` | `REGISTRY_USER`、`REGISTRY_TOKEN`：Preview push 权限；跨仓库读取时可配置 `UPSTREAM_ACTIONS_TOKEN` |
-| `nightly-test` | `REGISTRY_PULL_USER`、`REGISTRY_PULL_TOKEN`：只读拉取权限 |
-| `preview-distribution` | `REGISTRY_USER`、`REGISTRY_TOKEN`：仅 Preview tagging/push 权限 |
-| `dockerfile-ci` | `REGISTRY_PULL_USER`、`REGISTRY_PULL_TOKEN`；配置 required reviewers，并在支持时禁止自行批准 |
+| `nightly-registry` | `REGISTRY_USER`, `REGISTRY_TOKEN`: Preview push permission; `UPSTREAM_ACTIONS_TOKEN` may be configured for cross-repository reads |
+| `nightly-test` | `REGISTRY_PULL_USER`, `REGISTRY_PULL_TOKEN`: read-only pull permission |
+| `preview-distribution` | `REGISTRY_USER`, `REGISTRY_TOKEN`: Preview tagging/push permission only |
+| `dockerfile-ci` | `REGISTRY_PULL_USER`, `REGISTRY_PULL_TOKEN`; configure required reviewers and prevent self-approval where supported |
 
-在本仓库消费本仓库产物通常使用 `GITHUB_TOKEN` 即可。跨仓库 token 需能读取来源
-Actions 产物及本地 Preview Release。Registry 写凭证只放在对应 Environment，
-不向 PR 设备任务或测试容器传入。保护工作流文件、runner group 与默认分支；
-Environment 审批不是恶意代码隔离机制，不能用于放行外部不受信任 PR。
+Consuming this repository's artifacts from this repository usually only needs
+`GITHUB_TOKEN`. A cross-repository token must be able to read the source Actions
+artifacts and the local Preview Release. Registry write credentials stay in their
+own Environment and are never passed to PR device jobs or test containers.
+Protect the workflow files, the runner group and the default branch; Environment
+approval is not a malicious-code isolation mechanism and must not be used to let
+untrusted external PRs through.
 
-设备 runner 标签要求 `[self-hosted, Linux, X64, 8-ppu-m890p]`，并需满足：
+Device runners must carry the label `[self-hosted, Linux, X64, 8-ppu-m890p]` and
+satisfy:
 
-- Linux x86-64、Bash、Git、Python 3.11+、Docker/runc、flock、coreutils。
-- GitHub/API/Actions 产物及 Registry 连通性、足够磁盘空间。
-- 可用 PPU 驱动及 `/dev/alixpu`、`/dev/alixpu_ctl`、`/dev/alixpu_sep`、
-  `/dev/alixpu_ppu0`，runner 用户和容器用户具备设备访问权限。
-- 协调所有共用设备的任务；标签本身不是独占设备预留。
+- Linux x86-64, Bash, Git, Python 3.11+, Docker/runc, flock, coreutils.
+- Connectivity to GitHub/API/Actions artifacts and the Registry, plus enough
+  disk space.
+- A working PPU driver and `/dev/alixpu`, `/dev/alixpu_ctl`, `/dev/alixpu_sep`,
+  `/dev/alixpu_ppu0`, with device access for the runner user and the container
+  user.
+- Coordination with every job that shares the devices; the label alone is not an
+  exclusive device reservation.
 
-新脚本沿用 `/tmp/vllm-sail-ppu-ci.lock`，最多等待 3600 秒；现有 PR runtime
-仍使用 `flock -n`，遇到占锁会失败。上线前应安排独立 runner 或无冲突时段，
-若统一锁策略，应单独调整所有调用方及超时。该路线不是 Kubernetes 隔离方案。
+The new scripts reuse `/tmp/vllm-sail-ppu-ci.lock` and wait at most 3600 seconds;
+the existing PR runtime still uses `flock -n` and fails when the lock is taken.
+Before going live, arrange a dedicated runner or a conflict-free window; unifying
+the lock policy requires adjusting every caller and timeout separately. This route
+is not a Kubernetes isolation solution.
 
-首次启用按以下顺序验证：
+Verify the first enablement in this order:
 
-1. 先运行 hosted 控制测试，配置 base image、Registry、Environments 和 runner。
-2. 批准并启用 `PPU_TRANSITION_ENABLED`，手动运行 nightly；可填写合格的来源 run ID。
-3. 确认 candidate 镜像、11 项实际执行结果及当前 attempt 的 passed bundle。
-4. 确认自动分发后的镜像 digest 和 wheel SHA256 与被测值一致。
-5. 再启用受信任 Dockerfile PR 测试并观察后续定时运行。
+1. Run the hosted control tests, then configure the base image, Registry,
+   Environments and runners.
+2. Approve and enable `PPU_TRANSITION_ENABLED`, then run the nightly manually; a
+   qualifying source run ID may be supplied.
+3. Confirm the candidate image, the 11 actually executed results and the passed
+   bundle of the current attempt.
+4. Confirm that the automatically distributed image digest and wheel SHA256 match
+   the tested values.
+5. Only then enable the trusted Dockerfile PR tests and watch the following
+   scheduled runs.
 
-Dockerfile 手动测试要求开放、非草稿、同仓库且目标为默认分支的 PR；触发者和
-作者都必须具有仓库写权限。申请时勾选 `approve_host_execution`，审批后再次
-校验 head/base SHA；发生变化必须重新申请。测试的是 PR 的 `docker/` 与已有
-Preview wheel，不是该 PR 修改后的 SAIL 源码。`dockerfile-static` 成功不代表
-`dockerfile-ppu` 成功，也不能代替正式 `PPU CI`。取消后若留下 pending status，
-仍应视为未通过；手动重新验证。按路径触发的检查不宜直接设为所有 PR 的必需状态。
+A manual Dockerfile test requires an open, non-draft, same-repository PR targeting
+the default branch; both the triggerer and the author must have write permission.
+Tick `approve_host_execution` when requesting, and expect the head/base SHA to be
+revalidated after approval; any change requires a new request. It tests the PR's
+`docker/` directory together with existing Preview wheels, not the SAIL sources
+modified by that PR. `dockerfile-static` success does not imply `dockerfile-ppu`
+success and cannot replace the official `PPU CI`. If a cancellation leaves a
+pending status, treat it as not passed and verify again manually. A
+path-filtered check should not be made a required status for every PR.
 
-#### 分发、重试与保留策略
+#### Distribution, retries and retention
 
-发布器只维护以下 Preview 命名空间：
+The publisher maintains only these Preview namespaces:
 
-- 镜像 tag：`preview-<upstream_run_id>-test-<local_test_run_id>`，不重建被测镜像。
-- 不可变 prerelease：`preview-nightly-<upstream_run_id>-test-<local_test_run_id>`。
-- 固定 prerelease：`preview-baseline`，包含 `preview-wheels.zip` 和
-  `preview-baseline.json`，保留原始 wheel 版本与元数据。
+- Image tag: `preview-<upstream_run_id>-test-<local_test_run_id>`, without
+  rebuilding the tested image.
+- Immutable prerelease:
+  `preview-nightly-<upstream_run_id>-test-<local_test_run_id>`.
+- Fixed prerelease: `preview-baseline`, holding `preview-wheels.zip` and
+  `preview-baseline.json` and preserving the original wheel versions and metadata.
 
-正式发布的 push 触发器与 `setuptools-scm` 版本推导均排除 `preview-*`，
-避免 Preview run ID 被解释为包版本。最小回归不更新稳定 pin、BOM、
-`ci-baseline` 或正式 Release。每日可以重测 48 小时内已分发的产物，但相同或更旧
-来源 run 不会推进 Preview 指针；只改 Dockerfile 后重测旧 wheel 也不会自动推进。
+The release push trigger and the `setuptools-scm` version derivation both exclude
+`preview-*`, so a Preview run ID is never interpreted as a package version. The
+minimum regression does not update the stable pin, the BOM, `ci-baseline` or an
+official Release. Artifacts distributed within the last 48 hours may be retested
+daily, but an identical or older source run never advances the Preview pointer;
+retesting old wheels after changing only the Dockerfile does not advance it
+either.
 
-固定 Release 的两份资源不是原子更新。发布器串行运行，先上传 wheel，再写 JSON
-标记；读取者遇到缺失或哈希不一致会拒绝使用。中断后从已校验的不可变 Preview
-资源恢复，旧资源以归档重命名保留。不要同时启用其他发布器写入同一指针。
-回退应由维护者暂停发布器后，选择历史不可变 Preview 的 wheel 和 digest。
+The two assets of the fixed Release are not updated atomically. The publisher
+runs serially: it uploads the wheels and then writes the JSON marker; readers
+refuse a missing asset or a hash mismatch. An interruption is recovered from the
+verified immutable Preview assets, and the old assets are kept under an archived
+name. Do not run another publisher against the same pointer concurrently. To roll
+back, a maintainer pauses the publisher and selects the wheels and digest of a
+historical immutable Preview.
 
-Actions 产物保留 14 天；没有自动清理 Registry、Release 或持久化工作目录。
-上线时配置独立的保留与磁盘监控策略。
+Actions artifacts are retained for 14 days; nothing cleans the Registry, the
+Releases or the persistent work directories automatically. Configure a separate
+retention and disk-monitoring policy when going live.
 
-本地控制验证不需要 torch、vLLM、设备或网络。在项目根目录使用 Python 3.11+：
+Local control verification needs no torch, vLLM, device or network. In the project
+root with Python 3.11+:
 
 ```bash
 python3.12 -B -m unittest discover -s tests -p 'test_nightly_assets.py' -q

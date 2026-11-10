@@ -18,7 +18,7 @@ It connects vLLM's inference engine to the SAIL software stack, bringing PPU
 kernels, attention backends, quantization and model integration to the standard
 vLLM Python API and OpenAI-compatible server.
 
-**SAIL** is the software brand and **Zhenwu (真武)** is the hardware product
+**SAIL** is the software brand and **Zhenwu** is the hardware product
 name. The T-Head AI chips are **Zhenwu 810E** and **Zhenwu M890**. The Python
 distribution is `vllm-sail`, the import package is `vllm_sail`, and the vLLM
 plugin name is `ppu`.

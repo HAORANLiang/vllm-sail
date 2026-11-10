@@ -46,7 +46,7 @@ from tests.e2e.perf._perf_harness import PerfHarness
 
 
 class TestWarmupConstant:
-    """改动 2: WARMUP_ITERS should be 50."""
+    """Change 2: WARMUP_ITERS should be 50."""
 
     def test_warmup_value(self):
         pytest.importorskip("torch")
@@ -61,7 +61,7 @@ class TestWarmupConstant:
 
 
 class TestNoiseFloor:
-    """改动 3: regressions within NOISE_FLOOR (3 %) are clamped to zero."""
+    """Change 3: regressions within NOISE_FLOOR (3 %) are clamped to zero."""
 
     def test_noise_floor_constant(self):
         assert NOISE_FLOOR == pytest.approx(0.03)
@@ -97,7 +97,7 @@ class TestNoiseFloor:
 
 
 class TestClassify:
-    """改动 1 (partial): classify() accepts dynamic thresholds."""
+    """Change 1 (partial): classify() accepts dynamic thresholds."""
 
     def test_pass_default(self):
         assert classify(0.05) == STATUS_PASS
@@ -127,7 +127,7 @@ class TestClassify:
 
 
 class TestCompareCV:
-    """改动 1 (core): compare() uses CV to pick threshold band."""
+    """Change 1 (core): compare() uses CV to pick threshold band."""
 
     def test_low_cv_uses_default_thresholds(self):
         """CV < 8 % → default bands (WARN 10 %, FAIL 25 %)."""

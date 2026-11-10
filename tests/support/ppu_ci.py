@@ -39,11 +39,13 @@ def write_report(path, report):
 
 def inspect_runtime(isolated, checkout, requires):
     isolated, checkout = Path(isolated).resolve(), Path(checkout).resolve()
-    require(Path.cwd().resolve() == isolated, "cwd 不是隔离根目录")
-    require(not isolated.is_relative_to(checkout), "隔离目录位于 checkout 内")
+    require(Path.cwd().resolve() == isolated, "cwd is not the isolated root")
+    require(
+        not isolated.is_relative_to(checkout), "isolated root is inside the checkout"
+    )
     require(
         Path(__file__).resolve() == isolated / "tests/support/ppu_ci.py",
-        "CI 插件被遮蔽",
+        "CI plugin is shadowed",
     )
     paths = {"plugin": str(Path(__file__).resolve())}
     modules = {}
@@ -53,20 +55,22 @@ def inspect_runtime(isolated, checkout, requires):
         require(
             file.is_file()
             and not any(file.is_relative_to(p) for p in (isolated, checkout)),
-            f"安装包被源码遮蔽: {name}: {file}",
+            f"installed package is shadowed by source: {name}: {file}",
         )
         paths[name] = str(file)
         modules[name] = module
     envs = modules["vllm_sail.envs"]
     require(
         envs.VLLM_SAIL_USE_PLA is True and envs.VLLM_PPU_USE_PLA is True,
-        "PLA 启动有效值不为 True",
+        "PLA activation value is not True",
     )
     torch = modules["torch"]
-    require(modules["vllm.platforms"].current_platform.is_ppu(), "不是 PPU 平台")
+    require(
+        modules["vllm.platforms"].current_platform.is_ppu(), "not a PPU platform"
+    )
     require(
         torch.cuda.is_available() and torch.cuda.device_count() == 1,
-        "需要一张可用 PPU",
+        "exactly one usable PPU is required",
     )
     providers = modules["vllm_sail.native.extensions"].import_kernels(strict=True)
     return {
@@ -81,14 +85,15 @@ def inspect_runtime(isolated, checkout, requires):
 
 def validate_node_report(report, entry, board):
     require(
-        report.get("schema") == 1 and report.get("board") == board, "节点报告身份不符"
+        report.get("schema") == 1 and report.get("board") == board,
+        "ops node report identity mismatch",
     )
-    require(report.get("file") == entry["test"], "节点报告文件不符")
+    require(report.get("file") == entry["test"], "ops node report file mismatch")
     require(
         report.get("status") == "success"
         and report.get("exitstatus") == 0
         and not report.get("errors"),
-        "节点报告未成功",
+        "ops node report did not succeed",
     )
     collected, applicable, excluded = (
         report[k] for k in ("collected", "applicable", "hardware_excluded")
@@ -96,41 +101,50 @@ def validate_node_report(report, entry, board):
     for values in (collected, applicable, excluded):
         require(
             isinstance(values, list) and values == sorted(set(values)),
-            "节点集合重复或无序",
+            "node collection is duplicated or unordered",
         )
     require(
         bool(applicable)
         and set(collected) == set(applicable) | set(excluded)
         and not set(applicable) & set(excluded),
-        "节点集合不完整",
+        "node collection is incomplete",
     )
     functions = set()
     for node in collected:
-        require(node.startswith(entry["test"] + "::"), "未知文件节点")
+        require(node.startswith(entry["test"] + "::"), "unknown file node")
         function = node.split("::")[-1].split("[", 1)[0]
         functions.add(function)
         supported = board in entry["board_overrides"].get(function, entry["boards"])
-        require((node in applicable) == supported, "硬件适用节点不符")
-    require(set(entry["board_overrides"]) <= functions, "失效硬件例外")
-    require(set(report["nodes"]) == set(applicable), "节点阶段报告缺失或多余")
+        require((node in applicable) == supported, "hardware applicability mismatch")
+    require(set(entry["board_overrides"]) <= functions, "stale hardware override")
+    require(
+        set(report["nodes"]) == set(applicable),
+        "node phase report is missing or unexpected",
+    )
     for phases in report["nodes"].values():
-        require(set(phases) == {"setup", "call", "teardown"}, "缺少节点执行阶段")
+        require(
+            set(phases) == {"setup", "call", "teardown"},
+            "missing node execution phase",
+        )
         for phase in phases.values():
             require(
                 phase["outcome"] == "passed" and phase["wasxfail"] is None,
-                "节点非正常通过",
+                "node did not pass normally",
             )
             duration = phase["duration_seconds"]
             require(
                 isinstance(duration, int | float)
                 and math.isfinite(duration)
                 and duration >= 0,
-                "节点耗时非法",
+                "invalid node duration",
             )
     runtime = report.get("runtime", {})
     paths = runtime.get("paths", {})
     required = set(entry["requires"]) | RUNTIME_MODULES
-    require(required | {"plugin", "conftest"} <= paths.keys(), "缺少子进程安装态路径")
+    require(
+        required | {"plugin", "conftest"} <= paths.keys(),
+        "missing installed-path evidence from the subprocess",
+    )
     # Aggregation runs on another CPU host: validate resolved absolute paths without requiring Pod files to still exist.
     isolated = PurePosixPath(runtime.get("isolated_root", ""))
     checkout = PurePosixPath(runtime.get("checkout_root", ""))
@@ -138,7 +152,7 @@ def validate_node_report(report, entry, board):
         isolated.is_absolute()
         and checkout.is_absolute()
         and not isolated.is_relative_to(checkout),
-        "非法隔离根",
+        "invalid isolated root",
     )
     for name in required:
         path = PurePosixPath(paths[name])
@@ -146,15 +160,16 @@ def validate_node_report(report, entry, board):
             path.is_absolute()
             and ".." not in path.parts
             and not any(path.is_relative_to(p) for p in (isolated, checkout)),
-            "被测包路径非安装态",
+            "tested package path is not the installed one",
         )
     for name, suffix in (
         ("plugin", "tests/support/ppu_ci.py"),
         ("conftest", "tests/conftest.py"),
     ):
-        require(paths[name] == str(isolated / suffix), "测试辅助包被遮蔽")
+        require(paths[name] == str(isolated / suffix), "test helper is shadowed")
     require(
-        runtime.get("runtime_env") == {"VLLM_SAIL_USE_PLA": True}, "PLA 启动证据不符"
+        runtime.get("runtime_env") == {"VLLM_SAIL_USE_PLA": True},
+        "PLA activation evidence mismatch",
     )
 
 
@@ -196,20 +211,22 @@ class NodeGuard:
     def pytest_sessionstart(self, session):
         try:
             root = Path(os.environ["PPU_CI_ISOLATED_ROOT"]).resolve()
-            require(len(self.config.args) == 1, "每个进程必须只执行一个文件")
+            require(
+                len(self.config.args) == 1, "each process must run exactly one file"
+            )
             file = Path(self.config.args[0]).resolve().relative_to(root).as_posix()
             self.report["file"] = file
             require(
                 file in self.catalog and self.board in self.catalog[file]["boards"],
-                "文件未路由到当前板型",
+                "file is not routed to the current board",
             )
             require(
                 self.config.inipath.resolve() == root / "pyproject.toml",
-                "pytest 配置不在隔离树",
+                "pytest configuration is not in the isolated tree",
             )
             require(
                 [Path(p).resolve() for p in self.config.getini("pythonpath")] == [root],
-                "pytest pythonpath 非隔离根",
+                "pytest pythonpath is not the isolated root",
             )
             self.report["runtime"] = inspect_runtime(
                 root, os.environ["PPU_CI_CHECKOUT"], self.catalog[file]["requires"]
@@ -217,13 +234,13 @@ class NodeGuard:
             conftest = importlib.import_module("tests.conftest")
             require(
                 Path(conftest.__file__).resolve() == root / "tests/conftest.py",
-                "conftest 被遮蔽",
+                "conftest is shadowed",
             )
             require(
                 conftest in self.config.pluginmanager.get_plugins(),
-                "conftest 未实际加载",
+                "conftest was not actually loaded",
             )
-            require(conftest.HAS_REAL_DEVICE is True, "conftest 未探测到真实设备")
+            require(conftest.HAS_REAL_DEVICE is True, "conftest saw no real device")
             self.report["runtime"]["paths"]["conftest"] = str(
                 Path(conftest.__file__).resolve()
             )
@@ -240,7 +257,7 @@ class NodeGuard:
 
     def pytest_deselected(self, items):
         self.report["errors"].append(
-            "意外 deselection: " + ", ".join(i.nodeid for i in items)
+            "unexpected deselection: " + ", ".join(i.nodeid for i in items)
         )
 
     @pytest.hookimpl(hookwrapper=True, tryfirst=True)
@@ -248,12 +265,12 @@ class NodeGuard:
         original = list(items)
         yield
         if set(items) != set(original):
-            self.report["errors"].append("其他插件改变了节点集合")
+            self.report["errors"].append("another plugin changed the node set")
         entry = self.catalog[self.report["file"]]
         self.report["collected"] = sorted(i.nodeid for i in original)
         functions = {i.originalname or i.name.split("[", 1)[0] for i in original}
         if not set(entry["board_overrides"]) <= functions:
-            self.report["errors"].append("失效硬件例外")
+            self.report["errors"].append("stale hardware override")
         kept = []
         for item in items:
             function = item.originalname or item.name.split("[", 1)[0]
@@ -267,7 +284,9 @@ class NodeGuard:
                     "patch_utils_module" in item.fixturenames
                     or "upstream_source_root" in item.fixturenames
                 ):
-                    self.report["errors"].append("设备节点请求源码态 fixture")
+                    self.report["errors"].append(
+                        "device node requested a source-mode fixture"
+                    )
         items[:] = kept
         self.report["applicable"] = sorted(i.nodeid for i in kept)
         self.report["hardware_excluded"].sort()
@@ -277,7 +296,9 @@ class NodeGuard:
     def pytest_runtest_logreport(self, report):
         phases = self.report["nodes"].setdefault(report.nodeid, {})
         if report.when in phases:
-            self.report["errors"].append("重复执行节点阶段: " + report.nodeid)
+            self.report["errors"].append(
+                "duplicate node phase execution: " + report.nodeid
+            )
         phases[report.when] = {
             "outcome": report.outcome,
             "wasxfail": getattr(report, "wasxfail", None),
