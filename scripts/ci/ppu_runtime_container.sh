@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Run pin/model/accuracy validation in an isolated PPU runtime container.
+# Run wheel validation in an isolated PPU runtime container.
 set -Eeuo pipefail
 
-mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test|model-accuracy|kernel-perf}
+mode=${1:?Usage: ppu_runtime_container.sh pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse}
 case "${mode}" in
-    pin-ut|model-test|model-accuracy|kernel-perf) ;;
+    pin-ut|model-test|model-accuracy|kernel-perf|upstream-reuse) ;;
     *) printf 'Unknown runtime mode: %s\n' "${mode}" >&2; exit 2 ;;
 esac
 
@@ -143,6 +143,52 @@ mount_snapshot_if_external() {
 }
 
 case "${mode}" in
+    upstream-reuse)
+        : "${PPU_CI_UPSTREAM_DIR:?PPU_CI_UPSTREAM_DIR is required for upstream-reuse}"
+        [[ "${PPU_CI_DEVICE_COUNT}" == "1" ]] || {
+            echo "upstream-reuse requires exactly one M890 device" >&2
+            exit 2
+        }
+        upstream_dir=$(realpath "${PPU_CI_UPSTREAM_DIR}")
+        [[ -f "${upstream_dir}/vllm/__init__.py" ]] &&
+            [[ "$(git -c safe.directory="${upstream_dir}" -C "${upstream_dir}" rev-parse HEAD)" == "${expected_vllm_commit}" ]] || {
+            echo "PPU CI upstream checkout does not match the tested pin" >&2
+            exit 2
+        }
+        : "${HF_HOME:?HF_HOME is required for upstream-reuse}"
+        : "${PPU_CI_REUSE_CHECKPOINT_ROOT:?PPU_CI_REUSE_CHECKPOINT_ROOT is required for upstream-reuse}"
+        hf_home=$(realpath "${HF_HOME}")
+        checkpoint_root=$(realpath "${PPU_CI_REUSE_CHECKPOINT_ROOT}")
+        [[ -d "${hf_home}/hub" ]] || {
+            echo "HF_HOME must contain the offline hub cache" >&2
+            exit 2
+        }
+        [[ -d "${checkpoint_root}" ]] || {
+            echo "Reuse checkpoint root is missing" >&2
+            exit 2
+        }
+        create+=(
+            --shm-size=8g
+            --mount "type=bind,source=${hf_home},target=${hf_home},readonly"
+            --mount "type=bind,source=${checkpoint_root},target=${checkpoint_root},readonly"
+            --env HF_HOME="${hf_home}"
+            --env HF_HUB_CACHE="${hf_home}/hub"
+            --env HUGGINGFACE_HUB_CACHE="${hf_home}/hub"
+            --env TRANSFORMERS_CACHE="${hf_home}/hub"
+            --env HF_MODULES_CACHE="${hf_modules_cache}"
+            --env HF_HUB_OFFLINE=1
+            --env TRANSFORMERS_OFFLINE=1
+            --env REUSE_CHECKPOINT_ROOT="${checkpoint_root}"
+            --mount "type=bind,source=${upstream_dir},target=/upstream,readonly"
+            --env VLLM_SOURCE_ROOT=/upstream
+            --env REUSE_RESULTS_DIR=/artifacts/reuse
+            --env TESTED_SAIL_COMMIT="${PPU_CI_SOURCE_SHA}"
+            --env VLLM_USE_RUST_FRONTEND=0
+            --env VLLM_USE_RUST_BENCH=0
+            --entrypoint bash "${image_id}"
+            /source/scripts/ci/ppu_upstream_reuse.sh
+        )
+        ;;
     pin-ut)
         create+=(
             --shm-size=8g

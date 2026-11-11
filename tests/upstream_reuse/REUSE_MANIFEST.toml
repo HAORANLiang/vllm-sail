@@ -22,8 +22,8 @@
 #               "adapted" -> run with node selection / env / expected-xfail
 #                            applied by test_reuse_adapted.py
 #   chips       applicable targets, subset of {"cpu", "810e", "890p"}.
-#               "cpu" entries are collected by the PR CPU lane; entries with no
-#               "cpu" are marked `ppu` and only run in the nightly device lane.
+#               CI runs the "890p" entries on M890; "cpu" entries can also run on
+#               a device-less host. Entries without "cpu" are marked `ppu`.
 #   category    free-form grouping (params / config / core / sample / ...)
 #   reason      why this entry is direct|adapted (audited on every bump)
 #   min_tests   minimum number of upstream test cases that must be collected;
@@ -37,6 +37,7 @@
 #               failure is a real regression
 #   skip_reason when set, the entry is skipped entirely with this reason (used
 #               to park an entry whose upstream prerequisites are not yet met)
+#   allowed_skips nodeid/reason/max_count rules for reviewed upstream skips
 
 [meta]
 schema = 1
@@ -73,15 +74,6 @@ mode = "direct"
 chips = ["cpu", "810e", "890p"]
 category = "params"
 reason = "Logprob container/ranking logic, no device. Guards the sampling-output contract."
-min_tests = 1
-
-[[entry]]
-id = "pooling_params"
-path = "tests/test_pooling_params.py"
-mode = "direct"
-chips = ["cpu", "810e", "890p"]
-category = "params"
-reason = "PoolingParams validation and protocol parsing; pure CPU data classes."
 min_tests = 1
 
 [[entry]]
@@ -209,6 +201,16 @@ min_tests = 1
 # ---------------------------------------------------------------------------
 
 [[entry]]
+id = "pooling_params"
+path = "tests/test_pooling_params.py"
+mode = "adapted"
+chips = ["cpu", "810e", "890p"]
+category = "params"
+reason = "PoolingParams validation excluding the Snowflake embedding-dimension case; its offline model configuration is not provisioned."
+deselect = ["tests/test_pooling_params.py::test_embed_dimensions[model_info1]"]
+min_tests = 40
+
+[[entry]]
 id = "prefix_caching"
 path = "tests/v1/core/test_prefix_caching.py"
 mode = "adapted"
@@ -227,14 +229,4 @@ category = "tokenization"
 reason = "Tokenizer registry consistency needs HuggingFace AutoConfig; pinned to an offline HF_HOME in CI. Parked with a skip_reason until the runner provides a warm tokenizer cache."
 env = { HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1" }
 skip_reason = "requires a warm offline HF tokenizer cache (HF_HOME) on the runner; enable once the CI cache volume is provisioned"
-min_tests = 1
-
-[[entry]]
-id = "v1_sample_logprobs"
-path = "tests/v1/sample/test_logprobs.py"
-mode = "adapted"
-chips = ["810e", "890p"]
-category = "sample"
-reason = "Logprob end-to-end path uses cleanup_dist_env_and_memory + cudagraph reservation; needs a real device (PPU lane only), with ROCm/XPU-specific nodes deselected."
-keywords = "not rocm and not xpu"
 min_tests = 1

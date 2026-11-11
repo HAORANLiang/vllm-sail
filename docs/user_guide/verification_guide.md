@@ -98,6 +98,50 @@ issue and fails the job. Installation failure stops before that report step.
 This scheduled check does not replace PR checks, and none of these public CPU
 jobs runs PPU inference or `tests/e2e`.
 
+### Upstream test reuse
+
+Upstream reuse runs on a single M890 card in the authorized PPU pipeline, not
+automatically on PRs or a nightly schedule. It uses the runner-configured Docker
+runtime and the validated CI wheels with the SAIL plugin enabled, preserves the
+image's torch/torchvision stack and installs only the dedicated
+`requirements/upstream-reuse.txt` tooling. `requirements/dev.txt` stays unchanged.
+
+The container reads `HF_HOME=/nas_aisw/datasets/hf_cache` in offline mode. The
+cache and `/nas_aisw/datasets/checkpoints/LLM` are mounted read-only at their host
+paths, so snapshot symlinks into the checkpoint tree remain valid. Imported
+model code uses a writable temporary `HF_MODULES_CACHE`; no checkpoints are
+downloaded or modified. Missing model files still fail strict reuse, including
+cache entries whose snapshot directory exists but is empty. Diagnostics record
+the cache and checkpoint paths.
+
+For a local diagnostic in a prepared CPU environment with the exact upstream
+checkout, run the CPU entries with plugin loading disabled. This checks upstream
+behavior only and is not PPU qualification:
+
+```bash
+VLLM_PLUGINS='' VLLM_TARGET_DEVICE=cpu VLLM_SOURCE_ROOT=/path/to/pinned/vllm \
+  python -m pytest tests/upstream_reuse -q -rs \
+  -m "upstream_source and not ppu" --require-upstream-source \
+  --strict-upstream-reuse --upstream-reuse-target=cpu \
+  --upstream-reuse-report-dir=/path/to/reuse-report
+```
+
+Strict reuse requires each active entry to collect its declared minimum and
+actually pass at least one upstream case. Missing dependencies, import errors,
+empty runs and undeclared skips fail CI. Parked entries do not count as coverage.
+Reviewed skips identify the node, reason and maximum count; an all-skipped entry
+still fails. Reports retain per-entry JUnit XML, logs and execution counts.
+Pooling reuse excludes the Snowflake embedding-dimension case and requires the
+remaining 40 pooling cases; it does not qualify Snowflake model support.
+
+The PPU pipeline consumes validated wheels for single-card M890 reuse, records
+source/wheel/upstream identities and verifies installed-package imports and the
+SDK/Torch stack. 810E is explicitly deferred because no CI runner is available.
+The authorized `/ci run` dispatcher uses default-branch workflow definitions;
+new reusable-job wiring becomes active after merge. Before merge, the existing
+`ci-preview` PR path can execute the changed pipeline for validation. Neither a
+local CPU run nor a deferred device establishes M890 or 810E correctness.
+
 ## 3. Run device correctness tests
 
 In the PPU environment, install `requirements/dev.txt`. Use an editable native
