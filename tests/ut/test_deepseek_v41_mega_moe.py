@@ -658,12 +658,30 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
             return self
 
     hidden, ids, weights, output = Tensor(), Tensor(), Tensor(), Tensor()
-    buffer = object()
+    buffer = SimpleNamespace(
+        x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+    )
     l1, l2 = object(), object()
 
-    def dispatch(x, routed_ids, routed_weights, **kwargs):
+    def dispatch(
+        x,
+        routed_ids,
+        routed_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        num_tokens,
+        group_size=32,
+        mma_type="mxf4xmxf4",
+    ):
         assert (x, routed_ids, routed_weights) == (hidden, ids, weights)
-        assert kwargs == {"sym_buffer": buffer, "num_tokens": tokens}
+        assert buf_x is buffer.x
+        assert buf_x_sf is buffer.x_sf
+        assert buf_topk_idx is buffer.topk_idx
+        assert buf_topk_weights is buffer.topk_weights
+        assert num_tokens == tokens
+        assert group_size == 32 and mma_type == "mxf4xmxf4"
         calls.append("dispatch")
 
     def kernel(y, first, second, symm, **kwargs):

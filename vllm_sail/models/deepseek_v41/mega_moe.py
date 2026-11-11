@@ -254,7 +254,10 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             hidden_states,
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.float32).contiguous(),
-            sym_buffer=buffer,
+            buf_x=buffer.x,
+            buf_x_sf=buffer.x_sf,
+            buf_topk_idx=buffer.topk_idx,
+            buf_topk_weights=buffer.topk_weights,
             num_tokens=tokens,
         )
         output = torch.empty_like(hidden_states, dtype=torch.bfloat16)

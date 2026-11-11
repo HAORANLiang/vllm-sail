@@ -209,11 +209,29 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         weights = torch.ones(tokens, 2, dtype=torch.float32)
         padding = torch.tensor([True, False, False])[:tokens]
     calls = []
-    buffer = object()
+    buffer = SimpleNamespace(
+        x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+    )
 
-    def dispatch(x, selected_ids, selected_weights, *, sym_buffer, num_tokens):
-        assert x is hidden and sym_buffer is buffer
+    def dispatch(
+        x,
+        selected_ids,
+        selected_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+        num_tokens,
+        group_size=32,
+        mma_type="mxf4xmxf4",
+    ):
+        assert x is hidden
+        assert buf_x is buffer.x
+        assert buf_x_sf is buffer.x_sf
+        assert buf_topk_idx is buffer.topk_idx
+        assert buf_topk_weights is buffer.topk_weights
         assert num_tokens == tokens
+        assert group_size == 32 and mma_type == "mxf4xmxf4"
         assert selected_ids.dtype == torch.int32 and selected_ids.is_contiguous()
         assert selected_weights.dtype == torch.float32
         if tokens:
@@ -429,13 +447,14 @@ def test_mega_moe_fused_routing_matches_eager(
     class Experts:
         has_fused_shared_experts = False
 
-        def __call__(self, hidden, weights, ids, **kwargs):
+        def __call__(self, hidden, weights, ids, shared_experts):
+            assert shared_experts is None
             captured.update(weights=weights, ids=ids)
             return hidden
 
     moe = SimpleNamespace(
         gate=gate,
-        use_mega_moe=True,
+        use_native_mega_moe=True,
         scoring_func="sqrtsoftplus",
         n_activated_experts=6,
         renormalize=True,
