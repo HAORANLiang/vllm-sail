@@ -43,6 +43,7 @@ EXPECTED_MODULES = {
     "deepseek_v41_engram",
     "deepseek_v41_indexer",
     "glm5_next",
+    "glm5_next_mtp",
     "kimi_k3",
     "llama4",
     "minimax_m3",
