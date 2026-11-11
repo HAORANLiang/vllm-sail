@@ -254,6 +254,7 @@ import sys
 for _consumer_name in (
     "vllm.model_executor.models.deepseek_v2",
     "vllm.models.deepseek_v4.attention",
+    "vllm.models.deepseek_v41.attention",
 ):
     _consumer = sys.modules.get(_consumer_name)
     if (

@@ -778,11 +778,9 @@ static __global__ __launch_bounds__(kBF16BlockSize, 1)
   int* out = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
   if (length <= static_cast<uint32_t>(topK)) {
-    uint32_t tx = threadIdx.x;
-    if (tx < length) {
-      out[tx] = tx;
-    } else if (tx < static_cast<uint32_t>(topK)) {
-      out[tx] = -1;
+    for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(topK);
+         i += kBF16BlockSize) {
+      out[i] = i < length ? static_cast<int32_t>(i) : -1;
     }
     return;
   }
@@ -835,11 +833,9 @@ static __global__ __launch_bounds__(kBF16BlockSize, 1)
   int* out = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
   if (length <= static_cast<uint32_t>(topK)) {
-    uint32_t tx = threadIdx.x;
-    if (tx < length) {
-      out[tx] = tx;
-    } else if (tx < static_cast<uint32_t>(topK)) {
-      out[tx] = -1;
+    for (uint32_t i = threadIdx.x; i < static_cast<uint32_t>(topK);
+         i += kBF16BlockSize) {
+      out[i] = i < length ? static_cast<int32_t>(i) : -1;
     }
     return;
   }

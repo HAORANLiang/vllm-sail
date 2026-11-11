@@ -18,6 +18,112 @@ modules = harness.modules
 PATCH_PATH = (
     Path(__file__).parents[2] / "vllm_sail/patch/enhancement/attention/mla_indexer.py"
 )
+FP4_CONSUMERS = (
+    "vllm.model_executor.models.deepseek_v2",
+    "vllm.models.deepseek_v4.attention",
+    "vllm.models.deepseek_v41.attention",
+)
+
+
+@pytest.fixture
+def fp4_indexer(modules, patch_utils_module):
+    platform = types.SimpleNamespace(
+        ppu=True,
+        capability=89,
+        is_ppu=lambda: platform.ppu,
+        is_device_capability=lambda value: platform.capability == value,
+    )
+
+    def upstream(config):
+        use_fp4 = config.attention_config.resolve_indexer_kv_dtype("fp8") == "mxfp4"
+        if use_fp4 and platform.capability != 100:
+            raise ValueError("requires Blackwell datacenter GPUs")
+        return use_fp4
+
+    modules("vllm.platforms", current_platform=platform)
+    modules("torch", float32=object())
+    modules("vllm_sail.utils.deep_gemm")
+    modules("vllm_sail.patch.utils", patch_value=patch_utils_module.patch_value)
+    builder = type(
+        "DeepseekV32IndexerMetadataBuilder",
+        (),
+        {
+            "__init__": lambda *a, **kw: None,
+            "build": lambda *a, **kw: None,
+            "_split_indexer_prefill_chunks": staticmethod(lambda *a, **kw: None),
+        },
+    )
+    target = modules(
+        "vllm.v1.attention.backends.mla.indexer",
+        DeepseekV32IndexerMetadataBuilder=builder,
+        get_paged_mqa_logits_metadata=lambda *a, **kw: None,
+        _supports_flattened_device_query_lens=lambda: False,
+        DSA_INDEXER_KV_DTYPES=("fp8", "mxfp4"),
+        dsa_indexer_uses_fp4=upstream,
+    )
+    return platform, target, upstream
+
+
+@pytest.mark.parametrize("consumer_name", FP4_CONSUMERS)
+@pytest.mark.parametrize("preloaded", [False, True])
+@pytest.mark.parametrize("dtype", ["fp8", "mxfp4"])
+def test_fp4_capability_rebinds_preloaded_and_future_consumers(
+    modules, fp4_indexer, consumer_name, preloaded, dtype
+):
+    _, provider, upstream = fp4_indexer
+    if preloaded:
+        consumer = modules(consumer_name, dsa_indexer_uses_fp4=upstream)
+    patched = harness.load_patch("vllm_sail/patch/enhancement/attention/mla_indexer.py")
+    if not preloaded:
+        consumer = modules(consumer_name)
+        exec(
+            "from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4",
+            consumer.__dict__,
+        )
+    assert consumer.dsa_indexer_uses_fp4 is provider.dsa_indexer_uses_fp4
+    assert consumer.dsa_indexer_uses_fp4 is patched.dsa_indexer_uses_fp4
+    config = types.SimpleNamespace(
+        attention_config=types.SimpleNamespace(resolve_indexer_kv_dtype=lambda _: dtype)
+    )
+    assert consumer.dsa_indexer_uses_fp4(config) is (dtype == "mxfp4")
+
+
+@pytest.mark.parametrize("consumer_name", FP4_CONSUMERS)
+def test_fp4_capability_preserves_other_consumer_overrides(
+    modules, fp4_indexer, consumer_name
+):
+    def override(config):
+        return "other override"
+
+    consumer = modules(consumer_name, dsa_indexer_uses_fp4=override)
+    harness.load_patch("vllm_sail/patch/enhancement/attention/mla_indexer.py")
+    assert consumer.dsa_indexer_uses_fp4 is override
+
+
+@pytest.mark.parametrize(
+    "ppu,capability,dtype,expected,error",
+    [
+        (True, 80, "mxfp4", None, "requires capability sm_89"),
+        (True, 89, "bf16", None, "Unsupported PPU indexer_kv_dtype"),
+        (False, 100, "mxfp4", True, None),
+        (False, 90, "mxfp4", None, "requires Blackwell datacenter GPUs"),
+        (False, 90, "fp8", False, None),
+    ],
+)
+def test_fp4_capability_keeps_platform_and_dtype_gates(
+    fp4_indexer, ppu, capability, dtype, expected, error
+):
+    platform, provider, _ = fp4_indexer
+    platform.ppu, platform.capability = ppu, capability
+    harness.load_patch("vllm_sail/patch/enhancement/attention/mla_indexer.py")
+    config = types.SimpleNamespace(
+        attention_config=types.SimpleNamespace(resolve_indexer_kv_dtype=lambda _: dtype)
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            provider.dsa_indexer_uses_fp4(config)
+    else:
+        assert provider.dsa_indexer_uses_fp4(config) is expected
 
 
 @pytest.mark.upstream_source
