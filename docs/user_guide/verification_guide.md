@@ -141,6 +141,8 @@ The authorized `/ci run` dispatcher uses default-branch workflow definitions;
 new reusable-job wiring becomes active after merge. Before merge, the existing
 `ci-preview` PR path can execute the changed pipeline for validation. Neither a
 local CPU run nor a deferred device establishes M890 or 810E correctness.
+Sources without `scripts/ci/ppu_upstream_reuse.sh`, such as release branches
+cut before this lane, skip M890 reuse and the PPU CI gate accepts that skip.
 
 ## 3. Run device correctness tests
 

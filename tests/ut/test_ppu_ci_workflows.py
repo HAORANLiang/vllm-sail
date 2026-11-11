@@ -375,7 +375,9 @@ def test_pr_pipeline_structure():
     runtime = jobs["runtime-image"]
     assert runtime["runs-on"] == "8-ppu-m890p"
     assert "!inputs.skip_ppu" in runtime["if"]
-    assert "outputs" not in runtime
+    assert runtime["outputs"] == {
+        "upstream_reuse": "${{ steps.reuse.outputs.supported }}"
+    }
     resolve = next(
         step
         for step in runtime["steps"]
@@ -1171,6 +1173,7 @@ def test_consumers_require_build_or_valid_reuse(build_jobs, build, run_id, sourc
         "inputs.existing_build_run_id": run_id,
         "inputs.wheel_source_sha": source,
         "needs.runtime-image.result": "success",
+        "needs.runtime-image.outputs.upstream_reuse": "true",
         "needs.build.result": build,
     }
     reuse = bool(run_id) and bool(source)
@@ -1226,6 +1229,94 @@ def test_gate_executes_fail_closed_truth_table(
         or (states[0] == "skipped" and bool(run_id) and bool(source))
     ) and states[1:] == ("success", "success", "success")
     assert passed is expected
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_runtime_preflight_detects_the_upstream_reuse_entry_script(
+    build_jobs, tmp_path, present
+):
+    step = next(
+        step
+        for step in build_jobs["runtime-image"]["steps"]
+        if step.get("id") == "reuse"
+    )
+    assert step["env"] == {"SOURCE_DIR": "${{ steps.workspace.outputs.source }}"}
+    if present:
+        (tmp_path / "scripts/ci").mkdir(parents=True)
+        (tmp_path / "scripts/ci/ppu_upstream_reuse.sh").write_text("")
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-e", "-c", step["run"]],
+        env={**os.environ, "SOURCE_DIR": str(tmp_path), "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == f"supported={str(present).lower()}\n"
+
+
+@pytest.mark.parametrize("supported", ["true", "false", None])
+def test_upstream_reuse_lane_requires_the_entry_script(build_jobs, supported):
+    context = {
+        "github.event_name": "workflow_dispatch",
+        "inputs.skip_ppu": False,
+        "inputs.skip_device_tests": False,
+        "inputs.existing_build_run_id": "",
+        "inputs.wheel_source_sha": "",
+        "needs.runtime-image.result": "success",
+        "needs.runtime-image.outputs.upstream_reuse": supported,
+        "needs.build.result": "success",
+    }
+    assert bool(expression(build_jobs["upstream-reuse"]["if"], context)) == (
+        supported == "true"
+    )
+    # Only the reuse lane depends on the entry script.
+    for job_id in ("pin-unit-tests", "model-tests"):
+        assert expression(build_jobs[job_id]["if"], context)
+
+
+@pytest.mark.parametrize(
+    "outputs,lanes,passed",
+    [
+        ({"upstream_reuse": "false"}, ("success", "success", "skipped"), True),
+        ({"upstream_reuse": "false"}, ("success", "success", "failure"), False),
+        ({"upstream_reuse": "false"}, ("skipped", "success", "skipped"), False),
+        ({"upstream_reuse": "false"}, ("success", "skipped", "skipped"), False),
+        ({"upstream_reuse": "true"}, ("success", "success", "skipped"), False),
+        ({"upstream_reuse": ""}, ("success", "success", "skipped"), False),
+        ({}, ("success", "success", "skipped"), False),
+    ],
+)
+def test_gate_accepts_skipped_reuse_only_without_the_entry_script(
+    build_jobs, outputs, lanes, passed
+):
+    script = build_jobs["gate"]["steps"][0]["run"].replace(
+        "python - <<'PYTHON'", f"{sys.executable} - <<'PYTHON'"
+    )
+    results = {
+        "runtime-image": {"result": "success", "outputs": outputs},
+        "build": {"result": "success"},
+    }
+    results.update(
+        (job, {"result": state})
+        for job, state in zip(
+            ("pin-unit-tests", "model-tests", "upstream-reuse"), lanes, strict=True
+        )
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "JOB_RESULTS": json.dumps(results),
+            "SKIP_PPU": "false",
+            "SKIP_DEVICE_TESTS": "false",
+            "EXISTING_BUILD_RUN_ID": "",
+            "WHEEL_SOURCE_SHA": "",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) is passed, result.stderr
 
 
 def test_runtime_workflows_use_the_checked_in_docker_wrapper():
@@ -1358,10 +1449,11 @@ def test_upstream_reuse_leaf_uses_exact_pin_and_dual_source_identity():
     assert upload["uses"] == "actions/upload-artifact@v4"
     assert "github.run_attempt" in upload["with"]["name"]
     jobs = workflow("ppu-build-and-test.yaml")["jobs"]
-    assert (
-        jobs["upstream-reuse"]["if"]
-        == jobs["pin-unit-tests"]["if"]
-        == jobs["model-tests"]["if"]
+    runtime_ok = "needs.runtime-image.result == 'success' &&"
+    assert jobs["pin-unit-tests"]["if"] == jobs["model-tests"]["if"]
+    assert jobs["upstream-reuse"]["if"] == jobs["pin-unit-tests"]["if"].replace(
+        runtime_ok,
+        runtime_ok + " needs.runtime-image.outputs.upstream_reuse == 'true' &&",
     )
 
 

@@ -79,6 +79,8 @@ jobs:
     timeout-minutes: 10
     env:
       GIT_CONFIG_NOSYSTEM: "1"
+    outputs:
+      upstream_reuse: ${{ steps.reuse.outputs.supported }}
     steps:
       - name: Prepare isolated runtime preflight checkout
         id: workspace
@@ -104,6 +106,19 @@ jobs:
         env:
           SOURCE_DIR: ${{ steps.workspace.outputs.source }}
         run: bash "${SOURCE_DIR}/scripts/ci/ppu_runtime_image.sh" >/dev/null
+
+      # Release branches cut before the M890 reuse lane do not ship its entry
+      # script, so their PRs skip the lane instead of failing on an unknown mode.
+      - name: Detect the upstream reuse entry script
+        id: reuse
+        env:
+          SOURCE_DIR: ${{ steps.workspace.outputs.source }}
+        run: |
+          if [[ -f "${SOURCE_DIR}/scripts/ci/ppu_upstream_reuse.sh" ]]; then
+            echo supported=true >> "$GITHUB_OUTPUT"
+          else
+            echo supported=false >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: runtime-image
@@ -182,6 +197,7 @@ jobs:
       ${{ !cancelled() &&
       !inputs.skip_device_tests &&
       needs.runtime-image.result == 'success' &&
+      needs.runtime-image.outputs.upstream_reuse == 'true' &&
       (github.event_name != 'pull_request' ||
       ((((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'ci-preview')) &&
@@ -247,9 +263,20 @@ jobs:
           if build != "success" and not (build == "skipped" and reuse):
               raise SystemExit(f"build did not succeed or use validated wheels: {build}")
           skip_device_tests = os.environ["SKIP_DEVICE_TESTS"] == "true"
+          upstream_reuse_supported = (
+              results["runtime-image"].get("outputs", {}).get("upstream_reuse")
+              != "false"
+          )
           for job in ("pin-unit-tests", "model-tests", "upstream-reuse"):
               result = results.get(job, {}).get("result")
               if skip_device_tests and result == "skipped":
+                  continue
+              if (
+                  job == "upstream-reuse"
+                  and not upstream_reuse_supported
+                  and result == "skipped"
+              ):
+                  print("upstream-reuse skipped: source has no scripts/ci/ppu_upstream_reuse.sh")
                   continue
               if result != "success":
                   raise SystemExit(f"{job} did not succeed: {result}")
