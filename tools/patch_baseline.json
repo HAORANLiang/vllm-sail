@@ -234,6 +234,7 @@
   "vllm.models.muse_spark.common.moe.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.muse_spark.common.ops.fused_routing.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.muse_spark.nvidia.model.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
+  "vllm.models.qwen4_exp.nvidia.ops.qsa._select_config": "ce493f6cc9044f703b5c292862fe6e4ff45a328b01448f4847b4987cbe6c3661",
   "vllm.platforms.interface.Platform.is_ppu": "additive",
   "vllm.platforms.interface.Platform.is_sleep_mode_available": "bd559732376e83511388bc11a83310813a26be1d40b28c13f11ddd0e12d98085",
   "vllm.third_party.flash_linear_attention.ops.chunk_delta_h.chunk_gated_delta_rule_fwd_kernel_h_blockdim64": "additive",
