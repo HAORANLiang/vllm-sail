@@ -609,6 +609,9 @@ def megamoe_patch(modules):
         pass
 
     class MoE:
+        def forward(self, *args, **kwargs):
+            raise AssertionError("unpatched forward")
+
         def _init_mega_moe_experts(self, vllm_config, config, prefix):
             raise AssertionError("unpatched initializer")
 
@@ -644,6 +647,11 @@ def megamoe_patch(modules):
     )
     original_gate = gate("native")
     provider = modules("vllm.utils.deep_gemm", bf16_mega_gate=original_gate)
+    modules(
+        "vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router",
+        fused_topk_bias=lambda **kwargs: (object(), object()),
+    )
+    original_forward = MoE.forward
     original_init = MoE._init_mega_moe_experts
     patch = load_patch(_MEGAMOE_PATCH)
     return SimpleNamespace(
@@ -658,6 +666,7 @@ def megamoe_patch(modules):
         provider=provider,
         original_gate=original_gate,
         original_init=original_init,
+        original_forward=original_forward,
         patch=patch,
         calls=calls,
         outputs=outputs,
@@ -1126,3 +1135,107 @@ def test_megamoe_geometry_matches_wheel_contract(
         with pytest.raises(ValueError, match="H >= 2048.*I divisible by 64"):
             module.check_mega_moe_supported(device, hidden, intermediate)
         assert not calls
+
+
+@pytest.mark.parametrize("tokens", [0, 1, 16, 17, 104, 256])
+@pytest.mark.parametrize("ppu", [False, True])
+def test_megamoe_forward_uses_fused_routing_for_all_ppu_batches(
+    megamoe_patch, monkeypatch, tokens, ppu
+):
+    harness = megamoe_patch
+    harness.platform.ppu = ppu
+    calls = []
+    weights, ids = object(), object()
+    hidden = SimpleNamespace(shape=(tokens, 5120))
+    output = SimpleNamespace(view=lambda shape: ("output", shape))
+
+    class Gate:
+        weight = SimpleNamespace(shape=(384, 5120))
+        tid2eid = object()
+        e_score_correction_bias = SimpleNamespace(data=object())
+        bias_vl = SimpleNamespace(data=object())
+
+        def __call__(self, value):
+            assert value is hidden
+            calls.append("linear")
+            return "logits", None
+
+    class Experts:
+        has_fused_shared_experts = False
+
+        def __call__(self, value, routed_weights, routed_ids, **kwargs):
+            assert value is hidden
+            assert (routed_weights, routed_ids) == (weights, ids)
+            assert kwargs == {"activation_clamp": 7.0}
+            return output
+
+    def route(**kwargs):
+        calls.append(kwargs)
+        return weights, ids
+
+    def mega_route(*args, **kwargs):
+        calls.append("mega")
+        return weights, ids
+
+    monkeypatch.setattr(harness.patch, "fused_topk_bias", route)
+    monkeypatch.setattr(harness.provider, "bf16_mega_gate", mega_route)
+    moe = harness.model.DeepseekV4MoE()
+    moe.gate = Gate()
+    moe.use_mega_moe = True
+    moe.scoring_func = "sqrtsoftplus"
+    moe.n_activated_experts = 6
+    moe.renormalize = True
+    moe.hash_indices_dtype = "int64"
+    moe.routed_scaling_factor = 2.5
+    moe.image_sentinel_lo = 100
+    moe.ep_rank = 0
+    moe.swiglu_limit = 7
+    moe.experts = Experts()
+    moe.shared_experts = None
+    inputs = object()
+    if ppu or tokens <= 16:
+        assert moe.forward(hidden, inputs) == ("output", hidden.shape)
+        assert calls[0] == "linear"
+        assert calls[1] == dict(
+            hidden_states=hidden,
+            gating_output="logits",
+            scoring_func="sqrtsoftplus",
+            e_score_correction_bias=moe.gate.e_score_correction_bias.data,
+            topk=6,
+            renormalize=True,
+            indices_type="int64",
+            input_tokens=inputs,
+            hash_indices_table=moe.gate.tid2eid,
+            routed_scaling_factor=2.5,
+            bias_vl=moe.gate.bias_vl.data,
+            image_sentinel_lo=100,
+        )
+    else:
+        moe.gate.tid2eid = None
+        metadata = SimpleNamespace(image_token_mask=object())
+        assert moe.forward(hidden, inputs, metadata) == ("output", hidden.shape)
+        assert calls == ["mega"]
+    marker = getattr(moe.forward, harness.patch.PATCH_MARKER)
+    assert marker[f"{_MEGAMOE_MODEL}.DeepseekV4MoE.forward"] is harness.original_forward
+
+
+def test_megamoe_forward_retains_non_mega_path(megamoe_patch):
+    moe = megamoe_patch.model.DeepseekV4MoE()
+    moe.gate = SimpleNamespace(tid2eid=None)
+    moe.use_mega_moe = False
+    moe._forward_fused_moe = lambda hidden, ids: (hidden, ids)
+    hidden, ids = object(), object()
+    assert moe.forward(hidden, ids) == (hidden, ids)
+
+
+def test_megamoe_forward_rejects_duplicate_patch(megamoe_patch):
+    from vllm_sail.patch.utils import patch
+
+    with pytest.raises(RuntimeError, match="already patched"):
+        patch(
+            _MEGAMOE_MODEL,
+            "DeepseekV4MoE.forward",
+            reason="test",
+            affected_versions=">=0.31.0,<0.32.0",
+            remove_when="test",
+        )(megamoe_patch.patch.forward)

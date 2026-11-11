@@ -193,6 +193,7 @@
   "vllm.models.deepseek_v4.nvidia.flashmla.flash_mla_sparse_fwd": "689288c764f20ced631c8c92556e1dd0ecc255bf5a42bd62e10ac3a0385a2ccd",
   "vllm.models.deepseek_v4.nvidia.flashmla.flash_mla_with_kvcache": "689288c764f20ced631c8c92556e1dd0ecc255bf5a42bd62e10ac3a0385a2ccd",
   "vllm.models.deepseek_v4.nvidia.model.DeepseekV4MoE._init_mega_moe_experts": "7d5ae1cc89ae393ef333f0c55da21de1ef2e1952402886d131b095dbe8209a94",
+  "vllm.models.deepseek_v4.nvidia.model.DeepseekV4MoE.forward": "24e5592d3bf2f5627d9eed44851b1c29d3008b63aff7f184ac613cb90238802c",
   "vllm.models.deepseek_v4.nvidia.model._select_dsv4_attn_cls": "de6e01e08bfa00193f8a2a66f2fbe3cfed8637d731cfb57f7835af3401002a28",
   "vllm.models.deepseek_v41.attention.DeepseekV4Indexer.__init__": "30acf7ca2c16650b3a7e6948ba6f943998962763bc0be4ff477ca55bb63819ba",
   "vllm.models.deepseek_v41.attention.DeepseekV4IndexerCache.get_kv_cache_spec": "3b4d7fc3180b885f852c799b41909633591f8987d39830e337112859d6017c8a",

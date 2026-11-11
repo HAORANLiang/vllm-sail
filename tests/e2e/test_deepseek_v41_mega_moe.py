@@ -291,3 +291,133 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
                 buffer.destroy()
                 del cache[key]
         dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module")
+def mega_moe_gate_factory(tmp_path_factory):
+    import torch
+
+    import vllm_sail
+
+    vllm_sail.register_out_of_tree()
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.distributed import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+
+    rendezvous = tmp_path_factory.mktemp("mega_gate") / "rendezvous"
+    with set_current_vllm_config(VllmConfig()):
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method=f"file://{rendezvous}",
+            backend="nccl",
+        )
+        initialize_model_parallel(1, 1)
+        try:
+
+            def make_gate(num_experts):
+                return GateLinear(
+                    5120,
+                    num_experts,
+                    params_dtype=torch.float32,
+                    out_dtype=torch.float32,
+                ).cuda()
+
+            yield make_gate
+        finally:
+            destroy_model_parallel()
+            destroy_distributed_environment()
+
+
+@pytest.mark.parametrize("tokens", [1, 17, 104, 256])
+@pytest.mark.parametrize("num_experts", [128, 384])
+@pytest.mark.parametrize("routing", ["plain", "bias", "hash", "image", "mixed", "ties"])
+def test_mega_moe_fused_routing_matches_eager(
+    mega_moe_gate_factory, tokens, num_experts, routing
+):
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+
+    import vllm_sail
+
+    vllm_sail.register_out_of_tree()
+    from vllm_sail.models.deepseek_v41.mega_moe import mega_gate
+    from vllm_sail.patch.enhancement.models.deepseek_v41_megamoe import forward
+
+    assert DeepseekV4MoE.forward is forward
+    torch.manual_seed(123)
+    x = torch.randn(tokens, 5120, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(num_experts, 5120, device="cuda") * 0.01
+    bias = None if routing == "plain" else torch.randn(num_experts, device="cuda")
+    if routing == "ties":
+        weight.zero_()
+        bias.zero_()
+    image_bias = (
+        torch.randn(num_experts, device="cuda")
+        if routing in ("image", "mixed")
+        else None
+    )
+    input_ids = torch.arange(tokens, device="cuda", dtype=torch.int64) % 16
+    image_mask = (input_ids >= 10) & (input_ids < 15)
+    table = (
+        torch.randint(num_experts, (16, 6), device="cuda", dtype=torch.int64)
+        if routing in ("hash", "mixed")
+        else None
+    )
+    fixed = ~image_mask if image_bias is not None else torch.ones_like(image_mask)
+    expected_weights, expected_ids = mega_gate(
+        x,
+        weight,
+        6,
+        scoring_func="sqrtsoftplus",
+        routed_scaling_factor=2.5,
+        ep_rank=0,
+        bias=bias,
+        image_bias=image_bias,
+        image_token_mask=image_mask,
+        fix_routing_mask=fixed if table is not None else None,
+        unmapped_topk_idx=table[input_ids] if table is not None else None,
+    )
+    captured = {}
+
+    gate = mega_moe_gate_factory(num_experts)
+    gate.weight.data.copy_(weight)
+    gate.tid2eid = table
+    gate.e_score_correction_bias = bias
+    gate.bias_vl = image_bias
+
+    class Experts:
+        has_fused_shared_experts = False
+
+        def __call__(self, hidden, weights, ids, **kwargs):
+            captured.update(weights=weights, ids=ids)
+            return hidden
+
+    moe = SimpleNamespace(
+        gate=gate,
+        use_mega_moe=True,
+        scoring_func="sqrtsoftplus",
+        n_activated_experts=6,
+        renormalize=True,
+        hash_indices_dtype=torch.int64,
+        routed_scaling_factor=2.5,
+        image_sentinel_lo=10,
+        swiglu_limit=None,
+        experts=Experts(),
+        shared_experts=None,
+    )
+    assert forward(moe, x, input_ids).data_ptr() == x.data_ptr()
+    torch.testing.assert_close(captured["ids"], expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        captured["weights"], expected_weights, atol=1e-6, rtol=1e-5
+    )
+    assert captured["weights"].is_contiguous()
+    assert captured["ids"].is_contiguous()

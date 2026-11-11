@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 277
+target_count = 278
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -1624,6 +1624,14 @@ module = "vllm/models/deepseek_v4/nvidia/model.py"
 symbol = "DeepseekV4MoE._init_mega_moe_experts"
 present = true
 fingerprint = "sha256:a73d26ea1c8228075e3881056c9ea01e9181145916f9399f1aed884c1c9eb27d"
+
+[[patch_target]]
+name = "vllm.models.deepseek_v4.nvidia.model.DeepseekV4MoE.forward"
+kind = "class"
+module = "vllm/models/deepseek_v4/nvidia/model.py"
+symbol = "DeepseekV4MoE.forward"
+present = true
+fingerprint = "sha256:561bcfcabf53b368aa45e8fa55c533f0422b80b43cc049cf545f1eed290ffb4a"
 
 [[patch_target]]
 name = "vllm.models.deepseek_v4.nvidia.model._select_dsv4_attn_cls"
