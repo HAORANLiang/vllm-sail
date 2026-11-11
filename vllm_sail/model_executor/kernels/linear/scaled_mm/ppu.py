@@ -197,9 +197,26 @@ class PPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         self.use_acext_int8_gemm = False
         self.use_deepgemm_int8_gemm = False
 
+        w_q_name = self.layer_param_names[0]
+        # Both row-major int8 GEMMs consume the weight as [N, K]; read it
+        # before selecting a backend so the shape can veto a kernel that
+        # would otherwise assert at the first forward.
+        weight = getattr(layer, w_q_name)
+        # acext requires N and K to be multiples of 16 (see
+        # w8a8_int8_matmul_acext), so route non-aligned weights to Triton.
+        weight_16_aligned = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
+        if not weight_16_aligned:
+            logger.debug(
+                "int8 weight %s has shape %s, not 16-aligned on both dims; "
+                "using the Triton dense kernel for this layer",
+                w_q_name,
+                tuple(weight.shape),
+            )
+
         # check acext
         if (
-            (
+            weight_16_aligned
+            and (
                 not ppu_envs.VLLM_SAIL_DENSE_BACKEND
                 or ppu_envs.VLLM_SAIL_DENSE_BACKEND == "acext"
             )
@@ -216,17 +233,19 @@ class PPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         # instead of selecting it, and the branch below was unreachable whenever
         # the variable was set. Spelling corrected here; see
         # docs/user_guide/configuration.md.
-        if is_deep_gemm_supported() and (
-            not ppu_envs.VLLM_SAIL_DENSE_BACKEND
-            or ppu_envs.VLLM_SAIL_DENSE_BACKEND == "deepgemm"
+        if (
+            weight_16_aligned
+            and is_deep_gemm_supported()
+            and (
+                not ppu_envs.VLLM_SAIL_DENSE_BACKEND
+                or ppu_envs.VLLM_SAIL_DENSE_BACKEND == "deepgemm"
+            )
         ):
             self.use_deepgemm_int8_gemm = True
 
-        w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.layer_param_names
+        w_s_name, i_s_name, i_zp_name, azp_adj_name = self.layer_param_names[1:]
         config = self.config
-        # WEIGHT PROCESS
-        weight = getattr(layer, w_q_name)
-        # acext and DeepGEMM use row-major weights; Cutlass uses column-major.
+        # acext and DeepGEMM use [N, K]; the Triton fallback uses [K, N].
         row_major = self.use_acext_int8_gemm or self.use_deepgemm_int8_gemm
         if not row_major:
             weight = weight.t()
@@ -347,7 +366,7 @@ class PPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
                 azp=azp,
                 bias=bias,
             )
-        elif (bias is None) and self.use_deepgemm_int8_gemm:
+        elif bias is None and self.use_deepgemm_int8_gemm and x.dtype == torch.bfloat16:
             out = torch.ops.vllm.w8a8_int8_matmul_deepgemm(
                 x_q, w_q, scale_x=x_s, scale_w=w_s, out_dtype=x.dtype
             )
@@ -356,13 +375,20 @@ class PPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
                 x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
             )
         else:
-            out = ops.cutlass_scaled_mm(
+            # CUTLASS is excluded from the PPU build. Call Triton directly,
+            # including for aligned shapes that upstream sends to CUTLASS.
+            from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+                triton_scaled_mm,
+            )
+
+            out = triton_scaled_mm(
                 x_q,
                 w_q.t() if self.weight_RowMajor else w_q,
                 scale_a=x_s,
                 scale_b=w_s,
                 out_dtype=x.dtype,
                 bias=bias,
+                use_td=False,
             )
         return out.view(*original_shape[:-1], out.shape[-1])
 
