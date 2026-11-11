@@ -132,3 +132,36 @@ def suspend(self):
             )
             return
     return _upstream_suspend(self)
+
+
+_upstream_all_gather = _pynccl.PyNcclCommunicator.all_gather
+_upstream_all_gatherv = _pynccl.PyNcclCommunicator.all_gatherv
+
+
+def _gather_transport_views(output_tensor, input_tensor):
+    import torch
+
+    if current_platform.is_ppu() and input_tensor.dtype == torch.uint16:
+        # Gather only copies bytes. An equal-width BF16 view preserves packed
+        # E8M0 scale bits, tensor shapes, counts and the caller's output dtype.
+        return output_tensor.view(torch.bfloat16), input_tensor.view(torch.bfloat16)
+    return output_tensor, input_tensor
+
+
+_GATHER_META = dict(
+    reason="PCCL gathers need a supported transport dtype for packed uint16 MXFP4 scales.",
+    affected_versions=_AFFECTED,
+    remove_when="PyNccl and PCCL support uint16 in all_gather and all_gatherv.",
+)
+
+
+@patch(_COMMUNICATOR, "PyNcclCommunicator.all_gather", **_GATHER_META)
+def all_gather(self, output_tensor, input_tensor, stream=None):
+    output_tensor, input_tensor = _gather_transport_views(output_tensor, input_tensor)
+    return _upstream_all_gather(self, output_tensor, input_tensor, stream=stream)
+
+
+@patch(_COMMUNICATOR, "PyNcclCommunicator.all_gatherv", **_GATHER_META)
+def all_gatherv(self, output_tensor, input_tensor, sizes, stream=None):
+    output_tensor, input_tensor = _gather_transport_views(output_tensor, input_tensor)
+    return _upstream_all_gatherv(self, output_tensor, input_tensor, sizes, stream=stream)

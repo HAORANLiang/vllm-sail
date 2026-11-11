@@ -95,10 +95,12 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         global_to_physical: torch.Tensor | None = None,
         physical_to_global: torch.Tensor | None = None,
         local_expert_global_ids: torch.Tensor | None = None,
+        clean_buffer_before_dispatch: bool = False,
     ):
         super().__init__()
 
         self.buffer = buffer
+        self.clean_buffer_before_dispatch = clean_buffer_before_dispatch
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
         self.use_int8_dispatch = use_int8_dispatch
@@ -316,6 +318,15 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
             a1 = a1 * topk_weights.to(a1.dtype)
+
+        # DSpark shares one allocation between different expert layouts. Old
+        # token data can overlap the next layout's receive counters. Clear via
+        # the SDK before dispatch, including in every captured graph; a Python
+        # "last layout" cache cannot track graph replay order.
+        if self.clean_buffer_before_dispatch:
+            self.buffer.clean_low_latency_buffer(
+                self.max_tokens_per_rank, hidden_size, num_experts
+            )
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)

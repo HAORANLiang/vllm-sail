@@ -143,6 +143,32 @@ def _check_collectives(rank: int, rendezvous: str):
         torch.cuda.synchronize()
         expected = torch.tensor([0, 1, 1], dtype=torch.int32, device=device)
         torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        # Packed scale words must survive transport bit-for-bit, including
+        # values that would be NaNs if interpreted numerically as BF16.
+        words = torch.tensor([0, 1, 32768, 32641, 65535], dtype=torch.int32)
+        for sizes in ([1, 1], [1, 2], [0, 2]):
+            host = words.repeat(sizes[rank], 1)
+            local = host.to(device=device, dtype=torch.uint16)
+            gathered = communicator.all_gatherv(local, sizes=sizes)
+            torch.cuda.synchronize()
+            assert gathered.dtype == torch.uint16
+            torch.testing.assert_close(
+                gathered.cpu().to(torch.int32),
+                words.repeat(sum(sizes), 1),
+                rtol=0,
+                atol=0,
+            )
+        local = words.to(device=device, dtype=torch.uint16)
+        output = torch.empty((2 * words.numel(),), dtype=torch.uint16, device=device)
+        pynccl.all_gather(output, local)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pynccl.all_gather(output, local)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            output.cpu().to(torch.int32), words.repeat(2), rtol=0, atol=0
+        )
         print(f"rank {rank}: PyNccl enabled; all-reduce/broadcast/all-gatherv PASS")
         dist.barrier()
     finally:

@@ -11,7 +11,7 @@
 schema = 1
 vllm_version_range = ">=0.31.0,<0.32.0"
 key_interface_count = 10
-target_count = 275
+target_count = 277
 
 [[key_interface]]
 symbol = "vllm.platforms.interface.PlatformEnum"
@@ -96,6 +96,22 @@ module = "vllm/distributed/device_communicators/all2all.py"
 symbol = "DeepEPLLAll2AllManager._make_all2all_kwargs"
 present = true
 fingerprint = "sha256:f5637596191349ab986e9f06b1b069de4fcddf69626e79ed1ef5ace2312a6056"
+
+[[patch_target]]
+name = "vllm.distributed.device_communicators.pynccl.PyNcclCommunicator.all_gather"
+kind = "class"
+module = "vllm/distributed/device_communicators/pynccl.py"
+symbol = "PyNcclCommunicator.all_gather"
+present = true
+fingerprint = "sha256:660ea4061ba1a77dac9365e1d8f1e3f5cf194deb5cfe08f72323d15ad897bd8a"
+
+[[patch_target]]
+name = "vllm.distributed.device_communicators.pynccl.PyNcclCommunicator.all_gatherv"
+kind = "class"
+module = "vllm/distributed/device_communicators/pynccl.py"
+symbol = "PyNcclCommunicator.all_gatherv"
+present = true
+fingerprint = "sha256:9e8e27a1f4c30b49f68fae148ec8b6273f0ceac7189a3d66fd3f80de8663c440"
 
 [[patch_target]]
 name = "vllm.distributed.device_communicators.pynccl.PyNcclCommunicator.suspend"

@@ -256,3 +256,111 @@ def test_qnorm_rope_cache_insert(runtime, mode, tokens):
             cache[..., :448].float(), expected[..., :448], rtol=0, atol=0
         )
     torch.testing.assert_close(kv, kv_original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mode", ["packed", "mxfp8", "bf16", "fp8"])
+@pytest.mark.parametrize("tokens", [0, 1, 17])
+@pytest.mark.parametrize("capture", [False, True])
+def test_dspark_context_kv_insert(runtime, mode, tokens, capture):
+    """Compare KV-only drafting writes with an independent cache-layout oracle."""
+    torch = runtime
+    block_size, blocks = 16, 3
+    generator = torch.Generator(device="cuda").manual_seed(19)
+    kv = torch.randn(
+        tokens, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    original = kv.clone()
+    positions = torch.arange(tokens, device="cuda", dtype=torch.int64) * 3
+    frequency = 10000.0 ** (-torch.arange(0, 64, 2, device="cuda").float() / 64)
+    angles = torch.arange(64, device="cuda").float()[:, None] * frequency
+    rope_cache = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    slots = torch.arange(tokens, device="cuda", dtype=torch.int64).flip(0) + 7
+    slots[2::5] = -1
+    if tokens > 1:
+        slots = slots[:-1]  # Padded KV rows have no corresponding insertion slot.
+    valid = (slots.cpu() >= 0).nonzero(as_tuple=True)[0].to(slots.device)
+    block_ids, offsets = slots[valid] // block_size, slots[valid] % block_size
+    packed = mode in ("packed", "mxfp8")
+    width = 584 if mode == "packed" else 528 if mode == "mxfp8" else 512
+    dtype = (
+        torch.uint8
+        if packed
+        else torch.bfloat16
+        if mode == "bf16"
+        else torch.float8_e4m3fn
+    )
+    # Extra bytes/elements at each block's end exercise the block stride and
+    # guard against writes to adjacent blocks, padding, or unused slots.
+    storage = torch.full(
+        (blocks, block_size * width + 64), 1, device="cuda", dtype=dtype
+    )
+    cache = storage[:, : block_size * width].view(blocks, block_size, width)
+    expected = storage.clone()
+    scale = torch.tensor([0.25], device="cuda") if mode == "fp8" else None
+
+    def insert():
+        torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            kv,
+            cache,
+            slots,
+            positions,
+            rope_cache,
+            block_size,
+            fp8_scale=scale,
+            kv_mxfp8=mode == "mxfp8",
+        )
+
+    insert()
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            insert()
+        storage.fill_(1)
+        graph.replay()
+    torch.cuda.synchronize()
+    rotated = _rope(torch, kv, positions, rope_cache)[: slots.numel()][valid]
+    if packed:
+        rounded = rotated.to(kv.dtype)
+        quant_dim, group_size = (448, 64) if mode == "packed" else (512, 32)
+        groups = (
+            rounded[:, :quant_dim]
+            .float()
+            .reshape(len(valid), quant_dim // group_size, group_size)
+        )
+        exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
+        quantized = (groups * torch.exp2(-exponent[..., None])).clamp(-448, 448)
+        payload_width = 576 if mode == "packed" else 512
+        scale_width = width - payload_width
+        payload = expected[:, : block_size * payload_width].view(
+            blocks, block_size, payload_width
+        )
+        scales = expected[:, block_size * payload_width : block_size * width].view(
+            blocks, block_size, scale_width
+        )
+        payload[block_ids, offsets, :quant_dim] = (
+            quantized.to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .reshape(len(valid), quant_dim)
+        )
+        scales[block_ids, offsets, : quant_dim // group_size] = (exponent + 127).to(
+            torch.uint8
+        )
+        if mode == "packed":
+            actual_rope = storage[:, : block_size * payload_width].view(
+                blocks, block_size, payload_width
+            )[block_ids, offsets, 448:]
+            if len(valid):
+                _assert_ulp(
+                    torch, actual_rope.contiguous().view(kv.dtype), rounded[:, 448:]
+                )
+            payload[block_ids, offsets, 448:] = actual_rope
+            scales[block_ids, offsets, 7] = 0
+        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+    else:
+        encoded = rotated if scale is None else (rotated / scale).clamp(-448, 448)
+        expected[:, : block_size * width].view(blocks, block_size, width)[
+            block_ids, offsets
+        ] = encoded.to(dtype)
+        _assert_ulp(torch, storage, expected)
+        torch.testing.assert_close(storage[:, -64:], expected[:, -64:], rtol=0, atol=0)
+    torch.testing.assert_close(kv, original, rtol=0, atol=0)

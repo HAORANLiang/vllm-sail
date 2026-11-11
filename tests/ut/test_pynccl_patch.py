@@ -71,7 +71,15 @@ def runtime(monkeypatch, patch_utils_module):
         def has_symbol(self, name):
             return name in self._funcs
 
+    gathers = []
+
     class Communicator:
+        def all_gather(self, output, input_, stream=None):
+            gathers.append((output, input_, None, stream))
+
+        def all_gatherv(self, output, input_, sizes, stream=None):
+            gathers.append((output, input_, sizes, stream))
+
         def suspend(self):
             delegated.append(self)
             self._suspended = True
@@ -96,7 +104,7 @@ def runtime(monkeypatch, patch_utils_module):
     load("_pynccl_patch", ROOT / "vllm_sail/patch/enhancement/pynccl.py")
     assert Library.__init__ is not original_init
     assert Communicator.suspend is not original_suspend
-    assert len(patch_utils_module.PATCH_REGISTRY) == 2
+    assert len(patch_utils_module.PATCH_REGISTRY) == 4
 
     def library(path="default.so", symbols=OPTIONAL):
         libraries[path] = types.SimpleNamespace(
@@ -114,6 +122,7 @@ def runtime(monkeypatch, patch_utils_module):
         warnings=warnings,
         library=library,
         wrapper=wrapper,
+        gathers=gathers,
     )
 
 
@@ -165,3 +174,37 @@ def test_repeated_and_distinct_libraries_keep_separate_symbol_caches(runtime):
         *OPTIONAL,
         "ncclCommQueryProperties",
     ]
+
+
+@pytest.mark.parametrize("backend", ["ppu", "cuda"])
+@pytest.mark.parametrize("variable", [False, True])
+@pytest.mark.parametrize("dtype", ["uint16", "float32"])
+def test_gather_transports_packed_scales_without_casting(
+    runtime, monkeypatch, backend, variable, dtype
+):
+    monkeypatch.setitem(
+        sys.modules, "torch", types.SimpleNamespace(uint16="uint16", bfloat16="bf16")
+    )
+
+    class Tensor:
+        def __init__(self, dtype, storage):
+            self.dtype, self.storage = dtype, storage
+
+        def view(self, dtype):
+            return Tensor(dtype, self.storage)
+
+    runtime.platform.backend = backend
+    source = Tensor(dtype, [0, 32768, 65535])
+    target = Tensor(dtype, [0] * 6)
+    communicator = runtime.Communicator()
+    if variable:
+        communicator.all_gatherv(target, source, [3, 3], stream="stream")
+    else:
+        communicator.all_gather(target, source, stream="stream")
+    output, input_, sizes, stream = runtime.gathers[0]
+    expected_dtype = "bf16" if backend == "ppu" and dtype == "uint16" else dtype
+    assert output.dtype == input_.dtype == expected_dtype
+    assert input_.storage is source.storage and output.storage is target.storage
+    assert source.dtype == target.dtype == dtype
+    assert sizes == ([3, 3] if variable else None)
+    assert stream == "stream"

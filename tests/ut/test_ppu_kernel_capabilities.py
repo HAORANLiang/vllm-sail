@@ -886,8 +886,9 @@ def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
     ],
 )
 @pytest.mark.parametrize("explicit_manager", [False, True])
+@pytest.mark.parametrize("dspark", [False, True])
 def test_deepep_factory_uses_bound_globals_and_quantized_protocol(
-    modules, quant_dtype, block, expected, explicit_manager
+    modules, quant_dtype, block, expected, explicit_manager, dspark
 ):
     """Execute the installed factory, including its ordinary non-EP branch."""
     ns = types.SimpleNamespace
@@ -915,6 +916,12 @@ def test_deepep_factory_uses_bound_globals_and_quantized_protocol(
         maybe_roundup_layer_hidden_size=lambda *args: "upstream-roundup",
         make_moe_prepare_and_finalize_no_dp_ep=lambda flag: ("no-ep", flag),
         get_ep_all2all_manager=get_manager,
+        get_current_vllm_config=lambda: ns(
+            speculative_config=ns(use_dspark=lambda: True) if dspark else None,
+            model_config=ns(
+                hf_text_config=ns(n_routed_experts=384, dspark_n_routed_experts=128)
+            ),
+        ),
         DEEPEP_QUANT_BLOCK_SHAPE=[128, 128],
     )
     consumer = modules(
@@ -924,6 +931,14 @@ def test_deepep_factory_uses_bound_globals_and_quantized_protocol(
     modules(
         "vllm_sail.model_executor.layers.fused_moe.prepare_finalize.deepep_ll",
         DeepEPLLPrepareAndFinalize=lambda *args, **kwargs: ns(args=args, **kwargs),
+    )
+    buffer = load_patch(
+        "vllm_sail/model_executor/layers/fused_moe/prepare_finalize/deepep_buffer.py"
+    )
+    modules(
+        "vllm_sail.model_executor.layers.fused_moe.prepare_finalize.deepep_buffer",
+        dspark_buffer_args=buffer.dspark_buffer_args,
+        dspark_uses_shared_buffer=buffer.dspark_uses_shared_buffer,
     )
     load_patch("vllm_sail/patch/enhancement/deepep.py")
     assert consumer.maybe_make_prepare_finalize is provider.maybe_make_prepare_finalize
@@ -937,7 +952,7 @@ def test_deepep_factory_uses_bound_globals_and_quantized_protocol(
     moe.use_deepep_ll_kernels = True
     moe.max_num_tokens = 32
     moe.hidden_dim = 3584
-    moe.num_experts = 16
+    moe.num_experts = 128 if dspark else 16
     result = consumer.maybe_make_prepare_finalize(
         moe,
         ns(quant_dtype=quant_dtype, block_shape=block),
@@ -950,7 +965,10 @@ def test_deepep_factory_uses_bound_globals_and_quantized_protocol(
         result.use_mxfp4_dispatch,
     ) == expected
     assert result.global_to_physical == "g2p"
+    assert result.clean_buffer_before_dispatch is dspark
     assert result.args[0][1]["token_hidden_size"] == 3584
+    assert result.args[0][1]["num_global_experts"] == (384 if dspark else 16)
+    assert result.args[0][1]["num_local_experts"] == (96 if dspark else 4)
     platform.ppu = False
     assert provider.maybe_make_prepare_finalize(moe, None) == "original"
 

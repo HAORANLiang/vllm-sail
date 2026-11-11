@@ -75,12 +75,22 @@ def _maybe_make_prepare_finalize_body(
 
         all_to_all_args: dict[str, Any] = dict()
         handle = all2all_manager.get_handle(all_to_all_args)
-        prepare_finalize = DeepEPHTPrepareAndFinalize(
+        # PPU MODIFICATION: begin
+        if current_platform.is_ppu():
+            from vllm_sail.model_executor.layers.fused_moe.prepare_finalize.deepep_ht import (
+                PPUDeepEPHTPrepareAndFinalize,
+            )
+
+            prepare_finalize_cls = PPUDeepEPHTPrepareAndFinalize
+        else:
+            prepare_finalize_cls = DeepEPHTPrepareAndFinalize
+        prepare_finalize = prepare_finalize_cls(
             handle,
             num_dispatchers=all2all_manager.world_size,
             dp_size=all2all_manager.dp_world_size,
             rank_expert_offset=all2all_manager.rank * moe.num_local_experts,
         )
+        # PPU MODIFICATION: end
 
     elif moe.use_deepep_ll_kernels:
         assert quant_config is not None
@@ -98,6 +108,18 @@ def _maybe_make_prepare_finalize_body(
             num_global_experts=moe.num_experts,
             num_local_experts=moe.num_experts // all2all_manager.world_size,
         )
+        # PPU MODIFICATION: begin
+        clean_buffer_before_dispatch = False
+        if current_platform.is_ppu():
+            from vllm_sail.model_executor.layers.fused_moe.prepare_finalize.deepep_buffer import (
+                dspark_buffer_args,
+                dspark_uses_shared_buffer,
+            )
+
+            vllm_config = get_current_vllm_config()
+            all_to_all_args = dspark_buffer_args(all_to_all_args, vllm_config)
+            clean_buffer_before_dispatch = dspark_uses_shared_buffer(vllm_config)
+        # PPU MODIFICATION: end
         handle = all2all_manager.get_handle(all_to_all_args)
 
         # Note: We may want to use FP8 dispatch just to reduce
@@ -137,6 +159,7 @@ def _maybe_make_prepare_finalize_body(
             # PPU MODIFICATION: begin
             use_int8_dispatch=use_int8_dispatch,
             use_mxfp4_dispatch=use_mxfp4_dispatch,
+            clean_buffer_before_dispatch=clean_buffer_before_dispatch,
             # PPU MODIFICATION: end
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,

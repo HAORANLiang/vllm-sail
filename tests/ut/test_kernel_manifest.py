@@ -227,6 +227,7 @@ def test_accepted_regressions_are_excluded_and_stubbable(shipped: m.Manifest) ->
         "fused_kimi_k3_mla_key_concat_ds_mla_insert",
         "fused_kimi_k3_mla_key_concat_kv_cache_insert",
         "fused_kimi_k3_mla_qkv_quant_kv_cache_fp8_insert",
+        "fused_deepseek_v4_kv_rope_insert",
         "concat_and_cache_mla_rope_fused",
         "selective_scan_fwd",
         "rms_norm_static_fp8_quant",
