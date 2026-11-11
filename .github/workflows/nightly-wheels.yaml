@@ -1,0 +1,94 @@
+name: Nightly wheels
+run-name: Nightly wheels (${{ inputs.branch || 'main' }})
+
+on:
+  schedule:
+    - cron: '0 13 * * *' # 21:00 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Source branch to build; run the workflow itself from main
+        type: string
+        required: true
+        default: main
+
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+
+concurrency:
+  group: nightly-wheels-${{ inputs.branch || 'main' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  prepare:
+    # Keep the workflow definition trusted while allowing a different source branch.
+    if: github.repository == 'vllm-project/vllm-sail' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      branch: ${{ steps.source.outputs.branch }}
+    steps:
+      - name: Pin the source branch to a commit
+        id: source
+        env:
+          SOURCE_BRANCH: ${{ inputs.branch || 'main' }}
+          SOURCE_EVENT: ${{ github.event_name }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$SOURCE_BRANCH"
+          if [[ "$SOURCE_EVENT" == schedule ]]; then
+            sha="$TRIGGER_SHA"
+          else
+            remote="$(git ls-remote --exit-code --refs \
+              "https://github.com/${GITHUB_REPOSITORY}.git" "refs/heads/$SOURCE_BRANCH")"
+            read -r sha ref <<< "$remote"
+            test "$ref" = "refs/heads/$SOURCE_BRANCH"
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'sha=%s\nbranch=%s\n' "$sha" "$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/_ppu-build.yaml
+    with:
+      pr_head_sha: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    needs: build
+    uses: t-head/ci-infra/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      artifact_name: ppu-wheels-${{ github.run_id }}
+      template_repository: t-head/ci-infra
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  downloads:
+    name: Wheel download directory
+    needs: [prepare, build, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Show wheel downloads and source identity
+        env:
+          UPLOAD_URL: ${{ needs.publish.outputs.upload_url }}
+          SOURCE_BRANCH: ${{ needs.prepare.outputs.branch }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          BUILD_IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          test -n "$UPLOAD_URL"
+          {
+            printf '## Wheel downloads\n\n'
+            printf 'Wheel directory: %s\n\n' "$UPLOAD_URL"
+            printf 'Source branch: `%s`\n\nSource commit: `%s`\n\n' "$SOURCE_BRANCH" "$SOURCE_SHA"
+            printf 'Build image: `%s`\n\n' "$BUILD_IMAGE"
+            printf 'Both wheels and wheel-manifest.json are also in Actions artifact `ppu-wheels-%s` (14 days).\n\n' "$GITHUB_RUN_ID"
+            printf 'Compilation checks only; device and model tests are separate.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
