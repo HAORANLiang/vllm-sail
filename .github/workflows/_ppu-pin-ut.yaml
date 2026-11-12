@@ -42,12 +42,16 @@ jobs:
           artifacts="$(mktemp -d "${RUNNER_TEMP}/ppu-pin-artifacts.XXXXXX")"
           source_rel=".ppu-pin-source-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source="${GITHUB_WORKSPACE}/${source_rel}"
+          upstream_rel=".ppu-pin-upstream-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          upstream="${GITHUB_WORKSPACE}/${upstream_rel}"
           {
             printf 'GIT_CONFIG_GLOBAL=%s\n' "$config"
             printf 'wheels=%s\n' "$wheels"
             printf 'artifacts=%s\n' "$artifacts"
             printf 'source_rel=%s\n' "$source_rel"
             printf 'source=%s\n' "$source"
+            printf 'upstream_rel=%s\n' "$upstream_rel"
+            printf 'upstream=%s\n' "$upstream"
           } >> "$GITHUB_OUTPUT"
           printf 'GIT_CONFIG_GLOBAL=%s\n' "$config" >> "$GITHUB_ENV"
 
@@ -73,6 +77,29 @@ jobs:
           SOURCE_DIR: ${{ steps.runtime.outputs.source }}
         run: test "$(git -c safe.directory="$SOURCE_DIR" -C "$SOURCE_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
 
+      - name: Resolve the pinned upstream ref
+        id: upstream
+        env:
+          SOURCE_DIR: ${{ steps.runtime.outputs.source }}
+        run: |
+          pin="$(tr -d '[:space:]' < "$SOURCE_DIR/.github/vllm-main-verified.commit")"
+          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Invalid upstream pin"; exit 1; }
+          echo "ref=$pin" >> "$GITHUB_OUTPUT"
+
+      - name: Check out pinned upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ steps.upstream.outputs.ref }}
+          path: ${{ steps.runtime.outputs.upstream_rel }}
+          persist-credentials: false
+
+      - name: Verify upstream revision
+        env:
+          EXPECTED_SHA: ${{ steps.upstream.outputs.ref }}
+          UPSTREAM_DIR: ${{ steps.runtime.outputs.upstream }}
+        run: test "$(git -c safe.directory="$UPSTREAM_DIR" -C "$UPSTREAM_DIR" rev-parse HEAD)" = "$EXPECTED_SHA"
+
       - name: Download CI-built wheels
         uses: actions/download-artifact@v4
         with:
@@ -86,6 +113,7 @@ jobs:
         env:
           PPU_CI_SOURCE_DIR: ${{ steps.runtime.outputs.source }}
           PPU_CI_SOURCE_SHA: ${{ inputs.pr_head_sha || github.sha }}
+          PPU_CI_UPSTREAM_DIR: ${{ steps.runtime.outputs.upstream }}
           PPU_CI_WHEELS_DIR: ${{ steps.runtime.outputs.wheels }}
           PPU_CI_ARTIFACT_DIR: ${{ steps.runtime.outputs.artifacts }}
           PPU_CI_DEVICE_COUNT: "1"
