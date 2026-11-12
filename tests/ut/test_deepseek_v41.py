@@ -81,8 +81,8 @@ def test_dspark_context_projection_inherits_source_wkv_precision(
             model_config=SimpleNamespace(hf_config=hf)
         ),
     )
-    module.is_layer_skipped = (
-        lambda *, prefix, ignored_layers, **kwargs: prefix in ignored_layers
+    module.is_layer_skipped = lambda *, prefix, ignored_layers, **kwargs: (
+        prefix in ignored_layers
     )
     modules(
         "compressed_tensors.quantization",
@@ -234,12 +234,27 @@ def test_v41_selector_preserves_cuda_and_other_backends(modules):
     upstream, ppu, other = (type(name, (), {}) for name in ("Upstream", "PPU", "Other"))
     platform = SimpleNamespace(ppu=True)
     modules(
+        "vllm.logger",
+        init_logger=lambda name: SimpleNamespace(info_once=lambda *a, **k: None),
+    )
+    modules(
         "vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: platform.ppu)
     )
     modules(
         "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=upstream
     )
     modules("vllm_sail.models.deepseek_v41.flashmla", DeepseekV41FlashMLAAttention=ppu)
+    # PR#229 selector lazily imports the mega-attn classes and calls fused_gate;
+    # stub both so the fused path stays closed and the baseline fallback holds.
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn",
+        DeepseekV4MegaAttnAttention=type("UpstreamMega", (), {}),
+    )
+    modules(
+        "vllm_sail.models.deepseek_v41.flash_mla_mega_attn",
+        PPUDeepseekV4MegaAttnAttention=type("PPUMega", (), {}),
+        fused_gate=lambda vllm_config: (False, "gate-test: fused path forced closed"),
+    )
 
     def original(config):
         return config

@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Select the V4.1 PPU FlashMLA subclass at the CUDA selector boundary."""
+"""Select the V4.1 PPU FlashMLA subclass at the CUDA selector boundary.
+
+PPU MODIFICATION (M2, fused norm-rope): the selector now has a second PPU
+branch. When the PR#54 fused norm-rope sparse attention path passes every
+gate (env switch, flash_mla wheel capability, PPU SM80/SM89, 528B KV record
+switch, V4.1 head/group topology), the PPU mega-attention subclass is
+selected; otherwise the selector falls back to the existing PPU baseline
+subclass, and one ``info_once`` line records *which* gate closed so every run
+ledger can prove which attention path was live.
+"""
 
 import sys
 
+from vllm.logger import init_logger
 from vllm.models.deepseek_v41.nvidia.flashmla import (
     DeepseekV4FlashMLAAttention as UpstreamFlashMLAAttention,
 )
@@ -10,6 +20,8 @@ from vllm.platforms import current_platform
 
 from vllm_sail.models.deepseek_v41.flashmla import DeepseekV41FlashMLAAttention
 from vllm_sail.patch.utils import PATCH_MARKER, patch
+
+logger = init_logger(__name__)
 
 _MODULE = "vllm.models.deepseek_v41.nvidia.model"
 _TARGET = f"{_MODULE}._select_dsv4_attn_cls"
@@ -20,7 +32,10 @@ _TARGET = f"{_MODULE}._select_dsv4_attn_cls"
     "_select_dsv4_attn_cls",
     reason=(
         "PPU requires unpadded FlashMLA heads and an MXFP8 BF16 output projection "
-        "while retaining V4.1 shared KV/index metadata and CUDA model logic."
+        "while retaining V4.1 shared KV/index metadata and CUDA model logic. "
+        "With the PR#54 FlashMLA wheel and both runtime switches on, PPU instead "
+        "selects the fused norm-rope mega-attention subclass (528B KV record, "
+        "padded 64/128 heads, QuantizedActivation output)."
     ),
     affected_versions=">=0.32.0,<0.33.0",
     remove_when="vLLM exposes a V4.1 attention-class registry supporting PPU overrides.",
@@ -28,7 +43,40 @@ _TARGET = f"{_MODULE}._select_dsv4_attn_cls"
 def _select_dsv4_attn_cls(vllm_config):
     original = getattr(_select_dsv4_attn_cls, PATCH_MARKER)[_TARGET]
     selected = original(vllm_config)
-    if current_platform.is_ppu() and selected is UpstreamFlashMLAAttention:
+    if not current_platform.is_ppu():
+        return selected
+
+    # Lazy import: keeps patch installation cheap and guarantees a baseline
+    # wheel (b1b0e1f, no fused API) can never crash at import time.
+    from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import (
+        DeepseekV4MegaAttnAttention as UpstreamMegaAttnAttention,
+    )
+
+    from vllm_sail.models.deepseek_v41.flash_mla_mega_attn import (
+        PPUDeepseekV4MegaAttnAttention,
+        fused_gate,
+    )
+
+    if selected in (
+        UpstreamFlashMLAAttention,
+        UpstreamMegaAttnAttention,
+        DeepseekV41FlashMLAAttention,
+    ):
+        ok, gate_report = fused_gate(vllm_config)
+        if ok:
+            logger.info_once(
+                "[vllm_sail] DSV4.1 attention class: "
+                "PPUDeepseekV4MegaAttnAttention (fused norm-rope; %s)",
+                gate_report,
+            )
+            return PPUDeepseekV4MegaAttnAttention
+        logger.info_once(
+            "[vllm_sail] DSV4.1 fused norm-rope gate closed (%s); "
+            "falling back to the baseline attention class",
+            gate_report,
+        )
+
+    if selected in (UpstreamFlashMLAAttention, UpstreamMegaAttnAttention):
         return DeepseekV41FlashMLAAttention
     return selected
 

@@ -52,6 +52,8 @@ if TYPE_CHECKING:
     VLLM_SAIL_NVTX_PROFILE: bool = False
     VLLM_SAIL_NVTX_DUMP_TOPK: bool = False
     VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN: bool = False
+    VLLM_SAIL_FUSED_NORM_ROPE_ATTN: bool = False
+    VLLM_SAIL_PPU_KV_MXFP8: bool = False
     VLLM_DEEPEPLL_RECV_HOOK: bool = True
     VLLM_GDN_DECODE_KERNEL: str = "auto"
 
@@ -74,6 +76,8 @@ if TYPE_CHECKING:
     VLLM_PPU_NVTX_PROFILE: bool = False
     VLLM_PPU_NVTX_DUMP_TOPK: bool = False
     VLLM_PPU_NVTX_VFA_DUMP_SEQLEN: bool = False
+    VLLM_PPU_FUSED_NORM_ROPE_ATTN: bool = False
+    VLLM_PPU_PPU_KV_MXFP8: bool = False
 
 _TRUTHY = ("true", "1", "yes", "on")
 
@@ -216,6 +220,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # -- Attention / linear attention --------------------------------------
     # Legacy getter only. Current PLA/Triton dispatch uses VLLM_SAIL_USE_PLA.
     "VLLM_SAIL_FUSED_GDN_DECODE": _bool("VLLM_SAIL_FUSED_GDN_DECODE", True),
+    # -- DeepSeek V4.1 fused norm-rope attention (FlashMLA PR#54 wheel) -----
+    # Master switch for the PPU fused norm-rope sparse-attention path. Default
+    # OFF (opt-in): the baseline attention class runs unless the user sets 1.
+    # Enabling also requires the PR#54 wheel (capability probe), PPU SM80/SM89,
+    # the 528B KV record switch below, and a compatible V4.1 head/group
+    # topology; when any gate is closed the selector falls back to baseline
+    # and logs the reason (A-B-A control: set 0 to force baseline even with
+    # the fused wheel installed).
+    "VLLM_SAIL_FUSED_NORM_ROPE_ATTN": _bool("VLLM_SAIL_FUSED_NORM_ROPE_ATTN", False),
+    # KV record format for DeepSeek V4.1 on PPU: True -> 528B V4.1 MXFP8
+    # record (required by the fused decode kernel; opt-in together with the
+    # master switch above), False (default) -> 584B V4 record, identical to
+    # the upstream non-SM100 default, so an unconfigured process behaves
+    # exactly like baseline.
+    # Read once per process by the dsv41_kv_record patch, which also prints
+    # the forensic line "[VLLM_SAIL] kv_mxfp8=<bool> kv_bytes_per_token=<n>".
+    "VLLM_SAIL_PPU_KV_MXFP8": _bool("VLLM_SAIL_PPU_KV_MXFP8", False),
     # -- Distributed MoE ---------------------------------------------------
     # DeepEP low-latency deferred recv hook. The hook only pays off on backends
     # that can overlap the deferred receive with other compute; setting this to

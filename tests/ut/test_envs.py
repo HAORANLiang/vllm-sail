@@ -31,6 +31,8 @@ BOOL_DEFAULTS = {
     "NVTX_PROFILE": False,
     "NVTX_DUMP_TOPK": False,
     "NVTX_VFA_DUMP_SEQLEN": False,
+    "FUSED_NORM_ROPE_ATTN": False,
+    "PPU_KV_MXFP8": False,
 }
 BACKENDS = ("MOE_BACKEND", "DENSE_BACKEND")
 # String env vars with a non-None default and no legacy VLLM_PPU_* alias.
