@@ -1,11 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 """V4.1 integration contracts; CPU tests never import torch or vLLM."""
 
+import ast
+import re
 from types import SimpleNamespace
 
 import pytest
 
 from tests.support.modules import load_patch
+from tests.support.source import ROOT, definition, function
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("record_bytes", [528, 584])
+def test_cache_gather_dispatch_after_preload(
+    modules, upstream_source_root, ppu, record_bytes
+):
+    calls = []
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules(
+        "vllm.utils.import_utils", has_cutedsl=lambda: True, has_humming=lambda: True
+    )
+    provider = modules("vllm.utils.import_utils")
+    cache = modules(
+        "vllm.models.deepseek_v41.common.ops.cache_utils",
+        has_cutedsl=provider.has_cutedsl,
+        V41_BYTES_PER_TOKEN=528,
+        V41_NVFP4_BYTES_PER_TOKEN=288,
+        V41_QUANT_BLOCK=32,
+        dequantize_and_gather_k_cache_triton=lambda *a, **kw: calls.append("triton"),
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl",
+        _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL=lambda **kw: calls.append("cute"),
+    )
+    gather = function(
+        upstream_source_root / "vllm/models/deepseek_v41/common/ops/cache_utils.py",
+        "dequantize_and_gather_k_cache",
+        cache.__dict__,
+    )
+    load_patch("vllm_sail/patch/enhancement/import_gates.py")
+    gather(None, SimpleNamespace(shape=(4, 64, record_bytes)), None, None, None, 64, 3)
+    assert calls == ["triton" if ppu else "cute"]
 
 
 @pytest.fixture
@@ -321,7 +358,15 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
     )
     modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
-    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: True))
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=object)
+    modules("torch", int8="int8")
+    modules("vllm_sail.models.deepseek_v41.config", int8_w8a8_enabled=lambda: False)
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True, is_device_capability=lambda cap: False
+        ),
+    )
     module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
     attn = module.DeepseekV41FlashMLAAttention()
     attn.__dict__.update(
@@ -349,7 +394,140 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
     assert attn._forward_prefill is Upstream._forward_prefill
 
 
-def test_v41_draft_inherits_its_own_loader_and_execution(modules):
+@pytest.mark.parametrize(
+    "ppu,capability,contract",
+    [
+        (True, (8, 0), True),
+        (True, (8, 0), False),
+        (True, (8, 9), True),
+        (True, (8, 9), False),
+        (True, (9, 0), True),
+        (False, (8, 0), True),
+        (False, (8, 9), True),
+    ],
+)
+@pytest.mark.parametrize("weight_dtype", ["int8", "bf16"])
+@pytest.mark.parametrize("num_heads", [2, 4, 8, 16, 32, 64])
+def test_v41_projection_dispatches_by_quantization(
+    modules, ppu, capability, contract, weight_dtype, num_heads
+):
+    calls = []
+
+    class Upstream:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return 64
+
+        def _o_proj(self, *args):
+            calls.append(("upstream", args, {}))
+            return "upstream"
+
+    class Backend:
+        @classmethod
+        def supports_compute_capability(cls, cap):
+            return cap.major in (9, 10)
+
+    class PPUV4:
+        @classmethod
+        def get_padded_num_q_heads(cls, heads):
+            return heads + 128
+
+        def _o_proj(self, *args):
+            calls.append(("ppuv4", args, {}))
+            return "ppuv4"
+
+    class Output:
+        def __getitem__(self, slices):
+            assert slices == (slice(None), slice(None, num_heads))
+            return "actual_heads"
+
+    def int8(*args, **kw):
+        calls.append(("int8", args, kw))
+        return "int8"
+
+    def unavailable(*args):
+        raise AssertionError("FlashMLA must reuse the model's published decision")
+
+    modules("torch", int8="int8")
+    modules("vllm.config", get_current_vllm_config=unavailable)
+    # DeepseekV41ForCausalLM publishes is_ppu() and uses_int8_w8a8(config).
+    published = SimpleNamespace(value=ppu and contract)
+    modules(
+        "vllm_sail.models.deepseek_v41.config",
+        uses_int8_w8a8=unavailable,
+        int8_w8a8_enabled=lambda: published.value,
+    )
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(is_ppu=lambda: ppu),
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda *args: None,
+    )
+    modules(
+        "vllm.models.deepseek_v4.nvidia.ops.o_proj",
+        deep_gemm_fp8_o_proj=lambda *args, **kwargs: "bf16",
+    )
+    modules("vllm_sail.models.deepseek_v4.ops.o_proj", deep_gemm_int8_o_proj=int8)
+    modules("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=PPUV4)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flashmla", DeepseekV4FlashMLAAttention=Upstream
+    )
+    modules("vllm.models.deepseek_v41.sparse_mla", DeepseekV4FlashMLABackend=Backend)
+    module = load_patch("vllm_sail/models/deepseek_v41/flashmla.py")
+    cls = module.DeepseekV41FlashMLAAttention
+    attn = cls()
+    # _o_proj uses the construction-time snapshot, not the current flag.
+    published.value = not published.value
+    attn.__dict__.update(
+        _o_proj_block_size=128,
+        wo_a=SimpleNamespace(
+            weight=SimpleNamespace(
+                dtype=weight_dtype,
+                element_size=lambda: 1 if weight_dtype == "int8" else 2,
+            )
+        ),
+        _wo_b_proj=object(),
+        wo_b=object(),
+        rotary_emb=SimpleNamespace(cos_sin_cache=object()),
+        n_local_groups=2,
+        n_local_heads=num_heads,
+        nope_head_dim=448,
+        rope_head_dim=64,
+        o_lora_rank=1024,
+    )
+    expected = (
+        "int8"
+        if ppu and contract and weight_dtype == "int8"
+        else "ppuv4"
+        if ppu and weight_dtype == "int8"
+        else "bf16"
+        if ppu
+        else "upstream"
+    )
+    assert attn._o_proj(Output(), object()) == expected
+    if expected == "int8":
+        _, args, kw = calls[-1]
+        assert (
+            args[0] == "actual_heads"
+            and args[3] is attn.wo_a
+            and args[4] is attn._wo_b_proj
+        )
+        assert kw["einsum_recipe"] == (1, 1, 128)
+        assert kw["heads_per_group"] == num_heads // attn.n_local_groups
+    # PPU always uses the PPU V4 padding; the INT8 projection slices actual heads.
+    expected_heads = num_heads + 128 if ppu else 64
+    assert cls.get_padded_num_q_heads(num_heads) == expected_heads
+    backend = module.PPUDeepseekV41FlashMLABackend
+    for major, minor in ((8, 0), (8, 9), (9, 0), (10, 0)):
+        assert backend.supports_compute_capability(
+            SimpleNamespace(major=major, minor=minor)
+        ) is (ppu or major in (9, 10))
+
+
+@pytest.fixture
+def v41_draft(modules):
     class Upstream:
         load_weights = object()
         forward = object()
@@ -365,21 +543,287 @@ def test_v41_draft_inherits_its_own_loader_and_execution(modules):
         return mapper
 
     modules("vllm.model_executor.models.interfaces", SupportsQuant=SupportsQuant)
-    modules(
+    provider = modules(
         "vllm.models.deepseek_v41.nvidia.dspark", DSparkDeepseekV4ForCausalLM=Upstream
     )
     modules(
         "vllm.models.deepseek_v41.nvidia.model",
         _make_deepseek_v4_weights_mapper=make_mapper,
     )
-    draft = load_patch(
-        "vllm_sail/models/deepseek_v41/dspark.py"
-    ).DSparkDeepseekV41ForCausalLM
+    module = load_patch("vllm_sail/models/deepseek_v41/dspark.py")
+    draft = module.DSparkDeepseekV41ForCausalLM
     assert issubclass(draft, SupportsQuant)
-    assert (
-        draft.load_weights is Upstream.load_weights
-        and draft.forward is Upstream.forward
-    )
+    assert draft.load_weights is not Upstream.load_weights
+    assert draft.load_weights.__globals__ is provider.__dict__
+    assert draft.forward is Upstream.forward
     assert draft.hf_to_vllm_mapper is mapper
     assert mapper_args == [("fp4", "weight_scale")]
     assert draft.packed_modules_mapping["fused_wqa_wkv"] == ["wq_a", "wkv"]
+    return draft, provider
+
+
+def test_v41_draft_preserves_its_own_execution(v41_draft):
+    assert "forward" not in vars(v41_draft[0])
+
+
+@pytest.mark.parametrize("expert_dtype", ["int8", "int4", "fp4", "fp8"])
+@pytest.mark.parametrize("dense_scale", ["weight_scale", "weight_scale_inv"])
+@pytest.mark.parametrize("mega", [False, True])
+@pytest.mark.parametrize("draft_experts", [0, 2])
+def test_v41_draft_loads_scales_from_actual_destinations(
+    v41_draft, expert_dtype, dense_scale, mega, draft_experts
+):
+    """Reproduce the fused attention KeyError and cover experts, shared layers and heads."""
+    cls, provider = v41_draft
+    calls, counts = [], []
+
+    def mapping(count):
+        counts.append(count)
+        return [
+            ("experts.w13_", "experts.0.w1.", 0, "w1"),
+            ("experts.w13_", "experts.0.w3.", 0, "w3"),
+            ("experts.w2_", "experts.0.w2.", 0, "w2"),
+        ]
+
+    provider.make_deepseek_v4_expert_params_mapping = mapping
+    provider.fused_moe_make_expert_params_mapping = lambda _, **kw: mapping(
+        kw["num_experts"]
+    )
+    provider._EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+    provider.torch = SimpleNamespace(float8_e8m0fnu="e8m0", uint8="uint8")
+    provider.get_tensor_model_parallel_world_size = lambda: 8
+    provider.get_tensor_model_parallel_rank = lambda: 1
+    provider.default_weight_loader = lambda p, w: calls.append((p.name, w, (), {}))
+    provider.logger = SimpleNamespace(info_once=lambda *args: None)
+    provider._duplicate_context_wkv_weights = lambda weights, count: weights
+    provider.extract_layer_index = lambda name: int(name.split(".")[2])
+
+    def parameter(name):
+        def load(param, weight, *args, **kw):
+            calls.append((param.name, weight, args, kw))
+            return True
+
+        return SimpleNamespace(name=name, weight_loader=load)
+
+    expert_scale = "weight_scale_inv" if expert_dtype == "fp8" else "weight_scale"
+    pairs = [
+        ("context_wkv_proj.scale", f"model.context_wkv_proj.{dense_scale}", 0),
+        (
+            "mtp.0.attn.wq_a.scale",
+            f"model.layers.0.attn.fused_wqa_wkv.{dense_scale}",
+            0,
+        ),
+        ("mtp.0.attn.wkv.scale", f"model.layers.0.attn.fused_wqa_wkv.{dense_scale}", 1),
+        ("mtp.0.attn.wq_a.weight", "model.layers.0.attn.fused_wqa_wkv.weight", 0),
+        (
+            "mtp.0.ffn.shared_experts.w1.scale",
+            f"model.layers.0.ffn.shared_experts.gate_up_proj.{dense_scale}",
+            0,
+        ),
+        (
+            "mtp.0.ffn.shared_experts.w3.scale",
+            f"model.layers.0.ffn.shared_experts.gate_up_proj.{dense_scale}",
+            1,
+        ),
+        (
+            "mtp.0.ffn.shared_experts.w2.scale",
+            f"model.layers.0.ffn.shared_experts.down_proj.{dense_scale}",
+            None,
+        ),
+        # Mixed quantization: the first scale suffix cannot represent the entire model.
+        ("mtp.0.attn.wo_a.scale", "model.layers.0.attn.wo_a.weight_scale_inv", None),
+        ("mtp.0.main_proj.scale", "model.main_proj.weight_scale", None),
+        ("mtp.2.markov_head.embed.weight", "model.markov_head.markov_w1.weight", None),
+        (
+            "mtp.0.ffn.experts.0.w1.scale",
+            f"model.layers.0.ffn.experts.w13_{expert_scale}",
+            "w1",
+        ),
+        (
+            "mtp.0.ffn.experts.0.w3.scale",
+            f"model.layers.0.ffn.experts.w13_{expert_scale}",
+            "w3",
+        ),
+        (
+            "mtp.0.ffn.experts.0.w2.scale",
+            f"model.layers.0.ffn.experts.w2_{expert_scale}",
+            "w2",
+        ),
+        ("mtp.0.ffn.experts.0.w2.weight", "model.layers.0.ffn.experts.w2_weight", "w2"),
+        (
+            "mtp.0.ffn.gate.bias",
+            "model.layers.0.ffn.gate.e_score_correction_bias",
+            None,
+        ),
+    ]
+    params = {target: parameter(target) for _, target, _ in pairs}
+    model = cls()
+    model.config = SimpleNamespace(
+        n_routed_experts=384,
+        dspark_n_routed_experts=draft_experts,
+        expert_dtype=expert_dtype,
+        num_attention_heads=64,
+    )
+    model.model = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                ffn=SimpleNamespace(
+                    use_native_mega_moe=mega,
+                    experts=SimpleNamespace(has_fused_shared_experts=False),
+                )
+            )
+        ],
+        confidence_head=object(),
+    )
+    model.linear_scale_name = "weight_scale_inv"
+    model.pad_shared_expert = False
+    model.named_parameters = lambda: params.items()
+    processed = []
+    model.process_weights_after_loading = lambda: processed.append(True)
+
+    def remap(name):
+        if name.startswith("context_wkv_proj."):
+            return "model." + name
+        match = re.fullmatch(r"mtp\.(\d+)\.(.*)", name)
+        if not match:
+            return None
+        stage, rest = match.groups()
+        if rest.startswith("markov_head.embed."):
+            return "model.markov_head.markov_w1." + rest.removeprefix(
+                "markov_head.embed."
+            )
+        if rest.startswith("main_proj."):
+            return "model." + rest
+        return f"model.layers.{stage}.{rest}"
+
+    model._remap_dspark_name = remap
+    weights = [SimpleNamespace(dtype="int8", shard_id=0) for _ in pairs]
+    stream = [(name, weights[i]) for i, (name, _, _) in enumerate(pairs)]
+    stream.insert(0, ("layers.0.attn.wq_a.scale", object()))
+    assert model.load_weights(iter(stream)) == set(params)
+    assert counts == [draft_experts or 384]
+    assert processed == []  # The main loader defers processing to the model runner.
+    assert model.model.confidence_head is None
+    assert len(calls) == len(pairs)
+    for call, (_, target, shard), weight in zip(calls, pairs, weights, strict=False):
+        assert call[:2] == (target, weight)
+        if isinstance(shard, str):
+            assert call[2] == (target,)
+            assert call[3] == dict(shard_id=shard, expert_id=0, return_success=True)
+        else:
+            assert call[2] == (() if shard is None else (shard,))
+            assert call[3] == {}
+
+
+def test_v41_scale_resolution_preserves_existing_and_unknown_names(v41_draft):
+    resolve = v41_draft[0]._resolve_scale_name
+    params = {"layer.weight_scale": object(), "layer.weight_scale_inv": object()}
+    for name in (
+        *params,
+        "missing.weight_scale_inv",
+        "layer.input_scale",
+        "layer.weight",
+    ):
+        assert resolve(name, params) == name
+    assert (
+        resolve("layer.weight_scale_inv", {"layer.weight_scale": 1})
+        == "layer.weight_scale"
+    )
+    assert (
+        resolve("layer.weight_scale", {"layer.weight_scale_inv": 1})
+        == "layer.weight_scale_inv"
+    )
+
+
+@pytest.mark.upstream_source
+def test_v41_draft_loader_keeps_upstream_body_except_scale_resolution(
+    upstream_source_root,
+):
+    """Match the installed V4.1 loader after removing marked changes, without V4 context-KV."""
+    path = ROOT / "vllm_sail/models/deepseek_v41/dspark.py"
+    lines, inside = [], False
+    for line in path.read_text().splitlines():
+        if "PPU MODIFICATION: begin" in line:
+            inside = True
+        elif "PPU MODIFICATION: end" in line:
+            inside = False
+        elif not inside:
+            lines.append(line)
+    tree = ast.parse("\n".join(lines))
+    local = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+    )
+    upstream = definition(
+        upstream_source_root / "vllm/models/deepseek_v41/nvidia/dspark.py",
+        "DSparkDeepseekV4ForCausalLM.load_weights",
+    )
+    # Moving the function out of its class changes docstring indentation, not logic.
+    local.body[0] = upstream.body[0]
+    assert ast.dump(local, include_attributes=False) == ast.dump(
+        upstream, include_attributes=False
+    )
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("int8", [False, True])
+def test_v41_model_resolves_int8_at_construction_like_v4(
+    modules, monkeypatch, ppu, int8
+):
+    calls = []
+    published = []
+    selected = ppu and int8
+    original_mapper, mapped = object(), object()
+    config = SimpleNamespace(quant_config=None)
+
+    class Base:
+        hf_to_vllm_mapper = original_mapper
+
+        def __init__(self, **kwargs):
+            # Upstream layers are built here and must already see the decision.
+            calls.append(("construct", kwargs, list(published)))
+
+        def forward(self, *args, **kwargs):
+            return 17
+
+    def recognize(value):
+        assert value is config
+        calls.append(("recognize",))
+        return int8
+
+    def map_weights(mapper):
+        assert mapper is original_mapper
+        calls.append(("map",))
+        return mapped
+
+    def unavailable(*args, **kwargs):
+        raise AssertionError("the V4.1 model must not touch the global config")
+
+    modules(
+        "vllm.config",
+        set_current_vllm_config=unavailable,
+        get_current_vllm_config=unavailable,
+    )
+    modules("vllm.models.deepseek_v41.nvidia.vl_model", DeepseekV41ForCausalLM=Base)
+    modules("vllm.platforms", current_platform=SimpleNamespace(is_ppu=lambda: ppu))
+    modules(
+        "vllm_sail.models.deepseek_v41.config",
+        uses_int8_w8a8=recognize,
+        set_int8_w8a8=published.append,
+    )
+    module = load_patch("vllm_sail/models/deepseek_v41/model.py")
+    monkeypatch.setattr(module, "int8_weights_mapper", map_weights)
+    model = module.DeepseekV41ForCausalLM(vllm_config=config, prefix="model")
+    assert [call[0] for call in calls] == (
+        (["recognize"] if ppu else []) + ["construct"] + (["map"] if selected else [])
+    )
+    construct = next(call for call in calls if call[0] == "construct")
+    assert construct[1:] == (dict(vllm_config=config, prefix="model"), [selected])
+    assert published == [selected]
+    assert model.hf_to_vllm_mapper is (mapped if selected else original_mapper)
+    assert Base.hf_to_vllm_mapper is original_mapper
+    # Like the PPU V4 model, forward is inherited unchanged.
+    assert "forward" not in vars(module.DeepseekV41ForCausalLM)
+    assert model.forward(1, 2, 3, 4, lookback_token_ids=5) == 17
+    assert not hasattr(model, "_v41_int8_config")

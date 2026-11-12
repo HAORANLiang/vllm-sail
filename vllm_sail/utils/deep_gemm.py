@@ -400,9 +400,7 @@ def _lazy_init() -> None:
     _activation_mode_impl = getattr(_dg, "ActivationMode", None)
     _quant_mode_impl = getattr(_dg, "QuantMode", None)
     _activation_and_mul_impl = getattr(_dg, "activation_and_mul", None)
-    _activation_and_mul_masked_impl = getattr(
-        _dg, "activation_and_mul_masked", None
-    )
+    _activation_and_mul_masked_impl = getattr(_dg, "activation_and_mul_masked", None)
     DeepGemmQuantScaleFMT.init_oracle_cache()
 
 
@@ -899,11 +897,11 @@ def int8_paged_mqa_logits(
     """Compute INT8 MQA logits using paged KV-cache.
 
     Args:
-        q_fp8: Query tensor of shape [B, next_n, H, D]. Casted to
-            `torch.float8_e4m3fn` by caller.
-        kv_cache_fp8: Paged KV-cache in packed FP8+scale layout with shape
-            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. The last
-            4 bytes per (block,pos) store the `float` dequant scale.
+        q_fp8: Legacy argument name for INT8 Q of shape [B, next_n, H, D],
+            dtype `torch.int8`; the Q scale is folded into `weights`.
+        kv_cache_fp8: Legacy argument name for the packed INT8 cache with shape
+            [num_blocks, block_size, 1, D+4], dtype `torch.uint8`. Each page
+            stores an INT8 value plane followed by an FP32 scale plane.
         weights: Tensor of shape [B * next_n, H], dtype `torch.float32`.
         context_lens: Tensor of shape [B], dtype int32; effective context length
             for each batch element.

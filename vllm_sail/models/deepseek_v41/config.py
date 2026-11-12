@@ -3,6 +3,50 @@
 
 import re
 
+# Resolved once while constructing the V4.1 target model. Module-free operators
+# read it at forward time instead of querying the global vLLM config.
+_int8_w8a8 = False
+
+
+def set_int8_w8a8(enabled):
+    """Record the construction-time W8A8 decision; the last target model wins."""
+    global _int8_w8a8
+    _int8_w8a8 = bool(enabled)
+
+
+def int8_w8a8_enabled():
+    return _int8_w8a8
+
+
+def uses_int8_w8a8(vllm_config):
+    """Accept only V4.1 symmetric W8A8 channel/token compressed-tensors contracts."""
+    quant = getattr(vllm_config, "quant_config", None)
+    if quant is None or quant.get_name() != "compressed-tensors":
+        return False
+    model = getattr(vllm_config, "model_config", None)
+    hf = getattr(model, "hf_config", None)
+    if getattr(hf, "model_type", None) not in ("deepseek_v41", "deepseek_v41_text"):
+        return False
+    raw = getattr(hf, "quantization_config", None) or {}
+    if raw.get("expert_dtype") != "int8" or raw.get("format") != "int-quantized":
+        return False
+    for group in raw.get("config_groups", {}).values():
+        weight = group.get("weights") or {}
+        activation = group.get("input_activations") or {}
+        if (
+            "Linear" in group.get("targets", [])
+            and weight.get("type") == activation.get("type") == "int"
+            and weight.get("num_bits") == activation.get("num_bits") == 8
+            and weight.get("strategy") == "channel"
+            and activation.get("strategy") == "token"
+            and weight.get("symmetric") is True
+            and activation.get("symmetric") is True
+            and weight.get("dynamic") is False
+            and activation.get("dynamic") is True
+        ):
+            return True
+    return False
+
 
 def normalize_expert_dtype(vllm_config):
     """Canonicalize the exporter alias in resolved configs, never checkpoint files."""

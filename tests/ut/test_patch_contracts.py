@@ -107,9 +107,7 @@ def imported_consumer_calls(root):
         parts = path.relative_to(root).with_suffix("").parts
         module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
         package = (
-            module.split(".")
-            if path.name == "__init__.py"
-            else module.split(".")[:-1]
+            module.split(".") if path.name == "__init__.py" else module.split(".")[:-1]
         )
         tree = ast.parse(path.read_text())
         imports = {}
@@ -425,13 +423,11 @@ else:
     plugin = tmp_path / "plugin.py"
     parameters = "*args, **kwargs" if valid else ""
     declaration = (
-        '@patch("vllm.provider", "run")\n'
-        f"def replacement({parameters}): pass\n"
+        f'@patch("vllm.provider", "run")\ndef replacement({parameters}): pass\n'
     )
     if guarded:
-        declaration = (
-            'if getattr(consumer, "run", None) is original:\n'
-            + "".join("    " + line for line in declaration.splitlines(keepends=True))
+        declaration = 'if getattr(consumer, "run", None) is original:\n' + "".join(
+            "    " + line for line in declaration.splitlines(keepends=True)
         )
     plugin.write_text(declaration)
     hooks, unresolved = scan_patch_file(plugin)
@@ -462,8 +458,7 @@ run(1)
     plugin = tmp_path / "plugin.py"
     parameters = "a, *, used=None" if valid else "a"
     plugin.write_text(
-        '@patch("vllm.provider", "run")\n'
-        f"def replacement({parameters}): pass\n"
+        f'@patch("vllm.provider", "run")\ndef replacement({parameters}): pass\n'
     )
     hooks, _ = scan_patch_file(plugin)
     problems = target_problems(tmp_path, hooks)
@@ -524,7 +519,9 @@ def rebind():
 
 @pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
 @pytest.mark.parametrize("valid", [False, True])
-def test_descriptor_replacement_keeps_its_callable_contract(tmp_path, descriptor, valid):
+def test_descriptor_replacement_keeps_its_callable_contract(
+    tmp_path, descriptor, valid
+):
     package = tmp_path / "vllm"
     package.mkdir()
     receiver = "cls, " if descriptor == "classmethod" else ""
@@ -548,7 +545,9 @@ def test_descriptor_replacement_keeps_its_callable_contract(tmp_path, descriptor
 
 @pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
 @pytest.mark.parametrize("binding", ["assignment", "parameter", "vararg", "kwarg"])
-def test_shadowed_descriptor_requires_a_callable_contract(tmp_path, descriptor, binding):
+def test_shadowed_descriptor_requires_a_callable_contract(
+    tmp_path, descriptor, binding
+):
     package = tmp_path / "vllm"
     package.mkdir()
     (package / "provider.py").write_text("class Owner:\n    def run(a): pass\n")
@@ -651,9 +650,17 @@ for additive in (True, False):
 
 def test_every_unresolved_installation_has_a_feature_contract():
     _, unresolved = scan_patches()
-    # Only these two dispatcher mechanisms and dataclass-generated methods need
+    # These dispatcher mechanisms and dataclass-generated methods need
     # feature-specific source handling. A new opaque installation fails here.
     expected = {
+        # Source inventory and loaded-consumer rebinding are exercised in
+        # test_deepseek_v41_int8.test_operator_alias_inventory_matches_main.
+        (
+            "patch/enhancement/models/deepseek_v41_int8.py",
+            "_rebind_aliases",
+            "module_name",
+            "name",
+        ),
         ("patch/enhancement/runtime.py", "_install", "module.__name__", "target"),
         ("patch/enhancement/runtime.py", "_install", "name", "attribute"),
         (

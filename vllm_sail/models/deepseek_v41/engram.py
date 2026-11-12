@@ -2,11 +2,69 @@
 """Channelwise Engram storage with upstream sharding, UVA and prefetch."""
 
 import torch
-from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
+from vllm.distributed import get_engram_dp_group
+from vllm.models.deepseek_v41.common.engram import (
+    DPSharedEngramStorage,
+    ParallelEngramEmbedding,
+    _allocate_huge_page_storage,
+    _engram_head_shard_weight_loader,
+)
+
+
+def validate_weight(param, loaded_weight):
+    """Reject implicit casts or incomplete shards of INT8 tables and FP32 scales."""
+    if (
+        param.dtype not in (torch.int8, torch.float32)
+        or loaded_weight.dtype != param.dtype
+    ):
+        raise ValueError(
+            "1017 Engram requires INT8 tables or FP32 row scales; implicit casting is forbidden"
+        )
+    if (
+        param.ndim != 2
+        or loaded_weight.ndim != 2
+        or loaded_weight.shape[1:] != param.shape[1:]
+    ):
+        raise ValueError("1017 Engram weight or scale shape does not match the shard")
+    start = param.engram_vocab_start
+    if start < 0 or start + param.shape[0] > loaded_weight.shape[0]:
+        raise ValueError(
+            "1017 Engram weights do not contain all rows of the head shard"
+        )
+
+
+def load_weight(param, loaded_weight):
+    validate_weight(param, loaded_weight)
+    _engram_head_shard_weight_loader(param, loaded_weight)
+
+
+class Int8DPSharedEngramStorage(DPSharedEngramStorage):
+    def __init__(self, num_rows, dim, block_size, group):
+        self.group = group
+        weight_bytes = num_rows * dim
+        if weight_bytes % 4:
+            raise ValueError(
+                "The INT8 Engram FP32 scale base address must be four-byte aligned"
+            )
+        host, gpu = self._allocate_shm(weight_bytes + num_rows * 4)
+        self.huge_pages = False
+
+        def split(storage):
+            return (
+                storage[:weight_bytes].view(torch.int8).view(num_rows, dim),
+                storage[weight_bytes:].view(torch.float32).view(num_rows, 1),
+            )
+
+        self.weight, self.weight_scale_inv = split(host)
+        self._views = split(gpu)
+
+    def load_weight(self, param, loaded_weight):
+        validate_weight(param, loaded_weight)
+        super().load_weight(param, loaded_weight)
 
 
 class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
-    """FP8 embedding values and one FP32 scale per row, with no requantization."""
+    """FP8 or INT8 values with FP32 row scales and upstream sharding/prefetch."""
 
     def __init__(
         self,
@@ -16,8 +74,13 @@ class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
         *,
         cpu_offload=False,
         dp_shared_memory=False,
+        use_thp=False,
+        weight_dtype=torch.float8_e4m3fn,
     ):
-        if dp_shared_memory:
+        self.weight_dtype = weight_dtype
+        if weight_dtype == torch.int8:
+            self._weight_loader = load_weight
+        elif dp_shared_memory:
             raise ValueError(
                 "Channelwise Engram does not support dp_shared_memory; "
                 "use cpu_offload without shared DP storage."
@@ -28,7 +91,8 @@ class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
             head_sizes,
             block_size=dim,
             cpu_offload=cpu_offload,
-            dp_shared_memory=False,
+            dp_shared_memory=dp_shared_memory,
+            use_thp=use_thp,
         )
         # Keep the upstream parameter name and head-shard loader. The PPU
         # lookup distinguishes FP32 scales from exponent bytes by tensor dtype.
@@ -40,18 +104,28 @@ class ChannelwiseEngramEmbedding(ParallelEngramEmbedding):
                 "Channelwise Engram does not support peer-table storage; "
                 "enable cpu_offload or use tensor parallelism."
             )
+        rows, dim = self.part_num_embeddings, self.dim
+        if self.dp_shared_memory:
+            group = get_engram_dp_group()
+            if group is None:
+                raise RuntimeError("Engram requires a node-local shared group")
+            storage = Int8DPSharedEngramStorage(rows, dim, self.block_size, group)
+            self._shared_memory = storage
+            self._weight_loader = storage.load_weight
+            return storage.weight, storage.weight_scale_inv
+        if self.weight_dtype == torch.int8 and self.cpu_offload and self.use_thp:
+            weight_bytes = rows * dim
+            if weight_bytes % 4:
+                raise ValueError("INT8 Engram scale storage must be four-byte aligned")
+            packed = _allocate_huge_page_storage(weight_bytes + rows * 4)
+            if packed is not None:
+                self._packed = packed
+                return (
+                    packed[:weight_bytes].view(torch.int8).view(rows, dim),
+                    packed[weight_bytes:].view(torch.float32).view(rows, 1),
+                )
         placement = {"device": "cpu", "pin_memory": True} if self.cpu_offload else {}
         return (
-            torch.empty(
-                self.part_num_embeddings,
-                self.dim,
-                dtype=torch.float8_e4m3fn,
-                **placement,
-            ),
-            torch.empty(
-                self.part_num_embeddings,
-                1,
-                dtype=torch.float32,
-                **placement,
-            ),
+            torch.empty(rows, dim, dtype=self.weight_dtype, **placement),
+            torch.empty(rows, 1, dtype=torch.float32, **placement),
         )
