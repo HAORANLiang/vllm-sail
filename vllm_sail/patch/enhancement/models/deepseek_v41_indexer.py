@@ -6,11 +6,13 @@ from dataclasses import replace
 from vllm.models.deepseek_v41 import attention
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_sail.patch.utils import patch
 
 _cache_spec = attention.DeepseekV4IndexerCache.get_kv_cache_spec
 _kernel_sizes = DeepseekV41IndexerBackend.get_supported_kernel_block_sizes
+_capture_model = GPUModelRunner.capture_model
 _AFFECTED = ">=0.32.0,<0.33.0"
 
 _indexer_init = attention.DeepseekV4Indexer.__init__
@@ -72,3 +74,36 @@ def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
     if current_platform.is_ppu():
         return [64, 128]
     return _kernel_sizes(kv_cache_spec=kv_cache_spec)
+
+
+def warmup_indexer_projections(runner):
+    sizes = runner.vllm_config.compilation_config.cudagraph_capture_sizes
+    if not sizes:
+        return
+
+    import torch
+
+    for module in runner.model.modules():
+        if not isinstance(module, attention.DeepseekV4Indexer):
+            continue
+        projection = module.wq_b
+        inputs = torch.zeros(
+            (max(sizes), projection.input_size),
+            dtype=projection.params_dtype,
+            device=projection.weight.device,
+        )
+        for size in sizes:
+            module._wq_b_proj(inputs[:size])
+
+
+@patch(
+    "vllm.v1.worker.gpu.model_runner",
+    "GPUModelRunner.capture_model",
+    reason="Short-context warmup skips indexer Q projection, but SAIL DeepGEMM must load its JIT kernels before graph capture.",
+    affected_versions=_AFFECTED,
+    remove_when="Upstream graph warmup exercises indexer Q projection for every capture shape.",
+)
+def capture_model(self, *, profile_only: bool = False):
+    if current_platform.is_ppu():
+        warmup_indexer_projections(self)
+    return _capture_model(self, profile_only=profile_only)
