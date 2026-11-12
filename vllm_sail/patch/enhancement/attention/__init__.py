@@ -13,6 +13,9 @@ Import order notes:
 * The ``forward_ppu`` additions (``mhc``, ``sparse_attn_indexer``) rely on the
   parent package's ``custom_op_dispatch`` having installed the dispatch reroute
   first; the parent ``__init__`` guarantees that.
+* ``dsv41_kv_record`` patches a module-level helper of
+  ``vllm.models.deepseek_v41.attention`` consumed at layer ``__init__`` time
+  only, so it is order-independent with respect to the other patches here.
 """
 
 from vllm_sail.patch.enhancement.attention import (
@@ -36,4 +39,5 @@ from vllm_sail.patch.enhancement.attention import (
     sparse_attn_indexer,  # noqa: F401
     sparse_attn_indexer_kpool,  # noqa: F401
     triton_decode_attention,  # noqa: F401
+    dsv41_kv_record,  # noqa: F401
 )

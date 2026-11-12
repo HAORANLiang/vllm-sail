@@ -25,11 +25,14 @@ BOOL_DEFAULTS = {
     "DISABLE_MOE_WNA16_CUDA": False,
     "FORCE_MOE_WNA16_CUDA": False,
     "ENABLE_MOE_MARLIN": False,
+    "DISABLE_MEGA_MHC": False,
     "USE_TRITON_INT8_QUANT": True,
     "ENABLE_FP8_TO_INT8": False,
     "NVTX_PROFILE": False,
     "NVTX_DUMP_TOPK": False,
     "NVTX_VFA_DUMP_SEQLEN": False,
+    "FUSED_NORM_ROPE_ATTN": False,
+    "PPU_KV_MXFP8": False,
 }
 BACKENDS = ("MOE_BACKEND", "DENSE_BACKEND")
 # String env vars with a non-None default.

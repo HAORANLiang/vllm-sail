@@ -76,3 +76,26 @@ def test_shared_library_loader_failure_falls_back_only_for_auto(
     with pytest.raises(ImportError, match="ABI mismatch") as error:
         pla_loader.get_sail_cuda_pla_k_last()
     assert isinstance(error.value.__cause__, OSError)
+
+
+def test_auto_fallback_warning_passes_string_not_exception(
+    pla_loader, modules, monkeypatch
+):
+    """warning_once is lru_cache'd; an exception argument would pin its
+    traceback and every caller frame's locals. The auto fallback must hand it
+    a plain string so the cache cannot retain the exception (and leak memory).
+    """
+    calls = []
+    modules(
+        "vllm.logger",
+        init_logger=lambda _: NS(
+            info_once=lambda *a: None,
+            warning_once=lambda *a: calls.append(a),
+        ),
+    )
+    loader = load_patch("vllm_sail/attention/pla_decode.py")
+    monkeypatch.setitem(sys.modules, "pla", None)
+
+    assert loader.get_sail_cuda_pla_k_last() is None
+    assert calls, "the auto fallback should warn once"
+    assert all(isinstance(arg, str) for call in calls for arg in call)

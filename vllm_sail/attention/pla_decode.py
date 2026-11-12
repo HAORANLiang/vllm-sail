@@ -76,9 +76,14 @@ def _resolve_sail_cuda_pla() -> None:
             )
         except (ImportError, OSError) as exc:
             if envs.VLLM_GDN_DECODE_KERNEL == "auto":
+                # Pass a string, not the exception: warning_once is lru_cache'd,
+                # so an exception key would pin its traceback (and every caller
+                # frame's locals) for the life of the cache. Resolution is
+                # retried per layer/step, so each attempt would add an entry
+                # and leak that step's tensors until the device runs out.
                 logger.warning_once(
                     "PLA decode is unavailable; GDN auto will use another backend: %s",
-                    exc,
+                    str(exc),
                 )
                 return
             raise ImportError(

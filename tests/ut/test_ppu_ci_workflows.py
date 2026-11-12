@@ -1382,6 +1382,37 @@ def test_runtime_workflows_use_the_checked_in_docker_wrapper():
     )
 
 
+@pytest.mark.parametrize(
+    "name,job_id,mode",
+    [
+        ("_ppu-pin-ut.yaml", "pin-unit-tests", "pin-ut"),
+        ("_ppu-upstream-reuse.yaml", "upstream-reuse", "upstream-reuse"),
+    ],
+)
+def test_ut_and_reuse_leaves_prepare_verified_upstream_source(name, job_id, mode):
+    job = workflow(name)["jobs"][job_id]
+    source = checkouts(job)[1]
+    assert source["with"] == {
+        "repository": "vllm-project/vllm",
+        "ref": "${{ steps.upstream.outputs.ref }}",
+        "path": "${{ steps.runtime.outputs.upstream_rel }}",
+        "persist-credentials": False,
+    }
+    verify = job["steps"][job["steps"].index(source) + 1]
+    assert verify["env"]["EXPECTED_SHA"] == source["with"]["ref"]
+    assert verify["env"]["UPSTREAM_DIR"] == "${{ steps.runtime.outputs.upstream }}"
+    assert 'rev-parse HEAD)" = "$EXPECTED_SHA"' in verify["run"]
+    runtime = next(
+        step
+        for step in job["steps"]
+        if "ppu_runtime_container.sh" in step.get("run", "")
+    )
+    assert (
+        runtime["env"]["PPU_CI_UPSTREAM_DIR"] == "${{ steps.runtime.outputs.upstream }}"
+    )
+    assert runtime["run"].endswith(f'" {mode}')
+
+
 def test_upstream_reuse_only_runs_in_the_authorized_pipeline():
     texts = {path.name: path.read_text() for path in WORKFLOWS.glob("*.y*ml")}
     callers = {
