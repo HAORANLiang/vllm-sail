@@ -24,6 +24,7 @@ from vllm_sail.patch.enhancement import deep_gemm_redirect  # noqa: F401
 from vllm_sail.patch.enhancement import fused_moe_ppu
 from vllm_sail.patch.enhancement import int8_quant  # noqa: F401
 from vllm_sail.patch.enhancement import kernel_warmup  # noqa: F401
+from vllm_sail.patch.enhancement import mega_moe
 from vllm_sail.patch.enhancement import triton_warmup
 from vllm_sail.patch.enhancement import modular_kernel  # noqa: F401
 from vllm_sail.patch.enhancement import online_quantization_dtype  # noqa: F401
@@ -38,6 +39,7 @@ from vllm_sail.patch.enhancement import residual  # noqa: F401
 compressed_tensors_ppu.install()
 triton_warmup.install()
 fused_moe_ppu.install()
+mega_moe.install()
 mxfp4.install()
 
 # After generic quantization adapters, before runtime calls consume tuned configs.

@@ -13,7 +13,9 @@ def test_mega_moe_checkpoint_loader_matches_library_transform():
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm_sail.models.deepseek_v41.mega_moe import PPUDeepGemmMegaMoEExperts
+    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+        PPUDeepGemmMegaMoEExperts,
+    )
 
     e, h, i = 2, 2048, 128
     with torch.device("cuda"):
@@ -58,7 +60,9 @@ def test_mega_moe_checkpoint_loader_matches_library_transform():
 def test_mega_gate_preserves_hash_image_and_weight_contracts():
     import torch
 
-    from vllm_sail.models.deepseek_v41.mega_moe import mega_gate
+    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+        mega_gate,
+    )
 
     x = torch.randn(3, 64, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(8, 64, device="cuda", dtype=torch.float32)
@@ -102,7 +106,9 @@ def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
         MegaMoEActivation,
     )
 
-    from vllm_sail.models.deepseek_v41.mega_moe import PPUDeepGemmMegaMoEExperts
+    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+        PPUDeepGemmMegaMoEExperts,
+    )
 
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
@@ -180,7 +186,9 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         MegaMoEActivation,
     )
 
-    from vllm_sail.models.deepseek_v41 import mega_moe
+    from vllm_sail.model_executor.layers.fused_moe.experts import (
+        deep_gemm_mega_moe as mega_moe,
+    )
 
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
@@ -286,7 +294,9 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
         MegaMoEActivation,
     )
 
-    from vllm_sail.models.deepseek_v41 import mega_moe
+    from vllm_sail.model_executor.layers.fused_moe.experts import (
+        deep_gemm_mega_moe as mega_moe,
+    )
 
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
@@ -388,21 +398,28 @@ def mega_moe_gate_factory(tmp_path_factory):
 @pytest.mark.parametrize("tokens", [1, 17, 104, 256])
 @pytest.mark.parametrize("num_experts", [128, 384])
 @pytest.mark.parametrize("routing", ["plain", "bias", "hash", "image", "mixed", "ties"])
-def test_mega_moe_fused_routing_matches_eager(
+def test_native_deepseek_mega_moe_routing_matches_eager(
     mega_moe_gate_factory, tokens, num_experts, routing
 ):
     from types import SimpleNamespace
 
     import torch
-    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+    from vllm.models.deepseek_v4.nvidia import model
 
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
-    from vllm_sail.models.deepseek_v41.mega_moe import mega_gate
-    from vllm_sail.patch.enhancement.models.deepseek_v41_megamoe import forward
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+        DeepGemmMegaMoEExperts,
+    )
 
-    assert DeepseekV4MoE.forward is forward
+    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
+        PPUDeepGemmMegaMoEExperts,
+        mega_gate,
+    )
+
+    assert model.DeepGemmMegaMoEExperts is DeepGemmMegaMoEExperts
+    assert DeepGemmMegaMoEExperts is PPUDeepGemmMegaMoEExperts
     torch.manual_seed(123)
     x = torch.randn(tokens, 5120, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(num_experts, 5120, device="cuda") * 0.01
@@ -461,11 +478,18 @@ def test_mega_moe_fused_routing_matches_eager(
         hash_indices_dtype=torch.int64,
         routed_scaling_factor=2.5,
         image_sentinel_lo=10,
+        ep_rank=0,
         swiglu_limit=None,
         experts=Experts(),
         shared_experts=None,
     )
-    assert forward(moe, x, input_ids).data_ptr() == x.data_ptr()
+    metadata = SimpleNamespace(
+        image_token_mask=image_mask,
+        safe_hash_input_ids=input_ids,
+        hash_token_mask=fixed,
+    )
+    output = model.DeepseekV4MoE.forward(moe, x, input_ids, metadata)
+    assert output.data_ptr() == x.data_ptr()
     torch.testing.assert_close(captured["ids"], expected_ids, atol=0, rtol=0)
     torch.testing.assert_close(
         captured["weights"], expected_weights, atol=1e-6, rtol=1e-5

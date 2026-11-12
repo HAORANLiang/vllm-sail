@@ -102,7 +102,8 @@ expert-parallel routing/EPLB remain in vLLM; shared experts use their separate
 MLP. The current adapter supports MXFP4 routed experts, standard SwiGLU and the
 upstream normalized sqrtsoftplus/hash/image routes. It requires hidden size
 at least 2048 and divisible by 512, with expert intermediate size divisible by
-64. PPU uses GateLinear and fused top-k routing at every batch size.
+64. The upstream model selects GateLinear with fused top-k for small batches
+and the SAIL MegaGate fallback for larger batches.
 
 `VLLM_SAIL_MOE_BACKEND=deepgemm` continues to select the ordinary PPU DeepGEMM
 expert backend. Use the CLI selection above for MegaMoE.
