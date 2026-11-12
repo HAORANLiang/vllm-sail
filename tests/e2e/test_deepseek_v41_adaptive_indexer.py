@@ -182,3 +182,60 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
             torch.testing.assert_close(
                 logits[row, :end], reference, rtol=0.01, atol=0.002
             )
+
+
+@pytest.mark.cap89
+@pytest.mark.parametrize("tokens", [64, 1, 72])
+def test_indexer_projection_warmup_allows_fp8_graph_replay(tokens):
+    import torch
+
+    import vllm_sail
+
+    vllm_sail.register_out_of_tree()
+    from vllm.models.deepseek_v41.attention import DeepseekV4Indexer
+
+    from vllm_sail.patch.enhancement.models.deepseek_v41_indexer import (
+        warmup_indexer_projections,
+    )
+    from vllm_sail.utils.deep_gemm import fp8_gemm_nt
+
+    class Projection(torch.nn.Module):
+        input_size = 1280
+        params_dtype = torch.bfloat16
+
+        def __init__(self):
+            super().__init__()
+            weight = torch.randn(4096, 1280, device="cuda") * 0.1
+            self.register_buffer("weight", weight.to(torch.float8_e4m3fn))
+            self.register_buffer("scale", torch.ones(4096, 1, device="cuda"))
+
+        def forward(self, x):
+            quantized = x.to(torch.float8_e4m3fn)
+            scale = torch.ones(x.shape[0], 1, device=x.device)
+            output = torch.empty(
+                x.shape[0], 4096, device=x.device, dtype=torch.bfloat16
+            )
+            fp8_gemm_nt((quantized, scale), (self.weight, self.scale), output)
+            return output, None
+
+    indexer = DeepseekV4Indexer.__new__(DeepseekV4Indexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.wq_b = Projection()
+    runner = SimpleNamespace(
+        model=indexer,
+        vllm_config=SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[64, 1, 72])
+        ),
+    )
+    warmup_indexer_projections(runner)
+    inputs = torch.randn(tokens, 1280, device="cuda", dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = indexer._wq_b_proj(inputs)
+    for value in (0.25, -0.5):
+        inputs.fill_(value)
+        graph.replay()
+        reference = indexer._wq_b_proj(inputs)
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        assert torch.isfinite(output).all()
+        assert output.abs().max() > 0
