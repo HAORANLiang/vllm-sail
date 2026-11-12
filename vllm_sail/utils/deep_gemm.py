@@ -396,9 +396,7 @@ def _lazy_init() -> None:
     _activation_mode_impl = getattr(_dg, "ActivationMode", None)
     _quant_mode_impl = getattr(_dg, "QuantMode", None)
     _activation_and_mul_impl = getattr(_dg, "activation_and_mul", None)
-    _activation_and_mul_masked_impl = getattr(
-        _dg, "activation_and_mul_masked", None
-    )
+    _activation_and_mul_masked_impl = getattr(_dg, "activation_and_mul_masked", None)
     DeepGemmQuantScaleFMT.init_oracle_cache()
 
 
@@ -754,6 +752,15 @@ def int8_mqa_logits(
     )
 
 
+@functools.cache
+def has_typed_mqa_logits_metadata() -> bool:
+    """Whether the SAIL bindings expose the dtype-based MQA API."""
+    _lazy_init()
+    # pybind exposes the native signature in __doc__, not inspect.signature.
+    signature = getattr(_get_paged_mqa_logits_metadata_impl, "__doc__", "") or ""
+    return "torch.dtype" in signature.partition("metadata_extra:")[2]
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -785,13 +792,23 @@ def fp8_fp4_mqa_logits(
         clean_logits: Whether to clean the unfilled logits into `-inf`.
 
     Returns:
-        Logits tensor of shape [M, N], dtype `torch.float32`.
+        Logits tensor of shape [M, N]. With the dtype-based SAIL API, column
+        zero in each row corresponds to that row's `cu_seqlen_ks` position.
     """
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
     if logits_dtype is None:
         logits_dtype = torch.float32
+    if has_typed_mqa_logits_metadata():
+        logits = _fp8_fp4_mqa_logits_impl(
+            q, kv, weights.to(torch.bfloat16), cu_seqlen_ks, cu_seqlen_ke, kv[0].size(0)
+        )
+        if clean_logits:
+            columns = torch.arange(logits.size(1), device=logits.device)
+            lengths = cu_seqlen_ke - cu_seqlen_ks
+            logits.masked_fill_(columns >= lengths[:, None], -torch.inf)
+        return logits.to(logits_dtype)
     return _fp8_fp4_mqa_logits_impl(
         q,
         kv,
@@ -972,6 +989,23 @@ def fp8_fp4_paged_mqa_logits(
         return _missing()
     if logits_dtype is None:
         logits_dtype = torch.float32
+    if has_typed_mqa_logits_metadata():
+        # The builder flattens MXFP4 decode to one query per block-table row.
+        indices = torch.arange(q[0].size(0), dtype=torch.int32, device=q[0].device)
+        logits = _fp8_fp4_paged_mqa_logits_impl(
+            q,
+            kv_cache,
+            weights.to(torch.bfloat16),
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+            indices=indices,
+        )
+        if clean_logits:
+            columns = torch.arange(logits.size(1), device=logits.device)
+            logits.masked_fill_(columns >= context_lens.reshape(-1, 1), -torch.inf)
+        return logits.to(logits_dtype)
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
         kv_cache,

@@ -112,6 +112,17 @@ def test_paged_metadata_derives_the_fp4_extra_from_the_builder(modules):
     assert not fallback
 
 
+@pytest.mark.parametrize("qk_dtype", ["int8", "float8_e4m3fn"])
+def test_paged_metadata_forwards_typed_geometry(modules, qk_dtype):
+    builder = NS(indexer_n_head=32, indexer_q_head_dim=128, indexer_qk_dtype=qk_dtype)
+    namespace, calls, fallback = _paged_namespace(modules, ppu=True, builder=builder)
+
+    function(PATCH, "_ppu_paged_metadata", namespace)(Span(), 64, 7)
+
+    assert calls == [(ANY, 64, 7, (1, 32, 128, qk_dtype))]
+    assert not fallback
+
+
 def test_paged_metadata_keeps_the_standard_layout_without_fp4_heads(modules):
     namespace, calls, fallback = _paged_namespace(modules, ppu=True)
     namespace["_current_builder"] = [NS(indexer_n_head=0, indexer_q_head_dim=128)]
@@ -127,9 +138,7 @@ def test_paged_metadata_rejects_varlen_indices_on_ppu(modules):
     namespace, _, _ = _paged_namespace(modules, ppu=True, builder=builder)
 
     with pytest.raises(NotImplementedError, match="fixed-length"):
-        function(PATCH, "_ppu_paged_metadata", namespace)(
-            Span(), 64, 7, indices=Span()
-        )
+        function(PATCH, "_ppu_paged_metadata", namespace)(Span(), 64, 7, indices=Span())
 
 
 def test_paged_metadata_delegates_on_non_ppu(modules):

@@ -44,8 +44,8 @@ import torch
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.mla import indexer as _indexer_module
 from vllm.v1.attention.backends.mla.indexer import (
-    DeepseekV32IndexerMetadataBuilder,
     DeepseekV32IndexerMetadata,
+    DeepseekV32IndexerMetadataBuilder,
 )
 
 import vllm_sail.utils.deep_gemm as _ppu_deep_gemm
@@ -80,7 +80,7 @@ patch_value(
     allow_missing=True,
     reason=(
         "Fork constant: element size (bytes) of the PPU fp4 indexer cache, "
-        "passed to the PPU paged MQA logits metadata builder via metadata_extra."
+        "used in metadata_extra by legacy SAIL DeepGEMM wheels."
     ),
     affected_versions=_AFFECTED,
     remove_when="upstream defines the constant itself (patch_value becomes a no-op).",
@@ -119,16 +119,17 @@ def _ppu_paged_metadata(
         # site (build and update_draft_decode_metadata) runs behind a wrapper
         # that puts its builder on the stack.
         builder = _current_builder[-1] if _current_builder else None
-        n_head = getattr(builder, "indexer_n_head", 0) if builder else 0
+        n_head = getattr(builder, "indexer_n_head", 0)
+        qk_dtype = getattr(builder, "indexer_qk_dtype", None)
         if n_head > 0:
-            heads_per_token = (
-                context_lens.shape[1] if context_lens.dim() == 2 else 1
-            )
+            heads_per_token = context_lens.shape[1] if context_lens.dim() == 2 else 1
             metadata_extra = (
                 heads_per_token,
                 n_head,
                 builder.indexer_q_head_dim,
-                _indexer_module.PPU_FP4_INDEXER_ELEMENT_SIZE,
+                qk_dtype
+                if qk_dtype is not None
+                else _indexer_module.PPU_FP4_INDEXER_ELEMENT_SIZE,
             )
     return _ppu_deep_gemm.get_paged_mqa_logits_metadata(
         context_lens, block_size, num_sms, metadata_extra
@@ -294,6 +295,7 @@ import sys
 for _consumer_name in (
     "vllm.model_executor.models.deepseek_v2",
     "vllm.models.deepseek_v4.attention",
+    "vllm.models.deepseek_v41.attention",
 ):
     _consumer = sys.modules.get(_consumer_name)
     if (
@@ -339,9 +341,27 @@ def _builder_init_wrapper(self, *args, **kwargs) -> None:
     from vllm_sail.utils.deep_gemm import get_num_sms
 
     self.num_sms = get_num_sms()
-    if self.indexer_uses_fp4:
-        # NOTE(kai): fp4 paged uses extra metadata
-        # (num_sms * tb_per_cu + 1, 2)
+    typed_metadata = _ppu_deep_gemm.has_typed_mqa_logits_metadata()
+    if typed_metadata:
+        # The new scheduler requires head geometry for every PPU Q/K dtype.
+        hf_config = self.vllm_config.model_config.hf_text_config
+        self.indexer_n_head = getattr(self.kv_cache_spec, "indexer_n_head", None) or (
+            hf_config.index_n_heads
+        )
+        self.indexer_q_head_dim = (
+            getattr(self.kv_cache_spec, "indexer_q_head_dim", None)
+            or hf_config.index_head_dim
+        )
+        is_m890 = current_platform.is_device_capability(89)
+        self.indexer_qk_dtype = (
+            torch.float8_e4m3fn if is_m890 and not self.indexer_uses_fp4 else torch.int8
+        )
+        if self.indexer_uses_fp4:
+            # The dtype-based MXFP4 logits API takes one query per request index.
+            self.use_flattening = True
+    if self.indexer_uses_fp4 or typed_metadata:
+        # Reserve space for the largest schedule. Upstream slices it to the
+        # number of slots returned by the kernel.
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms * _indexer_module.PPU_DEEP_GEMM_TB_PER_CU + 1, 2),
             dtype=torch.int32,

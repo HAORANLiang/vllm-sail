@@ -77,6 +77,7 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
         fp8_paged_mqa_logits,
         get_num_sms,
         get_paged_mqa_logits_metadata,
+        has_typed_mqa_logits_metadata,
     )
 
     # Same total budget; CPU plans [3,3], device reallocates to [5,1] or [1,5].
@@ -122,6 +123,11 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
     cache.copy_(packed.reshape(8, block_size, 1, dim + 4))
     q, weights = q_cpu.cuda(), weight_cpu.cuda()
     sms = get_num_sms()
+    metadata_extra = (
+        (1, heads, dim, torch.float8_e4m3fn)
+        if has_typed_mqa_logits_metadata()
+        else None
+    )
 
     def step():
         ends, blocks, lengths, batch, padding = builder._prepare_decode_tensors(
@@ -138,7 +144,7 @@ def test_device_lengths_flattened_logits_graph_replay(compress_ratio):
         )
         assert batch == capacity and not padding
         ends = (ends // compress_ratio).unsqueeze(-1)
-        schedule = get_paged_mqa_logits_metadata(ends, block_size, sms, None)
+        schedule = get_paged_mqa_logits_metadata(ends, block_size, sms, metadata_extra)
         # Match the model: 2D context lengths require external top-k masking.
         # The logits kernel only promises values within each visible prefix.
         logits = fp8_paged_mqa_logits(

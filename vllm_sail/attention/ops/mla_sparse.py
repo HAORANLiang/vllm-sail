@@ -31,6 +31,7 @@ if current_platform.is_ppu():
         fp8_fp4_paged_mqa_logits,
         fp8_mqa_logits,
         fp8_paged_mqa_logits,
+        has_typed_mqa_logits_metadata,
         int8_mqa_logits,
         int8_paged_mqa_logits,
         is_deep_gemm_supported,
@@ -340,12 +341,20 @@ def ppu_sparse_attn_indexer(
             else:
                 raise RuntimeError("indexer need PPU deep gemm installed")
 
+            row_starts = chunk.cu_seqlen_ks
+            row_ends = chunk.cu_seqlen_ke
+            if use_fp4_cache and has_typed_mqa_logits_metadata():
+                # New SAIL MXFP4 logits are indexed relative to each query's K
+                # start. Top-k and candidate blocks also return relative indices.
+                row_ends = row_ends - row_starts
+                row_starts = torch.zeros_like(row_ends)
+
             num_rows = logits.shape[0]
             if candidate_blocks is not None:
                 _filter_candidates(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    row_starts,
+                    row_ends,
                     candidate_blocks[chunk.token_start : chunk.token_end],
                     candidate_block_size,
                     candidate_write,
@@ -358,8 +367,8 @@ def ppu_sparse_attn_indexer(
             if logits.dtype == torch.bfloat16:
                 sail_ops.top_k_per_row_prefill_bf16(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    row_starts,
+                    row_ends,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
@@ -369,8 +378,8 @@ def ppu_sparse_attn_indexer(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    row_starts,
+                    row_ends,
                     topk_indices,
                     num_rows,
                     logits.stride(0),
