@@ -158,9 +158,22 @@ def installed(monkeypatch, patch_utils_module):
     class Engram:
         _create_embedding = operation("embedding_upstream")
 
+    checkpoint = {}
+
+    def safetensors_metadata(model, revision=None):
+        calls.append(("safetensors_metadata", (model,), {"revision": revision}))
+        return checkpoint
+
+    module(
+        "vllm.transformers_utils.config",
+        get_safetensors_params_metadata=safetensors_metadata,
+    )
+
     config = types.SimpleNamespace(
         quant_config=types.SimpleNamespace(get_name=lambda: "compressed-tensors"),
         model_config=types.SimpleNamespace(
+            model="/ckpt/v41-w8a8",
+            revision=None,
             hf_config=types.SimpleNamespace(
                 model_type="deepseek_v41",
                 quantization_config={
@@ -186,7 +199,7 @@ def installed(monkeypatch, patch_utils_module):
                         },
                     },
                 },
-            )
+            ),
         ),
         engram_config=types.SimpleNamespace(
             cpu_offload=True, dp_shared_memory=True, use_thp=False
@@ -291,6 +304,7 @@ def installed(monkeypatch, patch_utils_module):
         nvidia=nvidia,
         sharing=sharing,
         config=config,
+        checkpoint=checkpoint,
         resolve=resolve,
     )
 
@@ -541,6 +555,36 @@ def test_int8_engram_factory_and_non_quant_isolation(installed, cap, shared, use
     assert (
         state.modules[BASE + ".common.engram"].can_share_engram_tables(layout) is False
     )
+
+
+def test_w8a8_engram_follows_checkpoint_table_dtype(installed):
+    # W8A8 Linear exports may keep Engram as MXFP8 (E4M3 + E8M0 block scales).
+    state = installed
+    state.checkpoint.update(
+        {
+            "layers.1.engram.embed.weight": {"dtype": "I8"},
+            "layers.1.engram.embed.scale": {"dtype": "F32"},
+            "model.layers.14.engram.embed.weight": {"dtype": "F8_E4M3"},
+            "model.layers.14.engram.embed.scale": {"dtype": "F8_E8M0"},
+            "__metadata__": {"format": "pt"},
+        }
+    )
+    layout = types.SimpleNamespace(
+        layer_ids=[1, 14, 30],
+        num_embeddings=[123, 456, 789],
+        head_dim=256,
+        primes=[[[60, 63]], [[200, 256]], [[300, 489]]],
+    )
+    assert state.engram._create_embedding(None, layout, 0) == "embedding810"
+    assert state.calls[-1][2]["weight_dtype"] == "int8"
+    assert state.engram._create_embedding(None, layout, 1) == "embedding_upstream"
+    # Unknown tables (no safetensors headers) keep the model-level W8A8 decision.
+    assert state.engram._create_embedding(None, layout, 2) == "embedding810"
+    probes = [call for call in state.calls if call[0] == "safetensors_metadata"]
+    assert probes == [("safetensors_metadata", ("/ckpt/v41-w8a8",), {"revision": None})]
+    state.config.quant_config = None
+    state.resolve()
+    assert state.engram._create_embedding(None, layout, 0) == "embedding_upstream"
 
 
 @pytest.mark.parametrize(

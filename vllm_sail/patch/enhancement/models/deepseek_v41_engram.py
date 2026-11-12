@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Preserve V4.1 Engram lookup semantics for PPU FP32 per-row scales."""
 
+import re
+from functools import cache
+
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.platforms import current_platform
@@ -142,8 +145,11 @@ def _create_embedding(self, layout, layer_hash_index):
     name = f"layers.{layout.layer_ids[layer_hash_index]}.engram.embed"
     if current_platform.is_ppu():
         # INT8 reuses the decision DeepseekV41ForCausalLM published before
-        # building layers; FP8 channelwise tables are listed per layer.
-        int8 = int8_w8a8_enabled()
+        # building layers, unless the checkpoint kept this table in MXFP8;
+        # FP8 channelwise tables are listed per layer.
+        int8 = int8_w8a8_enabled() and _checkpoint_table_dtype(
+            vllm_config.model_config, name
+        ) in (None, "I8")
         if int8 or name in (quant.get("fp8_channelwise_layers") or []):
             from vllm_sail.models.deepseek_v41.engram import ChannelwiseEngramEmbedding
 
@@ -160,6 +166,27 @@ def _create_embedding(self, layout, layer_hash_index):
             )
     original = getattr(_create_embedding, PATCH_MARKER)[f"{_FACTORY}.Engram._create_embedding"]
     return original(self, layout, layer_hash_index)
+
+
+_ENGRAM_TABLE = re.compile(r"(layers\.\d+\.engram\.embed)\.weight$")
+
+
+@cache
+def _checkpoint_table_dtypes(model, revision):
+    """Safetensors dtypes of the Engram tables, read from headers only."""
+    from vllm.transformers_utils.config import get_safetensors_params_metadata
+
+    metadata = get_safetensors_params_metadata(model, revision=revision)
+    return {
+        match[1]: info.get("dtype")
+        for key, info in metadata.items()
+        if (match := _ENGRAM_TABLE.search(key))
+    }
+
+
+def _checkpoint_table_dtype(model_config, name):
+    """W8A8 exports may keep Engram in MXFP8; None when headers are unavailable."""
+    return _checkpoint_table_dtypes(model_config.model, model_config.revision).get(name)
 
 
 @patch(
