@@ -109,8 +109,8 @@ captured by the kernel. Restart the server to replace checkpoint weights
 with W4A8 or W4A16, whose transformed banks are bound by CUDA graphs. Shared
 experts run as a separate MLP.
 
-The upstream model selects GateLinear with fused top-k for small batches
-and the SAIL MegaGate fallback for larger batches.
+Upstream DeepSeek uses GateLinear with fused top-k for small local batches.
+Larger local batches require a DeepGEMM build exposing `bf16_mega_gate`.
 
 `VLLM_SAIL_MOE_BACKEND=deepgemm` continues to select the ordinary PPU DeepGEMM
 expert backend. Use the CLI selection above for MegaMoE.

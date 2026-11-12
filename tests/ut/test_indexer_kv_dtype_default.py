@@ -63,11 +63,7 @@ def installed_indexer(modules, patch_utils_module):
             _supports_flattened_device_query_lens=lambda: False,
             DSA_INDEXER_KV_DTYPES=("fp8", "mxfp4"),
         )
-        v41_attention = modules(
-            "vllm.models.deepseek_v41.attention", dsa_indexer_uses_fp4=upstream
-        )
         patch = load_patch("vllm_sail/patch/enhancement/attention/mla_indexer.py")
-        assert v41_attention.dsa_indexer_uses_fp4 is patch.dsa_indexer_uses_fp4
         assert provider.dsa_indexer_uses_fp4 is patch.dsa_indexer_uses_fp4
         return provider.dsa_indexer_uses_fp4, calls
 

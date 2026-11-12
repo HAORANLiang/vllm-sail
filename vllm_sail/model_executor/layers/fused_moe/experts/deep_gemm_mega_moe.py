@@ -27,42 +27,6 @@ from vllm_sail.utils.deep_gemm_mega import (
 )
 
 
-def mega_gate(
-    x,
-    weight,
-    num_topk,
-    *,
-    scoring_func,
-    routed_scaling_factor,
-    ep_rank,
-    bias=None,
-    image_bias=None,
-    image_token_mask=None,
-    fix_routing_mask=None,
-    unmapped_topk_idx=None,
-):
-    """Preserve DeepSeek routing when SAIL has no SM100 MegaGate kernel."""
-    if scoring_func != "sqrtsoftplus":
-        raise ValueError("DeepSeek SAIL MegaMoE requires sqrtsoftplus routing.")
-    logits = torch.nn.functional.linear(x.float(), weight.float())
-    scores = torch.nn.functional.softplus(logits).sqrt()
-    selection = scores if bias is None else scores + bias
-    if image_bias is not None:
-        if image_token_mask is None:
-            raise ValueError("Image routing bias requires the prepared token mask.")
-        selection = torch.where(
-            image_token_mask[:, None], scores + image_bias, selection
-        )
-    ids = torch.argsort(selection, dim=-1, descending=True, stable=True)[:, :num_topk]
-    if fix_routing_mask is not None:
-        if unmapped_topk_idx is None:
-            raise ValueError("Hash routing mask requires prepared expert IDs.")
-        ids = torch.where(fix_routing_mask[:, None], unmapped_topk_idx, ids)
-    weights = scores.gather(1, ids)
-    weights = weights / weights.sum(dim=-1, keepdim=True) * routed_scaling_factor
-    return weights.contiguous(), ids.to(torch.int64).contiguous()
-
-
 class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
     """Use the selected PPU MegaMoE kernel with native vLLM routing."""
 

@@ -54,9 +54,6 @@ def megamoe_patch(modules):
     def native_gate(*args, **kwargs):
         return "native gate"
 
-    def ppu_gate(*args, **kwargs):
-        return args, kwargs
-
     platform = SimpleNamespace(ppu=True)
     platform.is_ppu = lambda: platform.ppu
     modules("vllm.platforms", current_platform=platform)
@@ -68,9 +65,7 @@ def megamoe_patch(modules):
         DeepGemmMegaMoEExperts=NativeExperts,
         bf16_mega_gate=native_gate,
     )
-    modules(
-        _MEGAMOE_IMPL_MODULE, PPUDeepGemmMegaMoEExperts=PPUExperts, mega_gate=ppu_gate
-    )
+    modules(_MEGAMOE_IMPL_MODULE, PPUDeepGemmMegaMoEExperts=PPUExperts)
     return SimpleNamespace(
         platform=platform,
         model=model,
@@ -116,24 +111,12 @@ def test_megamoe_redirects_late_imports_and_preserves_other_bindings(
     assert kimi.DeepGemmMegaMoEExperts is other_experts
 
 
-def test_megamoe_redirects_gate_used_by_native_model(megamoe_patch):
+def test_megamoe_leaves_native_gate_unmodified(megamoe_patch):
     harness = megamoe_patch
     harness.patch.install()
 
-    gate = harness.gate_provider.bf16_mega_gate
-    assert gate is harness.model.bf16_mega_gate
-    args = (object(), object(), 2)
-    kwargs = dict(
-        scoring_func="sqrtsoftplus",
-        routed_scaling_factor=1.5,
-        ep_rank=1,
-        bias=object(),
-        image_bias=object(),
-        image_token_mask=object(),
-        fix_routing_mask=object(),
-        unmapped_topk_idx=object(),
-    )
-    assert gate(*args, **kwargs) == (args, kwargs)
+    assert harness.gate_provider.bf16_mega_gate is harness.native_gate
+    assert harness.model.bf16_mega_gate is harness.native_gate
 
 
 def test_megamoe_leaves_non_ppu_unmodified(megamoe_patch, monkeypatch):
@@ -181,10 +164,6 @@ def test_megamoe_targets_and_inherited_interfaces_exist_in_main(upstream_source_
             upstream_source_root / _MEGAMOE_EXPERTS, f"DeepGemmMegaMoEExperts.{name}"
         )
     definition(upstream_model, "DeepseekV4MoE._init_mega_moe_experts")
-    gate_path = upstream_source_root / "vllm/utils/deep_gemm.py"
-    if not gate_path.is_file():
-        gate_path = upstream_source_root / "vllm/utils/deep_gemm/__init__.py"
-    definition(gate_path, "bf16_mega_gate")
 
 
 @pytest.mark.upstream_source

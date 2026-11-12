@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device checks for the SAIL MegaMoE loader and routing contracts."""
+"""Device checks for SAIL MegaMoE weight loading and dispatch."""
 
 import pytest
 
@@ -75,42 +75,6 @@ def test_mega_moe_checkpoint_loader_matches_library_transform(monkeypatch):
                 )
 
 
-def test_mega_gate_preserves_hash_image_and_weight_contracts():
-    import torch
-
-    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
-        mega_gate,
-    )
-
-    x = torch.randn(3, 64, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(8, 64, device="cuda", dtype=torch.float32)
-    bias = torch.randn(8, device="cuda")
-    image_bias = torch.randn(8, device="cuda")
-    image = torch.tensor([False, True, False], device="cuda")
-    fixed = torch.tensor([True, False, False], device="cuda")
-    hash_ids = torch.tensor([[5, 2], [4, 1], [0, 3]], device="cuda")
-    weights, ids = mega_gate(
-        x,
-        w,
-        2,
-        scoring_func="sqrtsoftplus",
-        routed_scaling_factor=2.5,
-        ep_rank=0,
-        bias=bias,
-        image_bias=image_bias,
-        image_token_mask=image,
-        fix_routing_mask=fixed,
-        unmapped_topk_idx=hash_ids,
-    )
-    torch.testing.assert_close(ids[0], hash_ids[0])
-    scores = torch.nn.functional.softplus(x.float() @ w.T).sqrt()
-    torch.testing.assert_close(
-        ids[1], torch.argsort(scores[1] + image_bias, descending=True, stable=True)[:2]
-    )
-    selected = scores.gather(1, ids)
-    torch.testing.assert_close(weights, selected / selected.sum(-1, keepdim=True) * 2.5)
-
-
 def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
     from types import SimpleNamespace
 
@@ -121,13 +85,17 @@ def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
     vllm_sail.register_out_of_tree()
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
         MEGA_MOE_MXFP4,
+        DeepGemmMegaMoEExperts,
         MegaMoEActivation,
     )
+    from vllm.models.deepseek_v4.nvidia import model
 
     from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
         PPUDeepGemmMegaMoEExperts,
     )
 
+    assert model.DeepGemmMegaMoEExperts is DeepGemmMegaMoEExperts
+    assert DeepGemmMegaMoEExperts is PPUDeepGemmMegaMoEExperts
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -402,148 +370,3 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
                 buffer.destroy()
                 del cache[key]
         dist.destroy_process_group()
-
-
-@pytest.fixture(scope="module")
-def mega_moe_gate_factory(tmp_path_factory):
-    import torch
-
-    import vllm_sail
-
-    vllm_sail.register_out_of_tree()
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.distributed import (
-        destroy_distributed_environment,
-        destroy_model_parallel,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
-
-    rendezvous = tmp_path_factory.mktemp("mega_gate") / "rendezvous"
-    with set_current_vllm_config(VllmConfig()):
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"file://{rendezvous}",
-            backend="nccl",
-        )
-        initialize_model_parallel(1, 1)
-        try:
-
-            def make_gate(num_experts):
-                return GateLinear(
-                    5120,
-                    num_experts,
-                    params_dtype=torch.float32,
-                    out_dtype=torch.float32,
-                ).cuda()
-
-            yield make_gate
-        finally:
-            destroy_model_parallel()
-            destroy_distributed_environment()
-
-
-@pytest.mark.parametrize("tokens", [1, 17, 104, 256])
-@pytest.mark.parametrize("num_experts", [128, 384])
-@pytest.mark.parametrize("routing", ["plain", "bias", "hash", "image", "mixed", "ties"])
-def test_native_deepseek_mega_moe_routing_matches_eager(
-    mega_moe_gate_factory, tokens, num_experts, routing
-):
-    from types import SimpleNamespace
-
-    import torch
-    from vllm.models.deepseek_v4.nvidia import model
-
-    import vllm_sail
-
-    vllm_sail.register_out_of_tree()
-    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
-        DeepGemmMegaMoEExperts,
-    )
-
-    from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
-        PPUDeepGemmMegaMoEExperts,
-        mega_gate,
-    )
-
-    assert model.DeepGemmMegaMoEExperts is DeepGemmMegaMoEExperts
-    assert DeepGemmMegaMoEExperts is PPUDeepGemmMegaMoEExperts
-    torch.manual_seed(123)
-    x = torch.randn(tokens, 5120, device="cuda", dtype=torch.bfloat16)
-    weight = torch.randn(num_experts, 5120, device="cuda") * 0.01
-    bias = None if routing == "plain" else torch.randn(num_experts, device="cuda")
-    if routing == "ties":
-        weight.zero_()
-        bias.zero_()
-    image_bias = (
-        torch.randn(num_experts, device="cuda")
-        if routing in ("image", "mixed")
-        else None
-    )
-    input_ids = torch.arange(tokens, device="cuda", dtype=torch.int64) % 16
-    image_mask = (input_ids >= 10) & (input_ids < 15)
-    table = (
-        torch.randint(num_experts, (16, 6), device="cuda", dtype=torch.int64)
-        if routing in ("hash", "mixed")
-        else None
-    )
-    fixed = ~image_mask if image_bias is not None else torch.ones_like(image_mask)
-    expected_weights, expected_ids = mega_gate(
-        x,
-        weight,
-        6,
-        scoring_func="sqrtsoftplus",
-        routed_scaling_factor=2.5,
-        ep_rank=0,
-        bias=bias,
-        image_bias=image_bias,
-        image_token_mask=image_mask,
-        fix_routing_mask=fixed if table is not None else None,
-        unmapped_topk_idx=table[input_ids] if table is not None else None,
-    )
-    captured = {}
-
-    gate = mega_moe_gate_factory(num_experts)
-    gate.weight.data.copy_(weight)
-    gate.tid2eid = table
-    gate.e_score_correction_bias = bias
-    gate.bias_vl = image_bias
-
-    class Experts:
-        has_fused_shared_experts = False
-
-        def __call__(self, hidden, weights, ids, shared_experts):
-            assert shared_experts is None
-            captured.update(weights=weights, ids=ids)
-            return hidden
-
-    moe = SimpleNamespace(
-        gate=gate,
-        use_native_mega_moe=True,
-        scoring_func="sqrtsoftplus",
-        n_activated_experts=6,
-        renormalize=True,
-        hash_indices_dtype=torch.int64,
-        routed_scaling_factor=2.5,
-        image_sentinel_lo=10,
-        ep_rank=0,
-        swiglu_limit=None,
-        experts=Experts(),
-        shared_experts=None,
-    )
-    metadata = SimpleNamespace(
-        image_token_mask=image_mask,
-        safe_hash_input_ids=input_ids,
-        hash_token_mask=fixed,
-    )
-    output = model.DeepseekV4MoE.forward(moe, x, input_ids, metadata)
-    assert output.data_ptr() == x.data_ptr()
-    torch.testing.assert_close(captured["ids"], expected_ids, atol=0, rtol=0)
-    torch.testing.assert_close(
-        captured["weights"], expected_weights, atol=1e-6, rtol=1e-5
-    )
-    assert captured["weights"].is_contiguous()
-    assert captured["ids"].is_contiguous()
