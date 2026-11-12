@@ -82,6 +82,39 @@ quantization and checkpoint-name mappings. These source adaptations still need
 device, model-load and inference verification; see the
 [verification guide](verification_guide.md).
 
+### MegaMoE
+
+On Zhenwu M890, select MegaMoE with expert parallelism:
+
+```bash
+vllm serve /path/to/deepseek-v41 \
+  --enable-expert-parallel --moe-backend deep_gemm_mega_moe
+```
+
+The mode selects the activation precision for MXFP4 routed expert weights.
+All three modes return BF16 outputs. Install a
+[DeepGEMM-for-sail](https://github.com/t-head/DeepGEMM-for-sail) build exposing
+the selected kernel and its weight transform, where applicable.
+
+| Mode | `VLLM_SAIL_MEGA_MOE_MMA_TYPE` | Activation | Expert dimensions |
+| --- | --- | --- | --- |
+| W4A4 | `mxf4xmxf4` | SwiGLU, SiTU | Hidden ≥ 2048 and divisible by 512. Intermediate divisible by 64. |
+| W4A8 (default) | `fp8xmxfp4` | SwiGLU, SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
+| W4A16 | `bf16xmxfp4` | SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
+
+DeepSeek V4/V4.1 uses SwiGLU and can select W4A4 or W4A8. Kimi K3's native
+latent MoE uses SiTU and requires an eligible MXFP4 checkpoint. W4A8 requires
+EPLB to be disabled because rebalancing can change the inverse weight scale
+captured by the kernel. Restart the server to replace checkpoint weights
+with W4A8 or W4A16, whose transformed banks are bound by CUDA graphs. Shared
+experts run as a separate MLP.
+
+Upstream DeepSeek uses GateLinear with fused top-k for small local batches.
+Larger local batches require a DeepGEMM build exposing `bf16_mega_gate`.
+
+`VLLM_SAIL_MOE_BACKEND=deepgemm` continues to select the ordinary PPU DeepGEMM
+expert backend. Use the CLI selection above for MegaMoE.
+
 ## Compatibility controls
 
 For FP8/BF16 conversion and recipe selection, see [Online quantization](online_quantization.md).

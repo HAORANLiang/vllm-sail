@@ -35,8 +35,11 @@ BOOL_DEFAULTS = {
     "PPU_KV_MXFP8": False,
 }
 BACKENDS = ("MOE_BACKEND", "DENSE_BACKEND")
-# String env vars with a non-None default and no legacy VLLM_PPU_* alias.
-STRING_DEFAULTS = {"KPOOL_DECODE_LOGITS": "non_paged"}
+# String env vars with a non-None default.
+STRING_DEFAULTS = {
+    "KPOOL_DECODE_LOGITS": "non_paged",
+    "MEGA_MOE_MMA_TYPE": "fp8xmxfp4",
+}
 INT_DEFAULTS = {"KPOOL_MAX_DENSE_POOLS": 1 << 21}
 
 
@@ -61,6 +64,17 @@ def test_defaults_and_canonical_snapshot() -> None:
     assert set(envs.environment_variables) == set(expected)
     for suffix in (*BOOL_DEFAULTS, *BACKENDS):
         assert getattr(envs, f"VLLM_PPU_{suffix}") == expected[f"VLLM_SAIL_{suffix}"]
+
+
+def test_mega_moe_mma_type_is_lazy_and_checks_choices(monkeypatch):
+    name = "VLLM_SAIL_MEGA_MOE_MMA_TYPE"
+    assert getattr(envs, name) == "fp8xmxfp4"
+    for mode in ("fp8xmxfp4", "bf16xmxfp4", "mxf4xmxf4"):
+        monkeypatch.setenv(name, f" {mode.upper()} ")
+        assert getattr(envs, name) == mode
+    monkeypatch.setenv(name, "unsupported")
+    with pytest.raises(ValueError, match=name):
+        getattr(envs, name)
 
 
 @pytest.mark.parametrize("suffix", BOOL_DEFAULTS)

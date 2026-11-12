@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     VLLM_SAIL_DISABLE_MOE_WNA16_CUDA: bool = False
     VLLM_SAIL_FORCE_MOE_WNA16_CUDA: bool = False
     VLLM_SAIL_ENABLE_MOE_MARLIN: bool = False
+    VLLM_SAIL_MEGA_MOE_MMA_TYPE: str = "fp8xmxfp4"
     VLLM_SAIL_DISABLE_MEGA_MHC: bool = False
     VLLM_SAIL_USE_TRITON_INT8_QUANT: bool = True
     VLLM_SAIL_FP8_LOAD_POLICY: str | None = None
@@ -85,6 +86,7 @@ _TRUTHY = ("true", "1", "yes", "on")
 GEMM_BACKENDS = ("deepgemm", "acext", "triton")
 GDN_DECODE_KERNELS = ("auto", "cuda", "pla", "triton")
 KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged",)
+MEGA_MOE_MMA_TYPES = ("mxf4xmxf4", "fp8xmxfp4", "bf16xmxfp4")
 
 
 def _env_names(name: str) -> tuple[str, ...]:
@@ -190,6 +192,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Legacy Marlin selection gate. Native Marlin execution remains excluded
     # by the CUDA-free manifest; this flag cannot supply those kernels.
     "VLLM_SAIL_ENABLE_MOE_MARLIN": _bool("VLLM_SAIL_ENABLE_MOE_MARLIN", False),
+    "VLLM_SAIL_MEGA_MOE_MMA_TYPE": _choice(
+        "VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp8xmxfp4", MEGA_MOE_MMA_TYPES
+    ),
     # -- DSV4.1 mHC ----------------------------------------------------------
     # Disable the PPU Mega mHC kernel so the upstream TileLang mHC path takes
     # over. The A/B baseline for bisecting mHC regressions: the two paths
