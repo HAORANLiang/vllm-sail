@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SAIL W4A4 MegaMoE with direct kernel-layout loading and native EPLB."""
+"""SAIL DeepGEMM MegaMoE expert layouts and dispatch."""
 
 from __future__ import annotations
 
@@ -19,7 +19,12 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from vllm_sail.utils.deep_gemm_mega import check_mega_moe_supported, mega_moe_api
+import vllm_sail.envs as sail_envs
+from vllm_sail.utils.deep_gemm_mega import (
+    MEGA_MOE_FORMATS,
+    check_mega_moe_supported,
+    mega_moe_api,
+)
 
 
 def mega_gate(
@@ -59,7 +64,7 @@ def mega_gate(
 
 
 class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
-    """Retain vLLM routing/loading; dispatch BF16 tokens as MXFP4 on PPU."""
+    """Use the selected PPU MegaMoE kernel with native vLLM routing."""
 
     _symm_buffers: dict[tuple, object] = {}
 
@@ -81,9 +86,22 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         max_num_tokens=None,
         prefix="",
     ):
-        # The SAIL kernel consumes a different scale layout and dispatch API.
-        if weight_format != MEGA_MOE_MXFP4 or activation.name != "swiglu":
-            raise ValueError("SAIL MegaMoE requires MXFP4 weights and SwiGLU.")
+        if weight_format != MEGA_MOE_MXFP4:
+            raise ValueError("SAIL MegaMoE requires MXFP4 weights.")
+        self.mma_type = sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
+        self.mma_format = MEGA_MOE_FORMATS[self.mma_type]
+        if activation.name not in self.mma_format.activations:
+            raise ValueError(
+                f"SAIL MegaMoE {self.mma_type} requires "
+                f"{' or '.join(self.mma_format.activations)} activation, "
+                f"got {activation.name}."
+            )
+        max_local_experts = 127 if self.mma_type == "bf16xmxfp4" else 128
+        if num_local_experts > max_local_experts:
+            raise ValueError(
+                f"SAIL MegaMoE {self.mma_type} supports at most "
+                f"{max_local_experts} local experts per EP rank."
+            )
         self.weight_format = weight_format
         self.activation = activation
         self.fast_math = fast_math
@@ -107,6 +125,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             num_logical_experts if num_logical_experts is not None else num_experts
         )
         self.eplb_state = EplbLayerState()
+        self._transformed_weights = None
         self._register_weight(
             "w13", (num_local_experts, 2 * intermediate_size, hidden_size), None
         )
@@ -133,7 +152,10 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
 
     def _check_runtime_supported(self):
         check_mega_moe_supported(
-            self.w13_weight.device, self.hidden_size, self.intermediate_size
+            self.w13_weight.device,
+            self.hidden_size,
+            self.intermediate_size,
+            self.mma_type,
         )
 
     def weight_loader(
@@ -167,7 +189,12 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 torch.zeros(experts, n, k // 2, dtype=torch.uint8), requires_grad=False
             ),
         )
-        scales = torch.zeros(experts, k // 64, n, dtype=torch.uint16).transpose(1, 2)
+        if self.mma_format.transform is None:
+            scales = torch.zeros(experts, k // 64, n, dtype=torch.uint16).transpose(
+                1, 2
+            )
+        else:
+            scales = torch.zeros(experts, n, k // 32, dtype=torch.uint8)
         self.register_parameter(
             f"{name}_weight_scale", torch.nn.Parameter(scales, requires_grad=False)
         )
@@ -192,11 +219,46 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             )
             if src.shape != (rows, k // 32):
                 raise ValueError(f"Invalid {shard_id} UE8M0 scale shape: {src.shape}")
-            src = src.view(torch.uint8).contiguous().view(torch.uint16)
+            src = src.view(torch.uint8)
+            if self.mma_format.transform is None:
+                src = src.contiguous().view(torch.uint16)
         if shard_id != "w2":
-            half = 0 if shard_id == "w1" else 1
-            dst = dst[half::2]
+            if self.mma_format.transform is None:
+                dst = dst[0::2] if shard_id == "w1" else dst[1::2]
+            else:
+                rows = dst.shape[0] // 2
+                dst = dst[:rows] if shard_id == "w1" else dst[rows:]
         dst.copy_(src)
+        self._transformed_weights = None
+
+    def _kernel_weights(self, api):
+        transform_name = self.mma_format.transform
+        if transform_name is None:
+            return self.l1_weights, self.l2_weights
+        # EPLB writes into the registered raw banks, bypassing the loader.
+        if self.eplb_state.logical_to_physical_map is not None:
+            return api.transform_weights_for_w4a16_mega_moe(
+                self.l1_weights, self.l2_weights, self.activation.name
+            )
+        if self._transformed_weights is None:
+            transform = getattr(api, transform_name)
+            args = (self.l1_weights, self.l2_weights)
+            if self.mma_type == "bf16xmxfp4":
+                args += (self.activation.name,)
+            self._transformed_weights = transform(*args)
+        return self._transformed_weights
+
+    def _kernel_kwargs(self):
+        activation = self.activation
+        kwargs = {"activation": activation.name, "fast_math": self.fast_math}
+        if activation.name == "situ":
+            kwargs["situ_beta"] = activation.alpha
+            kwargs["situ_linear_beta"] = activation.beta or None
+        else:
+            kwargs["activation_clamp"] = activation.clamp
+        if self.mma_format.transform is None:
+            kwargs["recipe"] = (1, 1, 32)
+        return kwargs
 
     def get_symm_buffer(self):
         group = get_ep_group().device_group
@@ -208,17 +270,21 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             self.top_k,
             self.hidden_size,
             self.intermediate_size,
+            self.mma_type,
+            self.activation.name,
         )
         if key not in self._symm_buffers:
-            self._symm_buffers[key] = mega_moe_api().get_symm_buffer_for_mega_moe(
+            self._symm_buffers[key] = mega_moe_api(
+                self.mma_type
+            ).get_symm_buffer_for_mega_moe(
                 group,
                 self.num_experts,
                 self.max_num_tokens,
                 self.top_k,
                 self.hidden_size,
                 self.intermediate_size,
-                mma_type="mxf4xmxf4",
-                activation="swiglu",
+                mma_type=self.mma_type,
+                activation=self.activation.name,
             )
         return self._symm_buffers[key]
 
@@ -237,6 +303,11 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 topk_ids = torch.where(padding[:tokens, None], -1, topk_ids)
         state = self.eplb_state
         if state.logical_to_physical_map is not None:
+            if self.mma_type == "fp8xmxfp4":
+                raise NotImplementedError(
+                    "SAIL W4A8 MegaMoE does not support EPLB because rebalancing "
+                    "can change the inverse weight scale captured by the kernel."
+                )
             topk_ids = eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
                 expert_load_view=state.expert_load_view,
@@ -249,9 +320,12 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                     else None
                 ),
             )
-        api, buffer = mega_moe_api(), self.get_symm_buffer()
+        api = mega_moe_api(self.mma_type)
+        l1, l2 = self._kernel_weights(api)
+        buffer = self.get_symm_buffer()
+        x = hidden_states.contiguous()
         api.mega_moe_pre_dispatch(
-            hidden_states,
+            x,
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.float32).contiguous(),
             buf_x=buffer.x,
@@ -259,19 +333,12 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             buf_topk_idx=buffer.topk_idx,
             buf_topk_weights=buffer.topk_weights,
             num_tokens=tokens,
+            mma_type=self.mma_type,
         )
-        output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        output = torch.empty_like(x, dtype=torch.bfloat16)
         # Every EP rank participates, including ranks with zero local tokens.
-        api.fp4_fp4_mega_moe(
-            output,
-            self.l1_weights,
-            self.l2_weights,
-            buffer,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=self.activation.clamp,
-            fast_math=self.fast_math,
-        )
+        kernel = getattr(api, self.mma_format.kernel)
+        kernel(output, l1, l2, buffer, **self._kernel_kwargs())
         if shared_experts is not None:
             output += shared_experts(hidden_states)
         return output

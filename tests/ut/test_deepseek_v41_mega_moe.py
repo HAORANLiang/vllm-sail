@@ -25,11 +25,15 @@ _MEGAMOE_GATE_PROVIDER = "vllm.utils.deep_gemm"
 _KIMI_MODEL = "vllm.models.kimi_k3.nvidia.model"
 _MINIMAX_MODEL = "vllm.models.minimax_m3.nvidia.model"
 _MEGAMOE_CLASS = "PPUDeepGemmMegaMoEExperts"
-_MEGAMOE_REQUIRED = (
+_MEGAMOE_COMMON_APIS = (
     "get_symm_buffer_for_mega_moe",
     "mega_moe_pre_dispatch",
-    "fp4_fp4_mega_moe",
 )
+_MEGAMOE_MODE_APIS = {
+    "mxf4xmxf4": ("fp4_fp4_mega_moe",),
+    "fp8xmxfp4": ("fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
+    "bf16xmxfp4": ("bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
+}
 
 
 @pytest.fixture
@@ -374,18 +378,26 @@ def test_megamoe_api_import_is_lazy_and_reports_missing_package(megamoe_api_modu
     with pytest.raises(
         RuntimeError, match=r"DeepGEMM-for-sail.*deep_gemm\.mega"
     ) as error:
-        module.mega_moe_api()
+        module.mega_moe_api("fp8xmxfp4")
     assert isinstance(error.value.__cause__, ImportError)
     assert calls == ["deep_gemm.mega"]
 
 
-@pytest.mark.parametrize("missing", _MEGAMOE_REQUIRED)
+@pytest.mark.parametrize(
+    "mode,missing",
+    [
+        (mode, api)
+        for mode, mode_apis in _MEGAMOE_MODE_APIS.items()
+        for api in (*_MEGAMOE_COMMON_APIS, *mode_apis)
+    ],
+)
 @pytest.mark.parametrize("noncallable", [False, True], ids=["absent", "noncallable"])
 def test_megamoe_api_reports_missing_required_functions_and_allows_retry(
-    megamoe_api_module, monkeypatch, missing, noncallable
+    megamoe_api_module, monkeypatch, mode, missing, noncallable
 ):
     module, calls = megamoe_api_module
-    api = SimpleNamespace(**{name: lambda: None for name in _MEGAMOE_REQUIRED})
+    required = (*_MEGAMOE_COMMON_APIS, *_MEGAMOE_MODE_APIS[mode])
+    api = SimpleNamespace(**{name: lambda: None for name in required})
     if noncallable:
         setattr(api, missing, object())
     else:
@@ -398,39 +410,47 @@ def test_megamoe_api_reports_missing_required_functions_and_allows_retry(
     monkeypatch.setattr(
         module, "importlib", SimpleNamespace(import_module=import_module)
     )
-    with pytest.raises(RuntimeError) as error:
-        module.mega_moe_api()
-    assert str(error.value) == f"PPU MegaMoE API is missing: {missing}"
+    with pytest.raises(RuntimeError, match=missing):
+        module.mega_moe_api(mode)
     setattr(api, missing, lambda: None)
-    assert module.mega_moe_api() is api
-    assert module.mega_moe_api() is api
+    assert module.mega_moe_api(mode) is api
+    assert module.mega_moe_api(mode) is api
     assert calls == ["deep_gemm.mega", "deep_gemm.mega"]
 
 
-def test_megamoe_api_reports_all_missing_functions(megamoe_api_module, monkeypatch):
+@pytest.mark.parametrize("mode", _MEGAMOE_MODE_APIS)
+def test_megamoe_api_reports_all_missing_functions(
+    megamoe_api_module, monkeypatch, mode
+):
     module, _ = megamoe_api_module
     monkeypatch.setattr(
         module, "importlib", SimpleNamespace(import_module=lambda _: SimpleNamespace())
     )
     with pytest.raises(RuntimeError) as error:
-        module.mega_moe_api()
-    missing = ", ".join(_MEGAMOE_REQUIRED)
-    assert str(error.value) == f"PPU MegaMoE API is missing: {missing}"
+        module.mega_moe_api(mode)
+    for name in (*_MEGAMOE_COMMON_APIS, *_MEGAMOE_MODE_APIS[mode]):
+        assert name in str(error.value)
 
 
 @pytest.mark.parametrize(
-    "hidden,intermediate,supported",
+    "mode,hidden,intermediate,supported",
     [
-        (2048, 64, True),
-        (2560, 128, True),
-        (512, 128, False),
-        (2048, 0, False),
-        (2048, 96, False),
-        (2304, 128, False),
+        ("mxf4xmxf4", 2048, 64, True),
+        ("mxf4xmxf4", 2560, 128, True),
+        ("mxf4xmxf4", 512, 128, False),
+        ("mxf4xmxf4", 2048, 0, False),
+        ("mxf4xmxf4", 2048, 96, False),
+        ("mxf4xmxf4", 2304, 128, False),
+        ("fp8xmxfp4", 2304, 128, True),
+        ("fp8xmxfp4", 2048, 64, False),
+        ("fp8xmxfp4", 2176, 128, False),
+        ("bf16xmxfp4", 2304, 128, True),
+        ("bf16xmxfp4", 2048, 0, False),
+        ("bf16xmxfp4", 0, 128, False),
     ],
 )
 def test_megamoe_geometry_matches_wheel_contract(
-    modules, monkeypatch, hidden, intermediate, supported
+    modules, monkeypatch, mode, hidden, intermediate, supported
 ):
     modules(
         "vllm.platforms",
@@ -442,21 +462,22 @@ def test_megamoe_geometry_matches_wheel_contract(
     modules("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
     module = load_patch(_MEGAMOE_API)
     calls = []
-    monkeypatch.setattr(module, "mega_moe_api", lambda: calls.append("api"))
+    monkeypatch.setattr(module, "mega_moe_api", calls.append)
     device = SimpleNamespace(index=0)
     if supported:
-        module.check_mega_moe_supported(device, hidden, intermediate)
-        assert calls == ["api"]
+        module.check_mega_moe_supported(device, hidden, intermediate, mode)
+        assert calls == [mode]
     else:
-        with pytest.raises(ValueError, match="H >= 2048.*I divisible by 64"):
-            module.check_mega_moe_supported(device, hidden, intermediate)
+        with pytest.raises(ValueError):
+            module.check_mega_moe_supported(device, hidden, intermediate, mode)
         assert not calls
 
 
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("with_shared", [False, True])
+@pytest.mark.parametrize("mode", _MEGAMOE_MODE_APIS)
 def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
-    tokens, with_shared
+    tokens, with_shared, mode
 ):
     calls = []
 
@@ -480,6 +501,8 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
     )
     l1, l2 = object(), object()
+    kernel_name = _MEGAMOE_MODE_APIS[mode][0]
+    expected_kwargs = {"fast_math": False, "activation": "swiglu"}
 
     def dispatch(
         x,
@@ -499,23 +522,28 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         assert buf_topk_idx is buffer.topk_idx
         assert buf_topk_weights is buffer.topk_weights
         assert num_tokens == tokens
-        assert group_size == 32 and mma_type == "mxf4xmxf4"
+        assert group_size == 32 and mma_type == mode
         calls.append("dispatch")
 
     def kernel(y, first, second, symm, **kwargs):
         assert (y, first, second, symm) == (output, l1, l2, buffer)
-        assert kwargs == dict(
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=7.0,
-            fast_math=False,
-        )
+        assert kwargs == expected_kwargs
         calls.append("kernel")
 
     def shared(x):
         assert x is hidden
         calls.append("shared")
         return "shared-output"
+
+    api = SimpleNamespace(mega_moe_pre_dispatch=dispatch, **{kernel_name: kernel})
+
+    def get_api(mma_type):
+        assert mma_type == mode
+        return api
+
+    def kernel_weights(actual_api):
+        assert actual_api is api
+        return l1, l2
 
     ns = {
         "torch": SimpleNamespace(
@@ -525,9 +553,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
             empty_like=lambda x, dtype: output,
         ),
         "envs": SimpleNamespace(VLLM_MOE_SKIP_PADDING=False),
-        "mega_moe_api": lambda: SimpleNamespace(
-            mega_moe_pre_dispatch=dispatch, fp4_fp4_mega_moe=kernel
-        ),
+        "mega_moe_api": get_api,
     }
     forward = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.forward", ns)
     expert = SimpleNamespace(
@@ -536,10 +562,10 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         capture_fn=lambda value: calls.append(("capture", value)),
         eplb_state=SimpleNamespace(logical_to_physical_map=None),
         get_symm_buffer=lambda: buffer,
-        l1_weights=l1,
-        l2_weights=l2,
-        activation=SimpleNamespace(clamp=7.0),
-        fast_math=False,
+        mma_type=mode,
+        mma_format=SimpleNamespace(kernel=kernel_name),
+        _kernel_weights=kernel_weights,
+        _kernel_kwargs=lambda: expected_kwargs,
     )
     assert (
         forward(expert, hidden, weights, ids, shared if with_shared else None) is output

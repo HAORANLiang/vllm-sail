@@ -6,17 +6,29 @@ import pytest
 pytestmark = [pytest.mark.ppu, pytest.mark.cap89]
 
 
-def test_mega_moe_checkpoint_loader_matches_library_transform():
+def test_mega_moe_checkpoint_loader_matches_library_transform(monkeypatch):
+    from types import SimpleNamespace
+
     import torch
     from deep_gemm.mega import transform_weights_for_mega_moe
 
     import vllm_sail
 
     vllm_sail.register_out_of_tree()
+    from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
+        MEGA_MOE_MXFP4,
+        MegaMoEActivation,
+    )
+
     from vllm_sail.model_executor.layers.fused_moe.experts.deep_gemm_mega_moe import (
         PPUDeepGemmMegaMoEExperts,
     )
 
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
     e, h, i = 2, 2048, 128
     with torch.device("cuda"):
         w13 = torch.randint(0, 256, (e, 2 * i, h // 2), dtype=torch.uint8)
@@ -24,11 +36,17 @@ def test_mega_moe_checkpoint_loader_matches_library_transform():
         s13 = torch.randint(120, 130, (e, 2 * i, h // 32), dtype=torch.uint8)
         s2 = torch.randint(120, 130, (e, h, i // 32), dtype=torch.uint8)
         expected = transform_weights_for_mega_moe((w13, s13), (w2, s2))
-        layer = PPUDeepGemmMegaMoEExperts.__new__(PPUDeepGemmMegaMoEExperts)
-        torch.nn.Module.__init__(layer)
-        layer.hidden_size, layer.intermediate_size = h, i
-        layer._register_weight("w13", (e, 2 * i, h), None)
-        layer._register_weight("w2", (e, h, i), None)
+        layer = PPUDeepGemmMegaMoEExperts(
+            config,
+            num_experts=e,
+            num_local_experts=e,
+            experts_start_idx=0,
+            top_k=2,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=MegaMoEActivation("swiglu"),
+            weight_format=MEGA_MOE_MXFP4,
+        )
         for expert in range(e):
             for shard, start in (("w1", 0), ("w3", i)):
                 layer._load_weight(
@@ -115,6 +133,7 @@ def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     h, i = 2048, 128
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
     monkeypatch.setattr(
         PPUDeepGemmMegaMoEExperts, "_check_runtime_supported", lambda self: None
     )
@@ -194,6 +213,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
     monkeypatch.setattr(
         mega_moe.PPUDeepGemmMegaMoEExperts,
         "_check_runtime_supported",
@@ -267,7 +287,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
     monkeypatch.setattr(
         mega_moe,
         "mega_moe_api",
-        lambda: SimpleNamespace(
+        lambda mode: SimpleNamespace(
             mega_moe_pre_dispatch=dispatch, fp4_fp4_mega_moe=kernel
         ),
     )
@@ -280,7 +300,8 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
 
 
 @pytest.mark.parametrize("tokens", [0, 16])
-def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
+@pytest.mark.parametrize("mode", ["mxf4xmxf4", "fp8xmxfp4", "bf16xmxfp4"])
+def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
     from types import SimpleNamespace
 
     import torch
@@ -302,6 +323,7 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", mode)
     torch.cuda.set_device(0)
     dist.init_process_group(
         "nccl", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1
@@ -311,6 +333,12 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
         mega_moe, "get_ep_group", lambda: SimpleNamespace(device_group=group)
     )
     try:
+        h, i = 2048, 128
+        activation = (
+            MegaMoEActivation("situ", alpha=4.0, beta=25.0)
+            if mode == "bf16xmxfp4"
+            else MegaMoEActivation("swiglu", clamp=7.0)
+        )
         with torch.device("cuda"):
             layer = mega_moe.PPUDeepGemmMegaMoEExperts(
                 config,
@@ -318,31 +346,54 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens):
                 num_local_experts=2,
                 experts_start_idx=0,
                 top_k=2,
-                hidden_size=2048,
-                intermediate_size=128,
-                activation=MegaMoEActivation("swiglu", clamp=None),
+                hidden_size=h,
+                intermediate_size=i,
+                activation=activation,
                 weight_format=MEGA_MOE_MXFP4,
             )
-            hidden = torch.randn(tokens, 2048, dtype=torch.bfloat16) * 0.01
+            hidden = torch.full((tokens, h), 0.125, dtype=torch.bfloat16)
             ids = torch.tensor([0, 1], dtype=torch.int64).expand(tokens, 2).contiguous()
             weights = torch.full((tokens, 2), 0.5, dtype=torch.float32)
-        layer.w13_weight_scale.data.fill_(0x7878)
-        layer.w2_weight_scale.data.fill_(0x7878)
+            w13 = torch.full((i, h // 2), 0x22, dtype=torch.uint8)
+            w2 = torch.full((h, i // 2), 0x22, dtype=torch.uint8)
+            s13 = torch.full((i, h // 32), 0x78, dtype=torch.uint8)
+            s2 = torch.full((h, i // 32), 0x78, dtype=torch.uint8)
+
+        def load(expert, shard, suffix, source):
+            bank = "w2" if shard == "w2" else "w13"
+            name = f"{bank}_{suffix}"
+            assert layer.weight_loader(
+                getattr(layer, name), source, name, shard, expert, True
+            )
+
+        for expert in range(2):
+            for shard, weight, scale in (
+                ("w1", w13, s13),
+                ("w3", w13, s13),
+                ("w2", w2, s2),
+            ):
+                load(expert, shard, "weight", weight)
+                load(expert, shard, "weight_scale", scale)
         monkeypatch.setattr(
             layer, "_synchronize_first_launch", lambda: dist.barrier(group=group)
         )
         output = layer(hidden, weights, ids)
         torch.cuda.synchronize()
+        assert layer.mma_type == mode
         assert output.shape == hidden.shape and output.dtype == torch.bfloat16
-        torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
+        assert torch.isfinite(output).all()
         if tokens:
-            layer.w13_weight.data.fill_(0x22)
-            layer.w2_weight.data.fill_(0x22)
-            layer.activation = MegaMoEActivation("swiglu", clamp=7.0)
-            output = layer(hidden, weights, ids)
+            assert (output > 0).all()
+            zero_weight = torch.zeros_like(w2)
+            # The experts start identical and each gets half the route weight.
+            load(1, "w2", "weight", zero_weight)
+            half = layer(hidden, weights, ids)
             torch.cuda.synchronize()
-            assert torch.isfinite(output).all()
-            assert output.abs().max() > 0
+            torch.testing.assert_close(half, output * 0.5, rtol=0.02, atol=0)
+            load(0, "w2", "weight", zero_weight)
+            zero = layer(hidden, weights, ids)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(zero, torch.zeros_like(zero), rtol=0, atol=0)
     finally:
         torch.cuda.synchronize()
         cache = mega_moe.PPUDeepGemmMegaMoEExperts._symm_buffers

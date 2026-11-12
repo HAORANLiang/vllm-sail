@@ -244,28 +244,43 @@ class PPUPlatform(NvmlCudaPlatform):
         normalize_expert_dtype(vllm_config)
 
         if vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe":
+            from vllm_sail import envs as sail_envs
             from vllm_sail.utils.deep_gemm_mega import check_mega_moe_supported
 
-            config = vllm_config.model_config.hf_text_config
-            if config.model_type not in (
+            model_config = vllm_config.model_config
+            config = model_config.hf_text_config
+            is_deepseek = config.model_type in (
                 "deepseek_v4",
                 "deepseek_v41",
                 "deepseek_v41_text",
-            ):
-                raise ValueError(
-                    "SAIL MegaMoE is integrated with DeepSeek V4/V4.1 only."
-                )
-            if getattr(config, "expert_dtype", "fp4") != "fp4":
-                raise ValueError(
-                    "SAIL MegaMoE requires MXFP4 experts (expert_dtype=fp4)."
-                )
-            import torch
-
-            check_mega_moe_supported(
-                torch.device("cuda", torch.cuda.current_device()),
-                config.hidden_size,
-                config.moe_intermediate_size,
             )
+            if not is_deepseek and model_config.hf_config.model_type != "kimi_k3":
+                raise ValueError(
+                    "SAIL MegaMoE is integrated with DeepSeek V4/V4.1 and Kimi K3."
+                )
+            mma_type = sail_envs.VLLM_SAIL_MEGA_MOE_MMA_TYPE
+            if mma_type == "fp8xmxfp4" and vllm_config.parallel_config.enable_eplb:
+                raise NotImplementedError("SAIL W4A8 MegaMoE does not support EPLB.")
+            if is_deepseek:
+                if getattr(config, "expert_dtype", "fp4") != "fp4":
+                    raise ValueError(
+                        "SAIL MegaMoE requires MXFP4 experts (expert_dtype=fp4)."
+                    )
+                if mma_type == "bf16xmxfp4":
+                    raise ValueError(
+                        "SAIL W4A16 MegaMoE requires SiTU. DeepSeek V4/V4.1 uses SwiGLU."
+                    )
+
+                import torch
+
+                check_mega_moe_supported(
+                    torch.device("cuda", torch.cuda.current_device()),
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                    mma_type,
+                )
+            # Kimi constructs its experts with latent and padded dimensions.
+            logger.info_once("SAIL DeepGEMM MegaMoE selected MMA type %s.", mma_type)
 
         compilation_config = vllm_config.compilation_config
         attention_config = vllm_config.attention_config
