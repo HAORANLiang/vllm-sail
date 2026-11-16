@@ -24,7 +24,7 @@ def test_mega_moe_checkpoint_loader_matches_library_transform(monkeypatch):
         PPUDeepGemmMegaMoEExperts,
     )
 
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -101,7 +101,7 @@ def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     h, i = 2048, 128
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     monkeypatch.setattr(
         PPUDeepGemmMegaMoEExperts, "_check_runtime_supported", lambda self: None
     )
@@ -181,7 +181,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     monkeypatch.setattr(
         mega_moe.PPUDeepGemmMegaMoEExperts,
         "_check_runtime_supported",
@@ -219,7 +219,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         buf_topk_weights,
         num_tokens,
         group_size=32,
-        mma_type="mxf4xmxf4",
+        mma_type="fp4xfp4",
     ):
         assert x is hidden
         assert buf_x is buffer.x
@@ -227,7 +227,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         assert buf_topk_idx is buffer.topk_idx
         assert buf_topk_weights is buffer.topk_weights
         assert num_tokens == tokens
-        assert group_size == 32 and mma_type == "mxf4xmxf4"
+        assert group_size == 32 and mma_type == "fp4xfp4"
         assert selected_ids.dtype == torch.int32 and selected_ids.is_contiguous()
         assert selected_weights.dtype == torch.float32
         if tokens:
@@ -268,7 +268,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
 
 
 @pytest.mark.parametrize("tokens", [0, 16])
-@pytest.mark.parametrize("mode", ["mxf4xmxf4", "fp8xmxfp4", "bf16xmxfp4"])
+@pytest.mark.parametrize("mode", ["fp4xfp4", "fp8xfp4", "bf16xfp4"])
 def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
     from types import SimpleNamespace
 
@@ -300,7 +300,7 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
         h, i = 2048, 128
         activation = (
             MegaMoEActivation("situ", alpha=4.0, beta=25.0)
-            if mode == "bf16xmxfp4"
+            if mode == "bf16xfp4"
             else MegaMoEActivation("swiglu", clamp=7.0)
         )
         with torch.device("cuda"):

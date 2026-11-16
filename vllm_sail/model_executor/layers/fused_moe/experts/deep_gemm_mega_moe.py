@@ -60,7 +60,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 f"{' or '.join(self.mma_format.activations)} activation, "
                 f"got {activation.name}."
             )
-        max_local_experts = 127 if self.mma_type == "bf16xmxfp4" else 128
+        max_local_experts = 127 if self.mma_type == "bf16xfp4" else 128
         if num_local_experts > max_local_experts:
             raise ValueError(
                 f"SAIL MegaMoE {self.mma_type} supports at most "
@@ -120,7 +120,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         weight = getattr(self, f"{name}_weight")
         scale = getattr(self, f"{name}_weight_scale", None)
         weights = (weight, scale)
-        if self.mma_type == "fp8xmxfp4":
+        if self.mma_type == "fp8xfp4":
             # W4A8 kernel expects each bank's inverse scale, returned by the
             # weight transform.
             weights += (self._l1_inv_scale if name == "w13" else self._l2_inv_scale,)
@@ -156,10 +156,10 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             (self.w13_weight, self.w13_weight_scale),
             (self.w2_weight, self.w2_weight_scale),
         )
-        if self.mma_type == "bf16xmxfp4":
+        if self.mma_type == "bf16xfp4":
             args += (self.activation.name,)
         transformed_l1, transformed_l2 = transform(*args)
-        if self.mma_type == "fp8xmxfp4":
+        if self.mma_type == "fp8xfp4":
             (
                 self.w13_weight.data,
                 self.w13_weight_scale.data,
@@ -309,7 +309,7 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 topk_ids = torch.where(padding[:tokens, None], -1, topk_ids)
         state = self.eplb_state
         if state.logical_to_physical_map is not None:
-            if self.mma_type == "fp8xmxfp4":
+            if self.mma_type == "fp8xfp4":
                 raise NotImplementedError(
                     "SAIL W4A8 MegaMoE does not support EPLB because rebalancing "
                     "can change the inverse weight scale captured by the kernel."
