@@ -988,6 +988,73 @@ def test_runtime_scripts_capture_same_image_stack_before_installing_wheels(scrip
     assert "--constraints" in text[capture:install]
 
 
+@pytest.mark.parametrize("script", ["ppu_e2e_smoke.sh", "ppu_upstream_reuse.sh"])
+def test_runtime_lanes_upgrade_transformers_before_verifying_image_stack(
+    script, tmp_path
+):
+    from packaging.requirements import Requirement
+
+    text = (ROOT / "scripts/ci" / script).read_text()
+    start = text.index("python -m pip install")
+    end = text.index("\n\n", text.index('ppu_image_stack.py" verify', start))
+    calls = tmp_path / "calls.jsonl"
+    python = tmp_path / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['CALLS'], 'a') as log:\n"
+        "    log.write(json.dumps([sys.argv[1:], os.environ.get('PIP_CONSTRAINT')]) + '\\n')\n"
+    )
+    python.chmod(0o755)
+    subprocess.run(
+        [
+            "bash",
+            "-euc",
+            "vllm_wheels=(/wheels/vllm.whl)\n"
+            "sail_wheels=(/wheels/vllm_sail.whl)\n" + text[start:end],
+        ],
+        env={
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "ROOT_DIR": str(ROOT),
+            "WHEELS_DIR": str(tmp_path),
+            "REUSE_RESULTS_DIR": str(tmp_path),
+            "PIP_CONSTRAINT": str(tmp_path / "image-constraints.txt"),
+            "CALLS": str(calls),
+            "BASH_ENV": "/dev/null",
+        },
+        check=True,
+    )
+    recorded = [json.loads(line) for line in calls.read_text().splitlines()]
+    assert recorded[-1][0][1] == "verify"
+
+    def requirements(path):
+        for line in path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                yield Requirement(line)
+
+    installed = []
+    for args, constraint in recorded[:-1]:
+        if args[:3] != ["-m", "pip", "install"]:
+            continue
+        assert constraint == str(tmp_path / "image-constraints.txt")
+        for index, arg in enumerate(args[:-1]):
+            if arg == "-r":
+                installed.extend(requirements(Path(args[index + 1])))
+    transformers = [req for req in installed if req.name == "transformers"]
+    assert len(transformers) == 1, "runtime must upgrade the image's transformers"
+    assert "5.16.1" in transformers[0].specifier
+    assert "5.15.0" not in transformers[0].specifier
+    assert "5.20.0" not in transformers[0].specifier
+    for filename in ("dev.txt", "ppu.txt"):
+        expected = next(
+            req
+            for req in requirements(ROOT / "requirements" / filename)
+            if req.name == "transformers"
+        )
+        assert transformers[0].specifier == expected.specifier
+
+
 def test_native_repack_is_verified_and_falls_back_to_full_build() -> None:
     text = SCRIPT.read_text()
     fingerprint = text.index('ppu_wheel_manifest.py" \\\n        fingerprint')

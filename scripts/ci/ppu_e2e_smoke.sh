@@ -75,6 +75,8 @@ python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" capture \
     --constraints "${PIP_CONSTRAINT}"
 python -m pip install --no-deps --force-reinstall "${vllm_wheels[0]}"
 python -m pip install --no-deps --force-reinstall "${sail_wheels[0]}"
+PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    python -m pip install -r "${ROOT_DIR}/requirements/ci-runtime.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
     --sdk /usr/local/PPU_SDK --output /tmp/ppu-smoke-image-stack.json
 

@@ -13,7 +13,7 @@
 #include <limits>
 #include <vector>
 
-#include <ATen/cuda/CUDAContext.h>
+#include "../step5_runtime.h"
 #include <torch/all.h>
 
 #ifndef STEP4_DSA_SELECTOR_THREADS
@@ -983,7 +983,7 @@ void step4_dsa_radix_select(
   int const block_table_stride =
       block_table.dim() == 2 ? static_cast<int>(block_table.stride(0)) : 0;
   int const block_table_length = static_cast<int>(block_table.size(-1));
-  auto stream = at::cuda::getCurrentCUDAStream(scores.device().index());
+  auto stream = get_current_cuda_stream(scores.device().index());
 
   // Request extra shared memory for the 4096-bin histogram.
   constexpr size_t kSelectorSmem = sizeof(Step4DsaRadixShared);

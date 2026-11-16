@@ -7,8 +7,8 @@
 
 #include <ATen/MemoryOverlap.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
 #include <torch/all.h>
+#include "../step5_runtime.h"
 
 namespace step5_dsa {
 

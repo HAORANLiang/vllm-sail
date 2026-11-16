@@ -1339,7 +1339,7 @@ void launch_explicit(const at::Tensor& query, const at::Tensor& key,
       : BQ == 4 ? (HeadTiles == 2 ? 128 : DSA_Q4_WARPS * 32)
             : BQ == 2 ? DSA_Q2_WARPS * 32 : kThreads;
   const dim3 grid(rows / BQ, 1, BQ >= 4 ? 1 : HeadTiles);
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = get_current_cuda_stream(query.get_device());
   step4_dsa_prefill_attn_kernel<8, false, true, BQ, false, HeadTiles>
       <<<grid, Threads, 0, stream>>>(
           reinterpret_cast<const __ppu_bfloat16*>(query.data_ptr()) + first * query.stride(0),
@@ -1468,7 +1468,7 @@ void step4_dsa_prefill_attn(at::Tensor const& query, at::Tensor const& key,
         });
       });
     });
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    step5_runtime::check(hggcGetLastError());
     return;
   }
   if (q_len == 0 || region_k == 0 || kv_seq_len == 0) {
@@ -1479,7 +1479,7 @@ void step4_dsa_prefill_attn(at::Tensor const& query, at::Tensor const& key,
   const bool sorted = dsa_prefill::config::kSortSlots &&
                       region_k <= dsa_prefill::config::kMaxSortSlots;
 
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = get_current_cuda_stream(query.get_device());
 
   const bool skip_dead =
       !sorted &&
@@ -1534,7 +1534,7 @@ void step4_dsa_prefill_attn(at::Tensor const& query, at::Tensor const& key,
           });
         }
       }
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      step5_runtime::check(hggcGetLastError());
       return;
     }
     const dim3 block(kGqa16 && block_q == 4 ? 128
@@ -1571,7 +1571,7 @@ void step4_dsa_prefill_attn(at::Tensor const& query, at::Tensor const& key,
       });
     });
   });
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  step5_runtime::check(hggcGetLastError());
 }
 
 }  // namespace

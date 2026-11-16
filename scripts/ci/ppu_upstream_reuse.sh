@@ -53,7 +53,9 @@ trap 'exit 143' TERM
 python -m pip install --no-index --no-deps --force-reinstall \
     "${WHEELS_DIR}"/vllm/*.whl "${WHEELS_DIR}"/vllm-sail/*.whl
 PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
-    python -m pip install --no-cache-dir -r "${ROOT_DIR}/requirements/upstream-reuse.txt"
+    python -m pip install --no-cache-dir \
+        -r "${ROOT_DIR}/requirements/ci-runtime.txt" \
+        -r "${ROOT_DIR}/requirements/upstream-reuse.txt"
 python "${ROOT_DIR}/scripts/ci/ppu_image_stack.py" verify \
     --sdk /usr/local/PPU_SDK --output "${REUSE_RESULTS_DIR}/image-stack.json"
 

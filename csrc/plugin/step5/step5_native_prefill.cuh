@@ -2,12 +2,13 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Ported from vllm-step5-dsa-890p-20261110/step5_sparse_prefill.cu.
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <hggc_runtime.h>
 #include <cfloat>
 #include <climits>
 #include <cmath>
 #include "step5_native_device.cuh"
+#include "step5_runtime.h"
 namespace STEP5_NATIVE_PREFILL_NAMESPACE {
 using namespace step5_dsa_native;
 constexpr int kHeads = STEP5_PREFILL_HEADS;
@@ -665,25 +666,25 @@ void step5_native_attention_kernel(Params p) {
   __builtin_trap();
 #endif
 }
-template <int BQ> void launch(Params p, cudaStream_t stream) {
+template <int BQ> void launch(Params p, hggcStream_t stream) {
   constexpr int HT = kHeads / 8, BS = BQ == 1 ? 16 : 64, PARTS = BQ == 1 ? 8 : 1;
   constexpr bool group_cta = BQ == 8 && kHeads == 16;
   const int blocks = p.groups * (group_cta ? 1 : kGroupRows / BQ);
   if constexpr (BQ > 1) {
     constexpr int bytes = BQ * kWords * sizeof(uint32_t);
     if (p.logical_regions > kWindowRegions) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(step5_prepare_union_kernel<BQ, group_cta, 2 * kWords>, cudaFuncAttributeMaxDynamicSharedMemorySize, 2 * bytes));
+      step5_runtime::check(hggcFuncSetAttribute(step5_prepare_union_kernel<BQ, group_cta, 2 * kWords>, hggcFuncAttributeMaxDynamicSharedMemorySize, 2 * bytes));
       step5_prepare_union_kernel<BQ, group_cta, 2 * kWords><<<blocks, 2 * kWords, 2 * bytes, stream>>>(p);
     } else step5_prepare_union_kernel<BQ, group_cta, kWords><<<blocks, kWords, bytes, stream>>>(p);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    step5_runtime::check(hggcGetLastError());
   }
   constexpr int threads = (BQ == 1 ? 1 : BQ / 2) * HT * 32, bytes = BS * 192 * 4 * PARTS;
   static_assert(PARTS == 1 || ((PARTS - 1) * HT * 8 * 192 + PARTS * HT * 8) * 4 <= bytes);
   if constexpr (BQ == 8) {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(step5_native_attention_kernel<kHeads>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    step5_runtime::check(hggcFuncSetAttribute(step5_native_attention_kernel<kHeads>, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     step5_native_attention_kernel<kHeads><<<blocks, threads, bytes, stream>>>(p);
   } else {
-    C10_CUDA_CHECK(cudaFuncSetAttribute(step5_paged_attention_kernel<BQ, HT, BS, PARTS>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    step5_runtime::check(hggcFuncSetAttribute(step5_paged_attention_kernel<BQ, HT, BS, PARTS>, hggcFuncAttributeMaxDynamicSharedMemorySize, bytes));
     step5_paged_attention_kernel<BQ, HT, BS, PARTS><<<blocks, threads * PARTS, bytes, stream>>>(p);
   }
 }
@@ -708,15 +709,15 @@ void run(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions
   p.rows = q.size(0); p.groups = starts.numel();
   p.width = regions.size(1); p.logical_regions = logical_regions; p.region_stride = regions.stride(0); p.scale = scale;
   p.qs = q.stride(0); p.qh = q.stride(1); p.os = out.stride(0); p.oh = out.stride(1);
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = get_current_cuda_stream(q.get_device());
   step5_validate_tiles_kernel<kHeads><<<1, 256, 0, stream>>>(p);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  step5_runtime::check(hggcGetLastError());
   switch (tile) {
     case 1: launch<1>(p, stream); break;
     case 2: launch<2>(p, stream); break;
     case 4: launch<4>(p, stream); break;
     case 8: launch<8>(p, stream); break;
   }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  step5_runtime::check(hggcGetLastError());
 }
 }  // namespace STEP5_NATIVE_PREFILL_NAMESPACE

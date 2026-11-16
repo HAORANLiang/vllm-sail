@@ -2,13 +2,14 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Ported from vllm-step5-dsa-890p-20261110/step5_sparse_decode.cu.
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <hggc_runtime.h>
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <optional>
 #include "step5_native_device.cuh"
+#include "step5_runtime.h"
 namespace step5_native_decode {
 using namespace step5_dsa_native;
 constexpr int kMaxSplits = 32, kMergeWarps = 4, kSingleWarpRows = 16, kDirectRows = 4096;
@@ -325,12 +326,12 @@ template <int Threads> __global__ void merge_single_row(Decode p) {
     out[0] = p.output_pair(sum.x, sum.y, sigmoid); out[1] = p.output_pair(sum.z, sum.w, sigmoid);
   }
 }
-void launch_single_row(Decode p, cudaStream_t stream) {
+void launch_single_row(Decode p, hggcStream_t stream) {
   const dim3 blocks(p.splits, p.heads / 8);
   packed_attention<8, kSingleRowTile, 1, false, true><<<blocks, 32, 0, stream>>>(p);
   if (p.splits > 1) { constexpr int tiles = kHeadDim / kSingleRowMergeWidth; merge_single_row<kSingleRowMergeThreads><<<p.heads * tiles, kSingleRowMergeThreads, 0, stream>>>(p); }
 }
-template <int Warps, bool Direct = false> void launch(Decode p, cudaStream_t stream) {
+template <int Warps, bool Direct = false> void launch(Decode p, hggcStream_t stream) {
   constexpr int TG = Warps == 1 ? 4 : 2;
   const int work = Direct ? p.rows : p.rows * p.splits, blocks = (work + Warps - 1) / Warps;
   if (p.heads == 16) packed_attention<16, TG, Warps, Direct><<<blocks, 32 * Warps, 0, stream>>>(p);
@@ -362,9 +363,9 @@ void run(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions
   p.rows = rows; p.heads = heads; p.slots = slots; p.splits = splits; p.groups = cache.size(1); p.rows_per_request = p.groups * query_len;
   p.qs = q.stride(0); p.qh = q.stride(1); p.os = out.stride(0); p.oh = out.stride(1); p.rs = regions.stride(0);
   p.gs = gate ? gate->stride(0) : 0; p.gh = gate ? gate->stride(1) : 0; p.clear_inactive = clear_inactive || gate.has_value(); p.scale = scale;
-  const auto stream = at::cuda::getCurrentCUDAStream();
+  const auto stream = get_current_cuda_stream(q.get_device());
   if (single) launch_single_row(p, stream); else if (rows >= kDirectRows) launch<2, true>(p, stream);
   else if (rows <= kSingleWarpRows) launch<1>(p, stream); else launch<2>(p, stream);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  step5_runtime::check(hggcGetLastError());
 }
 }  // namespace step5_native_decode
