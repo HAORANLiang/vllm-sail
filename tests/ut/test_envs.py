@@ -38,6 +38,7 @@ BOOL_DEFAULTS = {
     "FUSED_NORM_ROPE_ATTN": False,
     "PPU_KV_MXFP8": False,
     "PPU_KV_NVFP4": False,
+    "FUSED_ATTN_PER_TOKEN_SCALE": False,
 }
 BACKENDS = ("MOE_BACKEND", "DENSE_BACKEND")
 # String env vars with a non-None default.
