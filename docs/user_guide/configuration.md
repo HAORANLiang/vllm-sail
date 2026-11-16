@@ -98,9 +98,9 @@ the selected kernel and its weight transform, where applicable.
 
 | Mode | `VLLM_SAIL_MEGA_MOE_MMA_TYPE` | Activation | Expert dimensions |
 | --- | --- | --- | --- |
-| W4A4 | `mxf4xmxf4` | SwiGLU, SiTU | Hidden ≥ 2048 and divisible by 512. Intermediate divisible by 64. |
-| W4A8 (default) | `fp8xmxfp4` | SwiGLU, SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
-| W4A16 | `bf16xmxfp4` | SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
+| W4A4 | `fp4xfp4` | SwiGLU, SiTU | Hidden ≥ 2048 and divisible by 512. Intermediate divisible by 64. |
+| W4A8 (default) | `fp8xfp4` | SwiGLU, SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
+| W4A16 | `bf16xfp4` | SiTU | Hidden divisible by 256. Intermediate divisible by 128. |
 
 DeepSeek V4/V4.1 uses SwiGLU and can select W4A4 or W4A8. Kimi K3's native
 latent MoE uses SiTU and requires an eligible MXFP4 checkpoint. The platform

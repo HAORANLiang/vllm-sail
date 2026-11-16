@@ -18,10 +18,10 @@ class MegaMoEFormat(NamedTuple):
 
 
 MEGA_MOE_FORMATS = {
-    "mxf4xmxf4": MegaMoEFormat(
+    "fp4xfp4": MegaMoEFormat(
         "fp4_fp4_mega_moe", None, ("swiglu", "situ"), 2048, 512, 64
     ),
-    "fp8xmxfp4": MegaMoEFormat(
+    "fp8xfp4": MegaMoEFormat(
         "fp8_fp4_mega_moe",
         "transform_weights_for_w4a8_mega_moe",
         ("swiglu", "situ"),
@@ -29,7 +29,7 @@ MEGA_MOE_FORMATS = {
         256,
         128,
     ),
-    "bf16xmxfp4": MegaMoEFormat(
+    "bf16xfp4": MegaMoEFormat(
         "bf16_fp4_mega_moe",
         "transform_weights_for_w4a16_mega_moe",
         ("situ",),

@@ -24,7 +24,7 @@ def test_mega_moe_checkpoint_loader_matches_library_transform(monkeypatch):
         PPUDeepGemmMegaMoEExperts,
     )
 
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
@@ -101,7 +101,7 @@ def test_mega_moe_main_loader_and_eplb_views(monkeypatch):
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     h, i = 2048, 128
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     monkeypatch.setattr(
         PPUDeepGemmMegaMoEExperts, "_check_runtime_supported", lambda self: None
     )
@@ -181,7 +181,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "mxf4xmxf4")
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "fp4xfp4")
     monkeypatch.setattr(
         mega_moe.PPUDeepGemmMegaMoEExperts,
         "_check_runtime_supported",
@@ -219,7 +219,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         buf_topk_weights,
         num_tokens,
         group_size=32,
-        mma_type="mxf4xmxf4",
+        mma_type="fp4xfp4",
     ):
         assert x is hidden
         assert buf_x is buffer.x
@@ -227,7 +227,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
         assert buf_topk_idx is buffer.topk_idx
         assert buf_topk_weights is buffer.topk_weights
         assert num_tokens == tokens
-        assert group_size == 32 and mma_type == "mxf4xmxf4"
+        assert group_size == 32 and mma_type == "fp4xfp4"
         assert selected_ids.dtype == torch.int32 and selected_ids.is_contiguous()
         assert selected_weights.dtype == torch.float32
         if tokens:
@@ -268,7 +268,7 @@ def test_mega_moe_main_forward_contract(monkeypatch, tokens):
 
 
 @pytest.mark.parametrize("tokens", [0, 16])
-@pytest.mark.parametrize("mode", ["mxf4xmxf4", "fp8xmxfp4", "bf16xmxfp4"])
+@pytest.mark.parametrize("mode", ["fp4xfp4", "fp8xfp4", "bf16xfp4"])
 def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
     from types import SimpleNamespace
 
@@ -287,10 +287,6 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
         deep_gemm_mega_moe as mega_moe,
     )
 
-    config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
-        compilation_config=SimpleNamespace(static_forward_context={}),
-    )
     monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", mode)
     torch.cuda.set_device(0)
     dist.init_process_group(
@@ -304,21 +300,10 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
         h, i = 2048, 128
         activation = (
             MegaMoEActivation("situ", alpha=4.0, beta=25.0)
-            if mode == "bf16xmxfp4"
+            if mode == "bf16xfp4"
             else MegaMoEActivation("swiglu", clamp=7.0)
         )
         with torch.device("cuda"):
-            layer = mega_moe.PPUDeepGemmMegaMoEExperts(
-                config,
-                num_experts=2,
-                num_local_experts=2,
-                experts_start_idx=0,
-                top_k=2,
-                hidden_size=h,
-                intermediate_size=i,
-                activation=activation,
-                weight_format=MEGA_MOE_MXFP4,
-            )
             hidden = torch.full((tokens, h), 0.125, dtype=torch.bfloat16)
             ids = torch.tensor([0, 1], dtype=torch.int64).expand(tokens, 2).contiguous()
             weights = torch.full((tokens, 2), 0.5, dtype=torch.float32)
@@ -326,41 +311,63 @@ def test_mega_moe_single_rank_kernel_smoke(monkeypatch, tmp_path, tokens, mode):
             w2 = torch.full((h, i // 2), 0x22, dtype=torch.uint8)
             s13 = torch.full((i, h // 32), 0x78, dtype=torch.uint8)
             s2 = torch.full((h, i // 32), 0x78, dtype=torch.uint8)
+            zero_w2 = torch.zeros_like(w2)
 
-        def load(expert, shard, suffix, source):
+        def load(layer, expert, shard, suffix, source):
             bank = "w2" if shard == "w2" else "w13"
             name = f"{bank}_{suffix}"
             assert layer.weight_loader(
                 getattr(layer, name), source, name, shard, expert, True
             )
 
-        for expert in range(2):
-            for shard, weight, scale in (
-                ("w1", w13, s13),
-                ("w3", w13, s13),
-                ("w2", w2, s2),
-            ):
-                load(expert, shard, "weight", weight)
-                load(expert, shard, "weight_scale", scale)
-        monkeypatch.setattr(
-            layer, "_synchronize_first_launch", lambda: dist.barrier(group=group)
-        )
-        output = layer(hidden, weights, ids)
-        torch.cuda.synchronize()
+        def run(w2_by_expert):
+            """Load a fresh layer and run one forward.
+
+            The first forward replaces the raw checkpoint banks with the
+            kernel layout in place, so each weight variant needs its own
+            layer: a shard cannot be reloaded into a transformed bank.
+            """
+            with torch.device("cuda"):
+                layer = mega_moe.PPUDeepGemmMegaMoEExperts(
+                    SimpleNamespace(
+                        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+                        compilation_config=SimpleNamespace(static_forward_context={}),
+                    ),
+                    num_experts=2,
+                    num_local_experts=2,
+                    experts_start_idx=0,
+                    top_k=2,
+                    hidden_size=h,
+                    intermediate_size=i,
+                    activation=activation,
+                    weight_format=MEGA_MOE_MXFP4,
+                )
+            monkeypatch.setattr(
+                layer, "_synchronize_first_launch", lambda: dist.barrier(group=group)
+            )
+            for expert, expert_w2 in enumerate(w2_by_expert):
+                for shard, weight, scale in (
+                    ("w1", w13, s13),
+                    ("w3", w13, s13),
+                    ("w2", expert_w2, s2),
+                ):
+                    load(layer, expert, shard, "weight", weight)
+                    load(layer, expert, shard, "weight_scale", scale)
+            output = layer(hidden, weights, ids)
+            torch.cuda.synchronize()
+            return layer, output
+
+        layer, output = run((w2, w2))
         assert layer.mma_type == mode
         assert output.shape == hidden.shape and output.dtype == torch.bfloat16
         assert torch.isfinite(output).all()
         if tokens:
             assert (output > 0).all()
-            zero_weight = torch.zeros_like(w2)
-            # The experts start identical and each gets half the route weight.
-            load(1, "w2", "weight", zero_weight)
-            half = layer(hidden, weights, ids)
-            torch.cuda.synchronize()
+            # Both experts start identical and each gets half the route weight,
+            # so zeroing one down projection halves the result.
+            _, half = run((w2, zero_w2))
             torch.testing.assert_close(half, output * 0.5, rtol=0.02, atol=0)
-            load(0, "w2", "weight", zero_weight)
-            zero = layer(hidden, weights, ids)
-            torch.cuda.synchronize()
+            _, zero = run((zero_w2, zero_w2))
             torch.testing.assert_close(zero, torch.zeros_like(zero), rtol=0, atol=0)
     finally:
         torch.cuda.synchronize()

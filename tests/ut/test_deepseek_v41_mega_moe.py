@@ -30,9 +30,9 @@ _MEGAMOE_COMMON_APIS = (
     "mega_moe_pre_dispatch",
 )
 _MEGAMOE_MODE_APIS = {
-    "mxf4xmxf4": ("fp4_fp4_mega_moe",),
-    "fp8xmxfp4": ("fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
-    "bf16xmxfp4": ("bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
+    "fp4xfp4": ("fp4_fp4_mega_moe",),
+    "fp8xfp4": ("fp8_fp4_mega_moe", "transform_weights_for_w4a8_mega_moe"),
+    "bf16xfp4": ("bf16_fp4_mega_moe", "transform_weights_for_w4a16_mega_moe"),
 }
 
 
@@ -357,7 +357,7 @@ def test_megamoe_api_import_is_lazy_and_reports_missing_package(megamoe_api_modu
     with pytest.raises(
         RuntimeError, match=r"DeepGEMM-for-sail.*deep_gemm\.mega"
     ) as error:
-        module.mega_moe_api("fp8xmxfp4")
+        module.mega_moe_api("fp8xfp4")
     assert isinstance(error.value.__cause__, ImportError)
     assert calls == ["deep_gemm.mega"]
 
@@ -414,21 +414,21 @@ def test_megamoe_api_reports_all_missing_functions(
 @pytest.mark.parametrize(
     "mode,hidden,intermediate,supported",
     [
-        ("mxf4xmxf4", 2048, 64, True),
-        ("mxf4xmxf4", 2560, 128, True),
-        ("mxf4xmxf4", 512, 128, False),
-        ("mxf4xmxf4", 2048, 0, False),
-        ("mxf4xmxf4", 2048, 96, False),
-        ("mxf4xmxf4", 2304, 128, False),
-        ("fp8xmxfp4", 2304, 128, True),
-        ("fp8xmxfp4", 2048, 64, False),
-        ("fp8xmxfp4", 2176, 128, False),
-        ("bf16xmxfp4", 2304, 128, True),
-        ("bf16xmxfp4", 2048, 0, False),
-        ("bf16xmxfp4", 0, 128, False),
-        ("mxf4xmxf4", 1, None, True),
-        ("fp8xmxfp4", 1, None, True),
-        ("bf16xmxfp4", 1, None, True),
+        ("fp4xfp4", 2048, 64, True),
+        ("fp4xfp4", 2560, 128, True),
+        ("fp4xfp4", 512, 128, False),
+        ("fp4xfp4", 2048, 0, False),
+        ("fp4xfp4", 2048, 96, False),
+        ("fp4xfp4", 2304, 128, False),
+        ("fp8xfp4", 2304, 128, True),
+        ("fp8xfp4", 2048, 64, False),
+        ("fp8xfp4", 2176, 128, False),
+        ("bf16xfp4", 2304, 128, True),
+        ("bf16xfp4", 2048, 0, False),
+        ("bf16xfp4", 0, 128, False),
+        ("fp4xfp4", 1, None, True),
+        ("fp8xfp4", 1, None, True),
+        ("bf16xfp4", 1, None, True),
     ],
 )
 def test_megamoe_geometry_matches_wheel_contract(
@@ -473,7 +473,7 @@ def test_megamoe_unknown_geometry_still_checks_hardware_and_api(modules, missing
     error = RuntimeError if missing == "api" else NotImplementedError
     match = "API is missing" if missing == "api" else "requires Zhenwu M890"
     with pytest.raises(error, match=match):
-        module.check_mega_moe_supported(SimpleNamespace(index=0), 1, None, "fp8xmxfp4")
+        module.check_mega_moe_supported(SimpleNamespace(index=0), 1, None, "fp8xfp4")
 
 
 @pytest.fixture
@@ -484,7 +484,7 @@ def megamoe_platform_gate(modules):
         "vllm_sail.models.deepseek_v41.config",
         normalize_expert_dtype=lambda config: None,
     )
-    envs = modules("vllm_sail.envs", VLLM_SAIL_MEGA_MOE_MMA_TYPE="fp8xmxfp4")
+    envs = modules("vllm_sail.envs", VLLM_SAIL_MEGA_MOE_MMA_TYPE="fp8xfp4")
     modules(
         "vllm_sail.utils.deep_gemm_mega",
         check_mega_moe_supported=lambda *args: calls.append(args),
@@ -541,11 +541,11 @@ def test_megamoe_platform_gate_rejects_declared_non_fp4_experts(megamoe_platform
 @pytest.mark.parametrize(
     "mode,activation",
     [
-        ("mxf4xmxf4", "swiglu"),
-        ("fp8xmxfp4", "swiglu"),
-        ("mxf4xmxf4", "situ"),
-        ("fp8xmxfp4", "situ"),
-        ("bf16xmxfp4", "situ"),
+        ("fp4xfp4", "swiglu"),
+        ("fp8xfp4", "swiglu"),
+        ("fp4xfp4", "situ"),
+        ("fp8xfp4", "situ"),
+        ("bf16xfp4", "situ"),
     ],
 )
 def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
@@ -579,7 +579,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         expected_kwargs.update(situ_beta=1.7, situ_linear_beta=-0.2)
     else:
         expected_kwargs["activation_clamp"] = 7.0
-    if mode == "mxf4xmxf4":
+    if mode == "fp4xfp4":
         expected_kwargs["recipe"] = (1, 1, 32)
 
     def dispatch(
@@ -592,7 +592,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         buf_topk_weights,
         num_tokens,
         group_size=32,
-        mma_type="mxf4xmxf4",
+        mma_type="fp4xfp4",
     ):
         assert (x, routed_ids, routed_weights) == (hidden, ids, weights)
         assert buf_x is buffer.x
@@ -619,9 +619,22 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         assert mma_type == mode
         return api
 
-    def kernel_weights(actual_api):
+    def transform_weights(actual_api):
         assert actual_api is api
-        return l1, l2
+        calls.append("transform")
+
+    def kernel_weights(name):
+        assert name in ("w13", "w2")
+        return l1 if name == "w13" else l2
+
+    class Expert(SimpleNamespace):
+        @property
+        def l1_weights(self):
+            return self._kernel_weights("w13")
+
+        @property
+        def l2_weights(self):
+            return self._kernel_weights("w2")
 
     ns = {
         "torch": SimpleNamespace(
@@ -635,7 +648,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     }
     forward = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.forward", ns)
     kernel_kwargs = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._kernel_kwargs", {})
-    expert = SimpleNamespace(
+    expert = Expert(
         max_num_tokens=4,
         _synchronize_first_launch=lambda: calls.append("sync"),
         capture_fn=lambda value: calls.append(("capture", value)),
@@ -644,11 +657,12 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         mma_type=mode,
         mma_format=SimpleNamespace(
             kernel=kernel_name,
-            transform=None if mode == "mxf4xmxf4" else "transform",
+            transform=None if mode == "fp4xfp4" else "transform",
         ),
         activation=SimpleNamespace(name=activation, alpha=1.7, beta=-0.2, clamp=7.0),
         fast_math=False,
         _kernel_weights=kernel_weights,
+        _transform_weights=transform_weights,
     )
     expert._kernel_kwargs = lambda: kernel_kwargs(expert)
     assert (
@@ -657,6 +671,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     assert calls == [
         "sync",
         ("capture", ids),
+        "transform",
         ("dtype", "i32"),
         ("dtype", "fp32"),
         "dispatch",
@@ -665,3 +680,10 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     expert.max_num_tokens = -1
     with pytest.raises(ValueError, match="exceeds capacity"):
         forward(expert, hidden, weights, ids)
+
+
+def test_expert_rejects_reload_after_in_place_transform():
+    load_weight = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._load_weight", {})
+    expert = SimpleNamespace(_transformed=True)
+    with pytest.raises(RuntimeError, match="cannot be reloaded"):
+        load_weight(expert, None, None, "w2", False)
