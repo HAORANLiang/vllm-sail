@@ -89,7 +89,9 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             num_logical_experts if num_logical_experts is not None else num_experts
         )
         self.eplb_state = EplbLayerState()
-        self._transformed_weights = None
+        self._transformed = False
+        self._l1_inv_scale = None
+        self._l2_inv_scale = None
         self._register_weight(
             "w13", (num_local_experts, 2 * intermediate_size, hidden_size), None
         )
@@ -108,11 +110,21 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
 
     @property
     def l1_weights(self):
-        return self.w13_weight.data, self.w13_weight_scale.data
+        return self._kernel_weights("w13")
 
     @property
     def l2_weights(self):
-        return self.w2_weight.data, self.w2_weight_scale.data
+        return self._kernel_weights("w2")
+
+    def _kernel_weights(self, name):
+        weight = getattr(self, f"{name}_weight")
+        scale = getattr(self, f"{name}_weight_scale", None)
+        weights = (weight, scale)
+        if self.mma_type == "fp8xmxfp4":
+            # W4A8 kernel expects each bank's inverse scale, returned by the
+            # weight transform.
+            weights += (self._l1_inv_scale if name == "w13" else self._l2_inv_scale,)
+        return weights
 
     def _check_runtime_supported(self):
         check_mega_moe_supported(
@@ -121,6 +133,47 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
             self.intermediate_size,
             self.mma_type,
         )
+
+    def _transform_weights(self, api):
+        """Transform the raw banks in place and drop the raw storages.
+
+        The transformed banks are the only consumer once loading is done and
+        EPLB is disabled; keeping both copies doubles the expert memory
+        footprint. EPLB rebalancing writes into the registered raw banks, so
+        the raw layout must stay resident and each step re-transforms.
+        """
+        transform_name = self.mma_format.transform
+        if (
+            transform_name is None
+            or self._transformed
+            or self.eplb_state.logical_to_physical_map is not None
+        ):
+            return
+        transform = getattr(api, transform_name)
+        # Raw (weight, scale) pairs: l1_weights would append inv_scale, which
+        # is only produced by this transform.
+        args = (
+            (self.w13_weight, self.w13_weight_scale),
+            (self.w2_weight, self.w2_weight_scale),
+        )
+        if self.mma_type == "bf16xmxfp4":
+            args += (self.activation.name,)
+        transformed_l1, transformed_l2 = transform(*args)
+        if self.mma_type == "fp8xmxfp4":
+            (
+                self.w13_weight.data,
+                self.w13_weight_scale.data,
+                self._l1_inv_scale,
+            ) = transformed_l1
+            (
+                self.w2_weight.data,
+                self.w2_weight_scale.data,
+                self._l2_inv_scale,
+            ) = transformed_l2
+        else:
+            self.w13_weight.data, self.w13_weight_scale.data = transformed_l1
+            self.w2_weight.data, self.w2_weight_scale.data = transformed_l2
+        self._transformed = True
 
     def weight_loader(
         self,
@@ -164,6 +217,13 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
         )
 
     def _load_weight(self, dst, src, shard_id, is_scale):
+        if self._transformed:
+            # The first forward overwrote the raw banks with the kernel layout,
+            # so a checkpoint shard can no longer be decoded into them.
+            raise RuntimeError(
+                "MegaMoE expert weights cannot be reloaded after the first "
+                "forward: the raw banks were transformed in place."
+            )
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"Unsupported expert shard id: {shard_id}")
         if not is_scale:
@@ -193,24 +253,6 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 rows = dst.shape[0] // 2
                 dst = dst[:rows] if shard_id == "w1" else dst[rows:]
         dst.copy_(src)
-        self._transformed_weights = None
-
-    def _kernel_weights(self, api):
-        transform_name = self.mma_format.transform
-        if transform_name is None:
-            return self.l1_weights, self.l2_weights
-        # EPLB writes into the registered raw banks, bypassing the loader.
-        if self.eplb_state.logical_to_physical_map is not None:
-            return api.transform_weights_for_w4a16_mega_moe(
-                self.l1_weights, self.l2_weights, self.activation.name
-            )
-        if self._transformed_weights is None:
-            transform = getattr(api, transform_name)
-            args = (self.l1_weights, self.l2_weights)
-            if self.mma_type == "bf16xmxfp4":
-                args += (self.activation.name,)
-            self._transformed_weights = transform(*args)
-        return self._transformed_weights
 
     def _kernel_kwargs(self):
         activation = self.activation
@@ -285,7 +327,17 @@ class PPUDeepGemmMegaMoEExperts(DeepGemmMegaMoEExperts):
                 ),
             )
         api = mega_moe_api(self.mma_type)
-        l1, l2 = self._kernel_weights(api)
+        self._transform_weights(api)
+        l1, l2 = self.l1_weights, self.l2_weights
+        if (
+            self.eplb_state.logical_to_physical_map is not None
+            and self.mma_format.transform is not None
+        ):
+            # EPLB writes into the registered raw banks, so re-transform each
+            # step; without EPLB the banks were transformed in place at load.
+            l1, l2 = api.transform_weights_for_w4a16_mega_moe(
+                l1, l2, self.activation.name
+            )
         buffer = self.get_symm_buffer()
         x = hidden_states.contiguous()
         api.mega_moe_pre_dispatch(

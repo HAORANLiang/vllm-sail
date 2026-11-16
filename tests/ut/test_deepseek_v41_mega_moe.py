@@ -619,9 +619,22 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         assert mma_type == mode
         return api
 
-    def kernel_weights(actual_api):
+    def transform_weights(actual_api):
         assert actual_api is api
-        return l1, l2
+        calls.append("transform")
+
+    def kernel_weights(name):
+        assert name in ("w13", "w2")
+        return l1 if name == "w13" else l2
+
+    class Expert(SimpleNamespace):
+        @property
+        def l1_weights(self):
+            return self._kernel_weights("w13")
+
+        @property
+        def l2_weights(self):
+            return self._kernel_weights("w2")
 
     ns = {
         "torch": SimpleNamespace(
@@ -635,7 +648,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     }
     forward = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.forward", ns)
     kernel_kwargs = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._kernel_kwargs", {})
-    expert = SimpleNamespace(
+    expert = Expert(
         max_num_tokens=4,
         _synchronize_first_launch=lambda: calls.append("sync"),
         capture_fn=lambda value: calls.append(("capture", value)),
@@ -649,6 +662,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
         activation=SimpleNamespace(name=activation, alpha=1.7, beta=-0.2, clamp=7.0),
         fast_math=False,
         _kernel_weights=kernel_weights,
+        _transform_weights=transform_weights,
     )
     expert._kernel_kwargs = lambda: kernel_kwargs(expert)
     assert (
@@ -657,6 +671,7 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     assert calls == [
         "sync",
         ("capture", ids),
+        "transform",
         ("dtype", "i32"),
         ("dtype", "fp32"),
         "dispatch",
@@ -665,3 +680,10 @@ def test_expert_forward_uses_sail_dispatch_and_main_shared_contract(
     expert.max_num_tokens = -1
     with pytest.raises(ValueError, match="exceeds capacity"):
         forward(expert, hidden, weights, ids)
+
+
+def test_expert_rejects_reload_after_in_place_transform():
+    load_weight = function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._load_weight", {})
+    expert = SimpleNamespace(_transformed=True)
+    with pytest.raises(RuntimeError, match="cannot be reloaded"):
+        load_weight(expert, None, None, "w2", False)
