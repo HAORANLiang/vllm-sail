@@ -85,17 +85,21 @@ def test_humming_converter_retains_checkpoint_key_unless_explicit_override(
         CUTLASS_MXFP4_MXFP4="cutlass", DEEPGEMM_MXFP4="deepgemm", HUMMING="humming"
     )
     key, schema = object(), object()
-    key_calls, conversions = [], []
+    key_calls, conversions, staged = [], [], []
     module = ModuleType("vllm.model_executor.layers.quantization.utils.humming")
 
     def convert(layer, **kwargs):
         conversions.append((layer, kwargs))
+
+    def stage(layer, *weights):
+        staged.append((layer, weights))
 
     def to_schema(value):
         key_calls.append(value)
         return schema
 
     module.convert_to_humming_moe_kernel_format = convert
+    module.stage_moe_weights_for_humming = stage
     module.quant_key_to_input_schema = to_schema
     monkeypatch.setitem(sys.modules, module.__name__, module)
     layer = NS(
@@ -111,18 +115,30 @@ def test_humming_converter_retains_checkpoint_key_unless_explicit_override(
         "current_platform": NS(is_rocm=lambda: False),
         "B12X_BACKENDS": (),
         "QuantizationConfigArgs": type("QuantizationArgs", (), {}),
+        "_layer_target_spec": NS(get=lambda: None),
         "get_current_vllm_config": lambda: NS(
             model_config=NS(quantization_config=None)
         ),
+        "get_current_vllm_config_or_none": lambda: NS(
+            model_config=NS(quantization_config=None)
+        ),
     }
+    function(
+        upstream_source_root / "vllm/config/quantization.py",
+        "user_activation_override",
+        namespace,
+    )
     for name in (
         "_user_moe_activation_override",
+        "_user_moe_activation_override_is_set",
         "_resolve_activation_key",
         "_humming_input_schema",
     ):
         function(path, name, namespace)
     converter = function(path, "convert_weight_to_mxfp4_moe_kernel_format", namespace)
-    converter("humming", layer, *[object() for _ in range(4)], activation_key=key)
+    weights = [object() for _ in range(4)]
+    converter("humming", layer, *weights, activation_key=key)
+    assert staged == [(layer, tuple(weights))]
     assert key_calls == ([] if override else [key])
     assert conversions == [
         (

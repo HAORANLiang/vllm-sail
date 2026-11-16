@@ -37,7 +37,6 @@ Modules, and why each is import-on-install like the rest of the framework:
   (``msa_for_sail``) kernels on PPU, with 890P fp8 / 810E bf16 defaults.
 * ``qwen3_moe`` — per-layer mix_layer quant overrides (+36).
 * ``qwen3_next`` — NVTX profiling scaffold (+19).
-* ``step3p5_mtp`` — zero-point buffers as optional checkpoint params (+12).
 * ``moe_marlin_gate`` — VLLM_PPU_ENABLE_MOE_MARLIN default-off gate.
 """
 
@@ -64,5 +63,4 @@ from vllm_sail.patch.enhancement.models import (
     moe_marlin_gate,  # noqa: F401
     qwen3_moe,  # noqa: F401
     qwen3_next,  # noqa: F401
-    step3p5_mtp,  # noqa: F401
 )

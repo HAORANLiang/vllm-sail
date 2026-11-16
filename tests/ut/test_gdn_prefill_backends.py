@@ -64,6 +64,9 @@ def resolve(monkeypatch):
         pla=True,
         capability=89,
         mi3xx=False,
+        gfx1151=False,
+        hip_available=True,
+        hip_reasons=(),
         unsupported_reasons=(),
         helper=None,
         body=PATCH,
@@ -110,8 +113,11 @@ def resolve(monkeypatch):
             return list(unsupported_reasons)
 
         namespace["_aiter_flydsl_unsupported_reasons"] = reasons
+        namespace["is_hip_gdn_available"] = lambda: hip_available
+        namespace["_hip_gdn_unsupported_reasons"] = lambda *args: list(hip_reasons)
         rocm = ModuleType("vllm.platforms.rocm")
         rocm.on_mi3xx = lambda: mi3xx
+        rocm.on_gfx1151 = lambda: gfx1151
         monkeypatch.setitem(sys.modules, rocm.__name__, rocm)
         result = function(body, "_resolve_gdn_prefill_backend", namespace)(config)
         return result, warnings
@@ -148,9 +154,10 @@ def test_rocm_unsupported_aiter_shapes_warn_and_fall_back(resolve, shape):
 @pytest.mark.parametrize(
     "device", ["ppu", "cuda", "cpu"], ids=["fake-ppu", "fake-cuda", "fake-cpu"]
 )
-def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device):
-    with pytest.raises(RuntimeError, match="ROCm AITER backend"):
-        resolve(device, "aiter_flydsl")
+@pytest.mark.parametrize("backend", ["aiter_flydsl", "hip"])
+def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device, backend):
+    with pytest.raises(RuntimeError, match="it is a ROCm backend"):
+        resolve(device, backend)
 
 
 @pytest.mark.parametrize(
@@ -163,6 +170,8 @@ def test_explicit_aiter_prefill_rejects_non_rocm_devices(resolve, device):
         ("ppu", "flashinfer", {"capability": 90}, "triton"),
         ("cuda", "auto", {"capability": 90}, "flashinfer"),
         ("cuda", "cutedsl", {"capability": 100}, "cutedsl"),
+        ("cuda", "cutedsl", {"capability": 110}, "cutedsl"),
+        ("cuda", "auto", {"capability": 110}, "triton"),
         ("cuda", "auto", {}, "triton"),
     ],
 )
@@ -189,6 +198,34 @@ def test_rocm_auto_flydsl_requires_supported_hardware_model_and_kernel(
 ):
     result, warnings = resolve(
         "rocm", mi3xx=mi3xx, available=available, unsupported_reasons=reasons
+    )
+    assert result == ("auto", active)
+    assert not warnings
+
+
+def test_rocm_explicit_hip_prefill_routes_or_rejects(resolve):
+    assert resolve("rocm", "hip") == (("hip", "hip"), [])
+    with pytest.raises(RuntimeError, match="rdna35_gdn_chunked is unavailable"):
+        resolve("rocm", "hip", hip_available=False)
+    result, warnings = resolve("rocm", "hip", hip_reasons=["unsupported dtype"])
+    assert result == ("hip", "triton")
+    assert len(warnings) == 1 and "Falling back to Triton/FLA" in warnings[0][0]
+
+
+@pytest.mark.parametrize(
+    "gfx1151,hip_available,hip_reasons,active",
+    [
+        (True, True, [], "hip"),
+        (True, False, [], "triton"),
+        (True, True, ["unsupported dtype"], "triton"),
+        (False, True, [], "triton"),
+    ],
+)
+def test_rocm_auto_hip_requires_gfx1151_kernel_and_supported_model(
+    resolve, gfx1151, hip_available, hip_reasons, active
+):
+    result, warnings = resolve(
+        "rocm", gfx1151=gfx1151, hip_available=hip_available, hip_reasons=hip_reasons
     )
     assert result == ("auto", active)
     assert not warnings
@@ -241,7 +278,18 @@ def test_aiter_backend_has_a_log_name():
     assert messages[0][1:] == ("AITER FlyDSL", "aiter_flydsl", 128)
 
 
-@pytest.mark.parametrize("active", ["aiter_flydsl", "pla"])
+def test_hip_backend_has_a_log_name():
+    messages = []
+    config = NS(model_config=NS(hf_text_config=NS(linear_key_head_dim=128)))
+    namespace = {
+        "current_platform": NS(is_cpu=lambda: False, is_xpu=lambda: False),
+        "logger": NS(info_once=lambda *args: messages.append(args)),
+    }
+    function(PATCH, "_log_gdn_backend_decision", namespace)(config, "hip", "hip")
+    assert messages[0][1:] == ("HIP", "hip", 128)
+
+
+@pytest.mark.parametrize("active", ["aiter_flydsl", "hip", "pla"])
 def test_constructor_selects_the_resolved_forward_method(active):
     class Parent:
         def __init__(self):
@@ -256,6 +304,9 @@ def test_constructor_selects_the_resolved_forward_method(active):
 
         def forward_aiter_flydsl(self):
             return "aiter_flydsl"
+
+        def forward_hip(self):
+            return "hip"
 
         def forward_pla(self):
             return "pla"

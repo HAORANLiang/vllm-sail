@@ -31,7 +31,7 @@ def install() -> None:
             "source never names float8e4nv. Filter those keys before submission "
             "so the registry retains its shared asynchronous compiler pool."
         ),
-        affected_versions=">=0.32.0,<0.33.0",
+        affected_versions=">=0.34.0,<0.35.0",
         remove_when=(
             "The upstream Triton warmup interface filters compile keys by "
             "input dtype support before submitting asynchronous compilation."

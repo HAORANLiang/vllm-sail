@@ -18,7 +18,7 @@ _ppu_mlp_init = bind_body(_mlp_body, _model)
     "vllm.models.minimax_m3.nvidia.model",
     "MiniMaxM3MLP.__init__",
     reason="The dense MLP eagerly imports an SM100-only MXFP8 optimization before checking its capability. PPU keeps the original linear and activation path without importing NVIDIA kernels.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="MiniMax dense MLP gates the NVIDIA-only optimization import through a platform capability, or PPU implements that optimization.",
 )
 def init_mlp(
@@ -28,6 +28,8 @@ def init_mlp(
     quant_config=None,
     reduce_results=True,
     disable_tp=False,
+    use_sequence_parallel=False,
+    run_gemm_rs=False,
     prefix="",
 ):
     function = _ppu_mlp_init if current_platform.is_ppu() else _original_mlp_init
@@ -38,6 +40,8 @@ def init_mlp(
         quant_config,
         reduce_results,
         disable_tp,
+        use_sequence_parallel,
+        run_gemm_rs,
         prefix,
     )
 
@@ -46,7 +50,7 @@ def init_mlp(
     "vllm.models.minimax_m3.nvidia.model",
     "MiniMaxM3Model._init_fused_moe_finalize",
     reason="PPU inherits CUDA identity but does not implement NVIDIA's collective MoE finalize kernel or its dependencies.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="MiniMax gates fused finalize through a platform implementation capability or PPU implements and verifies that collective kernel.",
 )
 def init_fused_moe_finalize(self, vllm_config):

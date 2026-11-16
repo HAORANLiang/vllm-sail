@@ -897,6 +897,9 @@ def sparse_indexer(installed):
     state.config.kernel_config = types.SimpleNamespace(
         sparse_indexer_topk_backend="auto", enable_jit_warmup=False
     )
+    state.config.attention_config = types.SimpleNamespace(
+        resolve_indexer_logits_dtype=lambda default: default
+    )
     state.platform.is_cuda = lambda: True
     state.platform.fp8_dtype = lambda: "float8_e4m3fn"
     state.module("vllm_sail.utils.deep_gemm", is_deep_gemm_supported=lambda: True)
@@ -925,6 +928,7 @@ def sparse_indexer(installed):
         current_platform=state.platform,
         get_current_vllm_config=lambda: state.config,
         has_deep_gemm=lambda: True,
+        STR_DTYPE_TO_TORCH_DTYPE={"float32": "fp32", "bfloat16": "bf16"},
     )
     init = function(path, "sparse_attn_indexer_init", namespace)
     calls = []
@@ -964,6 +968,7 @@ def sparse_indexer(installed):
         candidate_write=False,
         compress_ratio=1,
         max_model_len=32,
+        skip_topk_buffer_clear=False,
     ):
         indexer = Indexer.__new__(Indexer)
         cache = types.SimpleNamespace(prefix="v41.indexer", kv_cache=object())
@@ -982,6 +987,7 @@ def sparse_indexer(installed):
             candidate_block_size=candidate_block_size,
             candidate_write=candidate_write,
             compress_ratio=compress_ratio,
+            skip_topk_buffer_clear=skip_topk_buffer_clear,
         )
         return indexer
 
@@ -1001,6 +1007,19 @@ def test_dense_indexer_owns_the_ppu_weights_dtype(
         assert indexer.weights_dtype == ("bf16" if fp4_cache else "fp32")
     else:
         assert not hasattr(indexer, "weights_dtype")
+
+
+def test_indexer_init_tracks_upstream_logits_dtype_and_buffer_contract(
+    installed, sparse_indexer
+):
+    installed.config.attention_config.resolve_indexer_logits_dtype = (
+        lambda default: "bfloat16"
+    )
+    indexer = sparse_indexer.construct(skip_topk_buffer_clear=True)
+    assert indexer.logits_dtype == "bf16"
+    assert indexer.skip_topk_buffer_clear is True
+    assert indexer.dcp_direct_topk_max_rows == 0
+    assert sparse_indexer.construct().skip_topk_buffer_clear is False
 
 
 @pytest.mark.parametrize(

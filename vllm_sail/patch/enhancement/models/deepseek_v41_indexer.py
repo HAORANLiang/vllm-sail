@@ -12,7 +12,7 @@ from vllm_sail.patch.utils import patch
 
 _cache_spec = attention.DeepseekV4IndexerCache.get_kv_cache_spec
 _kernel_sizes = DeepseekV41IndexerBackend.get_supported_kernel_block_sizes
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 _indexer_init = attention.DeepseekV4Indexer.__init__
 

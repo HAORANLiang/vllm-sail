@@ -145,9 +145,8 @@ _TORCH = types.SimpleNamespace(bfloat16="bf16")
 
 def _moe_config(*, batched: bool = False, has_bias: bool = False, backend="auto"):
     return types.SimpleNamespace(
-        moe_parallel_config=types.SimpleNamespace(
-            use_batched_activation_format=batched
-        ),
+        use_batched_activation_format=batched,
+        moe_parallel_config=types.SimpleNamespace(),
         moe_backend=backend,
         has_bias=has_bias,
     )

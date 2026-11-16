@@ -42,11 +42,13 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
             "flashinfer_sparse_mla_decode_autotune_warmup",
         ],
         "kimi_k3_triton_warmup": ["kimi_k3_triton_warmup"],
-        "mamba_triton_warmup": ["mamba_triton_warmup"],
         "qwen4_exp_qsa_warmup": ["qwen4_exp_qsa_triton_warmup"],
         "qwen_triton_warmup": ["qwen_triton_warmup"],
         "qwen_vl_triton_warmup": ["qwen_vl_triton_warmup"],
-        "replayssm_warmup": ["replayssm_autotune_warmup"],
+        "replayssm_warmup": [
+            "replayssm_autotune_warmup",
+            "replayssm_lifecycle_warmup",
+        ],
         "watermark_sample_warmup": ["watermark_sample_warmup"],
     }
     for name, names in imports.items():
@@ -110,11 +112,12 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     for callback, label in [
         ("qwen_triton_warmup", "qwen"),
         ("qwen_vl_triton_warmup", "vl"),
-        ("mamba_triton_warmup", "mamba"),
+        ("replayssm_lifecycle_warmup", "replayssm"),
         ("kimi_k3_triton_warmup", "kimi"),
         ("watermark_sample_warmup", "watermark"),
         ("qwen4_exp_qsa_triton_warmup", "qsa"),
         ("_warmup_gemm_rs_ar", "gemm_rs_ar"),
+        ("_warmup_skinny_gemm", "skinny"),
         ("flashinfer_sparse_mla_decode_autotune_warmup", "sparse_decode"),
         ("deepseek_v4_sparse_mla_attention_warmup", "dsv4"),
         ("b12x_warmup", "b12x"),
@@ -184,10 +187,10 @@ def test_real_warmup_keeps_applicable_work_and_guards_msa(
     expected = ["sampler"] if ppu else []
     if jit:
         expected += ["registry", "triton"]
-    expected += ["qwen", "vl", "mamba"]
+    expected += ["qwen", "vl", "replayssm"]
     if jit:
         expected += ["kimi", "watermark", "qsa"]
-    expected += ["gemm_rs_ar"]
+    expected += ["gemm_rs_ar", "skinny"]
     if not ppu:
         expected += ["legacy"]
     if not local:

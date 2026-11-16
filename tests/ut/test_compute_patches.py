@@ -154,7 +154,6 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
         lambda worker, **kwargs: calls.append("upstream"),
     )
     worker = types.SimpleNamespace(
-        use_v2_model_runner=True,
         model_runner=types.SimpleNamespace(
             jit_warmup_registry=None, is_pooling_model=True, attn_groups=[]
         ),
@@ -186,8 +185,9 @@ def test_kernel_warmup_delegates_off_ppu_and_runs_ppu_warmup_on_ppu(
     )
     for name in (
         "qwen_vl_triton_warmup",
-        "mamba_triton_warmup",
+        "replayssm_lifecycle_warmup",
         "_warmup_gemm_rs_ar",
+        "_warmup_flashinfer_attention",
         "flashinfer_sparse_mla_decode_autotune_warmup",
         "deepseek_v4_sparse_mla_attention_warmup",
         "b12x_warmup",

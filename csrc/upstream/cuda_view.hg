@@ -35,7 +35,7 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
     void* host_ptr = const_cast<void*>(cpu_tensor.mutable_data_ptr());
     void* device_ptr = nullptr;
     hggcError_t err = hggcHostGetDevicePointer(&device_ptr, host_ptr, 0);
-    STD_TORCH_CHECK(err == hggcSuccess, "cudaHostGetDevicePointer failed: ",
+    STD_TORCH_CHECK(err == hggcSuccess, "hggcHostGetDevicePointer failed: ",
                     hggcGetErrorString(err));
 
     return torch::stable::from_blob(
@@ -50,14 +50,14 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
   void* host_ptr = nullptr;
   hggcError_t err = hggcHostAlloc(&host_ptr, nbytes, hggcHostAllocMapped);
   if (err != hggcSuccess) {
-    STD_TORCH_CHECK(false, "cudaHostAlloc failed: ", hggcGetErrorString(err));
+    STD_TORCH_CHECK(false, "hggcHostAlloc failed: ", hggcGetErrorString(err));
   }
 
   err = hggcMemcpy(host_ptr, contiguous_cpu.const_data_ptr(), nbytes,
                    hggcMemcpyDefault);
   if (err != hggcSuccess) {
     hggcFreeHost(host_ptr);
-    STD_TORCH_CHECK(false, "cudaMemcpy failed: ", hggcGetErrorString(err));
+    STD_TORCH_CHECK(false, "hggcMemcpy failed: ", hggcGetErrorString(err));
   }
 
   void* device_ptr = nullptr;
@@ -65,7 +65,7 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
   if (err != hggcSuccess) {
     hggcFreeHost(host_ptr);
     STD_TORCH_CHECK(
-        false, "cudaHostGetDevicePointer failed: ", hggcGetErrorString(err));
+        false, "hggcHostGetDevicePointer failed: ", hggcGetErrorString(err));
   }
 
   auto deleter = [host_ptr](void*) { hggcFreeHost(host_ptr); };

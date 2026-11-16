@@ -118,7 +118,7 @@ from __future__ import annotations
 import importlib
 from functools import lru_cache
 
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.34.0,<0.35.0"
 
 _QSA_OPS_MODULE = "vllm.models.qwen4_exp.nvidia.ops.qsa"
 

@@ -13,7 +13,7 @@ from vllm.platforms import current_platform
 from vllm_sail.patch.utils import patch
 from vllm_sail.utils import deep_select as _sail
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.model_executor.layers.indexer_topk"
 _SPARSE_MODULE = "vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits"
 _REASON = "PPU SM89 uses the SAIL BF16 DeepSelect wheel instead of vllm._deepselect_C."

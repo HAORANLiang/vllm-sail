@@ -12,7 +12,7 @@ from vllm.platforms import current_platform
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _MODULE = "vllm.model_executor.kernels.mhc.tilelang"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REASON = "Delayed mHC bypasses the PPU prenorm helper and its zeroed single-split SAIL accumulators."
 _REMOVE_WHEN = (
     "Upstream delayed mHC launchers call a platform-dispatched prenorm helper."
@@ -462,10 +462,7 @@ def mhc_fused_post_pre_delayed_tilelang(
 
 # V4.1 imports these functions by value, including the Mega-mHC fallback.
 _ALIAS_CONSUMERS = {
-    "mhc_pre_delayed_tilelang": (
-        "vllm.models.deepseek_v41.nvidia.model",
-        "vllm.models.deepseek_v41.nvidia.specialized_decode.boundary.boundary",
-    ),
+    "mhc_pre_delayed_tilelang": ("vllm.models.deepseek_v41.nvidia.model",),
     "mhc_fused_post_pre_delayed_tilelang": (
         "vllm.models.deepseek_v41.nvidia.ops.mega_mhc",
         "vllm.models.deepseek_v41.nvidia.ops.mhc",

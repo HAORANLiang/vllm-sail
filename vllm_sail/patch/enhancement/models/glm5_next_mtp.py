@@ -34,7 +34,7 @@ import re
 from vllm_sail.patch.utils import PATCH_REGISTRY, PatchRecord, patch
 
 _MTP_MODULE = "vllm.models.glm5next.common.mtp"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 #: Fused -> checkpoint projection names, as on ``Glm5NextForConditionalGeneration``.
 _PACKED_MODULES_MAPPING = {"gate_up_proj": ["gate_proj", "up_proj"]}

@@ -150,7 +150,7 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
   static BatchFn batch_fn = []() -> BatchFn {
     HGdriverProcAddressQueryResult sym_status;
     void* fn_ptr = nullptr;
-    HGresult res = hgGetProcAddress("cuMemcpyBatchAsync", &fn_ptr, 12080,
+    HGresult res = hgGetProcAddress("hgMemcpyBatchAsync", &fn_ptr, 12080,
                                     HG_GET_PROC_ADDRESS_DEFAULT, &sym_status);
     if (res != HGGC_SUCCESS || fn_ptr == nullptr) {
       return nullptr;
@@ -185,7 +185,7 @@ void swap_blocks_batch(const torch::stable::Tensor& src_ptrs,
                                  static_cast<size_t>(cnt), &attr, &attrs_idx, 1,
                                  &fail_idx, static_cast<HGstream>(stream));
       STD_TORCH_CHECK(result == HGGC_SUCCESS,
-                      "cuMemcpyBatchAsync failed at index ", fail_idx,
+                      "hgMemcpyBatchAsync failed at index ", fail_idx,
                       " with error ", result);
     }
     return;

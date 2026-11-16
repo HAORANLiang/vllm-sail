@@ -38,7 +38,7 @@ from vllm_sail.patch.bodies import bind_body
 from vllm_sail.patch.utils import patch
 from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.model_executor.layers.sparse_attn_indexer"
 
 logger = init_logger(__name__)
@@ -79,6 +79,7 @@ def sparse_attn_indexer_init(
     candidate_blocks: torch.Tensor | None = None,
     candidate_block_size: int = 0,
     candidate_write: bool = False,
+    skip_topk_buffer_clear: bool = False,
 ):
     # PPU MODIFICATION: begin
     # An out-of-class copied method has no implicit __class__ cell.
@@ -93,6 +94,9 @@ def sparse_attn_indexer_init(
     self.max_total_seq_len = max_total_seq_len
     self.topk_indices_buffer = topk_indices_buffer
     self.skip_k_cache_insert = skip_k_cache_insert
+    # Set when the caller already filled topk_indices_buffer[:num_tokens]
+    # with -1 earlier in the forward.
+    self.skip_topk_buffer_clear = skip_topk_buffer_clear
     self.use_fp4_cache = use_fp4_cache
     self.compress_ratio = compress_ratio
     # v4.1 two-level selection: the candidate source indexer writes the
@@ -120,12 +124,32 @@ def sparse_attn_indexer_init(
     # PPU MODIFICATION: end
     parallel_config = vllm_config.parallel_config
     self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
+    self.logits_dtype = STR_DTYPE_TO_TORCH_DTYPE[
+        vllm_config.attention_config.resolve_indexer_logits_dtype("float32")
+    ]
     self._parallel_config = parallel_config
     self.dcp_world_size = parallel_config.decode_context_parallel_size
     self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
     self.use_pcp = parallel_config.prefill_context_parallel_size > 1
     self.pcp_shard_decode_requests = parallel_config.pcp_shard_decode_requests
-    self._cp_kv_cache_interleave_size: int | None = None
+    self.dcp_direct_topk_max_rows = 0
+    if (
+        self.dcp_world_size > 1
+        and not self.use_pcp
+        and parallel_config.dcp_comm_backend == "a2a"
+        and not parallel_config.use_ubatching
+        and current_platform.is_cuda()
+        and has_cutedsl()
+    ):
+        from vllm.v1.attention.ops.dcp import get_dcp_workspace_max_num_tokens
+
+        # Rendezvous now, while every rank is constructing the model.
+        max_rows = get_dcp_workspace_max_num_tokens(vllm_config)
+        workspace = _get_direct_dcp_topk_workspace(
+            topk_indices_buffer.device, max_rows, topk_tokens
+        )
+        if workspace is not None:
+            self.dcp_direct_topk_max_rows = max_rows
     # PPU MODIFICATION: begin
     from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 

@@ -8,7 +8,7 @@ from vllm_sail.registry.moe_backends._extend import extend_enum
 __all__ = ["extend_enum", "register"]
 
 _registered = False
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REMOVE_WHEN = (
     "vLLM imports MoE selectors through a registration API instead of "
     "capturing module-level aliases before plugin registration."
@@ -69,6 +69,9 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
+        "_backend_activation_key": (
+            "vllm.model_executor.layers.quantization.online.mxfp4",
+        ),
         "convert_gpt_oss_weight_to_mxfp4_moe_kernel_format": (
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
@@ -77,11 +80,13 @@ _ORACLE_ALIAS_CONSUMERS = {
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4",
             "vllm.model_executor.layers.quantization.mxfp4",
             "vllm.model_executor.layers.quantization.online.mxfp4",
+            "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),
         "make_mxfp4_moe_quant_config": (
             "vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_mxfp4",
             "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_moe",
             "vllm.model_executor.layers.quantization.mxfp4",
+            "vllm.model_executor.layers.quantization.online.fp8_requant",
             "vllm.model_executor.layers.quantization.online.mxfp4",
             "vllm.model_executor.layers.quantization.quark.quark_moe",
         ),

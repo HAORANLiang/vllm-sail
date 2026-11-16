@@ -56,7 +56,10 @@ def kpool(modules, patch_utils_module, monkeypatch, request):
 
         return record
 
-    modules("torch", float8_e4m3fn="fp8", contiguous_format="contiguous")
+    modules(
+        "torch", float8_e4m3fn="fp8", float32="fp32", bfloat16="bf16",
+        contiguous_format="contiguous",
+    )
     platform = NS(ppu=True)
     platform.is_ppu = lambda: platform.ppu
     modules("vllm.platforms", current_platform=platform)
@@ -179,10 +182,53 @@ def test_glm_wrappers_preserve_non_ppu_calls(kpool, paged):
         assert (
             kpool.provider.fp8_fp4_paged_mqa_logits(*args, indices=ids) == "cuda_decode"
         )
-        assert kpool.calls == [("cuda_decode", args, {"indices": ids})]
+        assert kpool.calls == [
+            ("cuda_decode", args, {"logits_dtype": "fp32", "indices": ids})
+        ]
     else:
         assert kpool.provider.fp8_fp4_mqa_logits(*args) == "cuda_prefill"
-        assert kpool.calls == [("cuda_prefill", args, {})]
+        assert kpool.calls == [("cuda_prefill", args, {"logits_dtype": "fp32"})]
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_glm_wrappers_cast_legacy_fp32_logits_to_requested_dtype(
+    kpool, paged, monkeypatch
+):
+    class Logits:
+        def __init__(self):
+            self.cast_to = None
+
+        def to(self, dtype):
+            self.cast_to = dtype
+            return self
+
+    logits = Logits()
+    module = sys.modules["vllm_sail.utils.deep_gemm"]
+    if paged:
+        monkeypatch.setattr(module, "fp8_paged_mqa_logits", lambda *a, **k: logits)
+        result = kpool.provider.fp8_fp4_paged_mqa_logits(
+            (Tensor((2, 1, 32, 128)), None),
+            Tensor((2, 64, 1, 132)),
+            object(),
+            Tensor((2, 1)),
+            Tensor((2, 1)),
+            "stale",
+            64,
+            logits_dtype="bf16",
+        )
+    else:
+        monkeypatch.setattr(module, "fp8_mqa_logits", lambda *a, **k: logits)
+        result = kpool.provider.fp8_fp4_mqa_logits(
+            (Tensor((2, 32, 128)), None),
+            object(),
+            object(),
+            object(),
+            object(),
+            65,
+            logits_dtype="bf16",
+        )
+    assert result is logits
+    assert logits.cast_to == "bf16"
 
 
 @pytest.mark.upstream_source

@@ -52,7 +52,7 @@ _TARGET = "_try_load_fp8_attn_proj"
 #: carry no ``mtp`` module - so listing a platform copy here would be dead code
 #: that the patch contract check rejects as a missing target.
 _CONSUMERS = ("vllm.models.glm5next.common.mtp",)
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _installed = False
 #: True when the upstream glm5next model cannot be imported (older transformers).
 _unavailable = False

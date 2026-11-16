@@ -69,7 +69,6 @@ def complete_warmup_contract(modules, provider, worker, platform, *, entered=Non
     platform.is_cuda = lambda: True
     platform.is_rocm = lambda: False
     platform.is_device_capability_family = lambda _: False
-    worker.use_v2_model_runner = True
     worker.model_runner.attn_groups = []
     worker.vllm_config.model_config = ns()
     worker.vllm_config.compilation_config = ns(cudagraph_capture_sizes=[])
@@ -89,17 +88,18 @@ def complete_warmup_contract(modules, provider, worker, platform, *, entered=Non
     callbacks = {
         "qwen_triton_warmup": lambda runner, config: entered(),
         "qwen_vl_triton_warmup": lambda runner: None,
-        "mamba_triton_warmup": lambda runner: None,
+        "replayssm_lifecycle_warmup": lambda runner: None,
         "kimi_k3_triton_warmup": lambda worker: None,
         "watermark_sample_warmup": lambda worker: None,
         "qwen4_exp_qsa_triton_warmup": lambda worker: None,
         "_warmup_bf16x3_router_gemm": lambda model, tokens: None,
         "_warmup_ll_bf16_router_gemm": lambda model: None,
         "_warmup_gemm_rs_ar": lambda: None,
+        "_warmup_skinny_gemm": lambda model: None,
         "flashinfer_sparse_mla_decode_autotune_warmup": lambda worker: None,
         "deepseek_v4_sparse_mla_attention_warmup": lambda worker: None,
         "b12x_warmup": lambda worker, sizes: None,
-        "mixed_batch_attention_warmup": lambda worker: None,
+        "_warmup_flashinfer_attention": lambda worker: None,
         "is_deep_gemm_supported": lambda: False,
         "has_flashinfer": lambda: False,
     }
@@ -278,11 +278,20 @@ def test_compressor_constructor_registers_supported_warmup(
 ):
     base = "vllm.models.deepseek_v4"
     calls = []
+    linear_calls = []
 
     def kernel(name):
         return types.SimpleNamespace(register_warmup=lambda *a, **k: calls.append(name))
 
     def noop(*a, **k):
+        return object()
+
+    def merged_linear(*a, **k):
+        linear_calls.append("merged")
+        return object()
+
+    def kv_score_linear(*a, **k):
+        linear_calls.append("kv_score")
         return object()
 
     cls = type(
@@ -292,12 +301,16 @@ def test_compressor_constructor_registers_supported_warmup(
         f"{base}.compressor",
         DeepseekCompressor=cls,
         current_platform=types.SimpleNamespace(
-            device_type="cuda", is_cuda=lambda: True, is_ppu=lambda: ppu
+            device_type="cuda",
+            is_cuda=lambda: True,
+            is_ppu=lambda: ppu,
+            is_cpu=lambda: False,
         ),
         torch=types.SimpleNamespace(empty=noop, float32="fp32"),
         nn=types.SimpleNamespace(Parameter=noop),
         _prefer_two_stage_compressor=lambda: False,
-        MergedColumnParallelLinear=noop,
+        MergedColumnParallelLinear=merged_linear,
+        DeepseekV4CompressorKVScoreLinear=kv_score_linear,
         RMSNorm=noop,
         CompressorStateCache=noop,
         _SAVE_PARTIAL_STATES_KERNEL=kernel("save"),
@@ -330,6 +343,8 @@ def test_compressor_constructor_registers_supported_warmup(
     )
     obj = cls(config, ratio, 256, head)
     assert obj.__init__.__func__.__globals__ is provider.__dict__
+    # Non-CPU platforms must build the FP32-out KV/score projection.
+    assert linear_calls == ["kv_score"]
     if not warmup:
         assert calls == []
     elif ppu or head != 512:
@@ -345,6 +360,52 @@ def test_compressor_constructor_registers_supported_warmup(
             "cute128",
             "cutestore" if cache_dtype == "fp8_ds_mla" else "cutestorefull",
         ]
+
+
+@pytest.mark.parametrize("cpu,expected", [(False, "kv_score"), (True, "merged")])
+def test_compressor_kv_score_linear_matches_platform(cpu, expected):
+    ns = types.SimpleNamespace
+    calls = []
+
+    def linear(name):
+        def factory(*a, **k):
+            calls.append(name)
+            return object()
+
+        return factory
+
+    cls = type("DeepseekCompressor", (), {})
+    namespace = {
+        "DeepseekCompressor": cls,
+        "current_platform": ns(
+            device_type="cpu" if cpu else "cuda",
+            is_cpu=lambda: cpu,
+            is_cuda=lambda: not cpu,
+            is_ppu=lambda: False,
+        ),
+        "torch": ns(float32="fp32", empty=lambda *a, **k: object()),
+        "nn": ns(Parameter=lambda *a, **k: object()),
+        "_prefer_two_stage_compressor": lambda: False,
+        "MergedColumnParallelLinear": linear("merged"),
+        "DeepseekV4CompressorKVScoreLinear": linear("kv_score"),
+        "RMSNorm": lambda *a, **k: object(),
+        "CompressorStateCache": lambda *a, **k: object(),
+    }
+    config = ns(
+        model_config=ns(
+            hf_config=ns(qk_rope_head_dim=64, rms_norm_eps=1e-6), max_model_len=1024
+        ),
+        scheduler_config=ns(max_num_seqs=4, max_num_batched_tokens=64),
+        compilation_config=ns(static_forward_context={}),
+        kernel_config=ns(enable_jit_warmup=False),
+    )
+    obj = cls.__new__(cls)
+    function(
+        "vllm_sail/patch/enhancement/models/deepseek_v4_compressor.py",
+        "__init__",
+        namespace,
+    )(obj, config, 128, 256, 512)
+    assert calls == [expected]
 
 
 @pytest.mark.parametrize("ppu", [True, False])
@@ -789,54 +850,6 @@ def test_body_binding_preserves_keyword_defaults_and_live_globals(modules):
     assert bound.__annotations__ == namespace.body.__annotations__
 
 
-def test_input_batch_reinitializes_when_only_context_length_changes(modules):
-    platform = types.SimpleNamespace(is_ppu=lambda: True)
-    modules("vllm.platforms", current_platform=platform)
-    cls = type("GPUModelRunner", (), {"may_reinitialize_input_batch": lambda *a: None})
-    modules(
-        "vllm.v1.worker.gpu_model_runner",
-        GPUModelRunner=cls,
-        InputBatch=lambda **kwargs: types.SimpleNamespace(**kwargs),
-    )
-    modules(
-        "vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils",
-        rejection_sample=lambda *a: None,
-    )
-    load_patch("vllm_sail/patch/enhancement/runtime.py")
-    runner = cls()
-    runner.__dict__.update(
-        max_model_len=8192,
-        cp_kv_cache_interleave_size=1,
-        jit_warmup_registry=types.SimpleNamespace(
-            activate=__import__("contextlib").nullcontext
-        ),
-        max_encoder_len=0,
-        _init_block_sizes=[],
-        _init_max_num_blocks=[],
-        _init_slot_mapping_modes=[],
-        input_batch=types.SimpleNamespace(
-            max_model_len=4096,
-            logitsprocs=object(),
-            logitsprocs_need_output_token_ids=False,
-        ),
-        max_num_reqs=16,
-        max_num_tokens=2048,
-        device="ppu",
-        model_config=types.SimpleNamespace(get_vocab_size=lambda: 1024),
-        num_spec_tokens=2,
-        is_pooling_model=False,
-        parallel_config=types.SimpleNamespace(cp_kv_cache_interleave_size=1),
-        vllm_config=types.SimpleNamespace(reasoning_config=None),
-        cache_config=types.SimpleNamespace(use_replayssm=False),
-    )
-    old = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is not old and runner.input_batch.max_model_len == 8192
-    new = runner.input_batch
-    runner.may_reinitialize_input_batch(types.SimpleNamespace(kv_cache_groups=[]))
-    assert runner.input_batch is new
-
-
 def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
     class Fp8Config:
         def __init__(self, **kwargs):
@@ -923,7 +936,7 @@ def test_deepseek_config_preserves_dense_channelwise_patterns_for_mtp(modules):
 @pytest.mark.parametrize(
     "consumer_name",
     [
-        "vllm.model_executor.layers.fused_moe.oracle.fp8",
+        "vllm.model_executor.layers.fused_moe.oracle.base",
         "vllm.model_executor.layers.quantization.modelopt_block_quant",
     ],
 )
@@ -1045,6 +1058,8 @@ def test_fa_sink_combination_respects_ppu_fa3_and_fp8_gates(
     modules, ppu, arch, version, fp8, expected
 ):
     class Backend:
+        head_size_v = None
+
         @classmethod
         def supports_combination(cls, *args, **kwargs):
             return "original"
@@ -1066,3 +1081,109 @@ def test_fa_sink_combination_respects_ppu_fa3_and_fp8_gates(
         assert result is None
     else:
         assert expected in result
+
+
+@pytest.mark.parametrize(
+    "block_size,use_sparse,expected",
+    [
+        (16, False, "divisible by 64"),
+        (64, True, "block sparsity"),
+        (64, False, None),
+        (None, False, None),
+    ],
+)
+def test_fa_sm90_d512_fp8_kv_gates(modules, block_size, use_sparse, expected):
+    class Backend:
+        head_size_v = 512
+
+        @classmethod
+        def supports_combination(cls, *args, **kwargs):
+            return "original"
+
+    modules(
+        "vllm.v1.attention.backends.flash_attn",
+        FlashAttentionBackend=Backend,
+        current_platform=types.SimpleNamespace(is_ppu=lambda: False),
+        DeviceCapability=lambda major, minor: (major, minor),
+        get_flash_attn_version=lambda **kw: 3,
+        is_quantized_kv_cache=lambda dtype: dtype == "fp8",
+        flash_attn_supports_kv_cache_dtype=lambda *args, **kw: True,
+    )
+    load_patch("vllm_sail/patch/enhancement/attention/flash_attn.py")
+    result = Backend.supports_combination(
+        512, "bf16", "fp8", block_size, False, False, use_sparse, False, (9, 0)
+    )
+    if expected is None:
+        assert result is None
+    else:
+        assert expected in result
+
+
+def test_fa_kv_gate_forwards_backend_head_size_v(modules):
+    seen = {}
+
+    class Backend:
+        head_size_v = 192
+
+        @classmethod
+        def supports_combination(cls, *args, **kwargs):
+            return "original"
+
+    def supports(*args, **kwargs):
+        seen.update(kwargs)
+        return True
+
+    modules(
+        "vllm.v1.attention.backends.flash_attn",
+        FlashAttentionBackend=Backend,
+        current_platform=types.SimpleNamespace(is_ppu=lambda: False),
+        DeviceCapability=lambda major, minor: (major, minor),
+        get_flash_attn_version=lambda **kw: 3,
+        is_quantized_kv_cache=lambda dtype: dtype == "fp8",
+        flash_attn_supports_kv_cache_dtype=supports,
+    )
+    load_patch("vllm_sail/patch/enhancement/attention/flash_attn.py")
+    assert (
+        Backend.supports_combination(
+            128, "bf16", "fp8", 16, False, False, False, False, (8, 9)
+        )
+        is None
+    )
+    assert seen["head_size"] == 128
+    assert seen["head_size_v"] == 192
+
+
+@pytest.mark.parametrize(
+    "head_size,head_size_v,expected",
+    [
+        (512, 512, True),
+        (512, None, True),
+        (None, None, True),
+        (512, 128, False),
+        (256, 256, False),
+    ],
+)
+def test_sm90_fa4_fp8_kv_requires_equal_d512(modules, head_size, head_size_v, expected):
+    platform = types.SimpleNamespace(
+        is_ppu=lambda: False,
+        is_rocm=lambda: False,
+        is_xpu=lambda: False,
+        supports_fp8=lambda: True,
+        get_device_capability=lambda: types.SimpleNamespace(major=9),
+        is_device_capability_family=lambda family: family == 90,
+    )
+    provider = modules(
+        "vllm.v1.attention.backends.fa_utils",
+        get_flash_attn_version=lambda **kw: 4,
+        flash_attn_supports_kv_cache_dtype=lambda *a, **k: "old",
+        current_platform=platform,
+        envs=types.SimpleNamespace(VLLM_BATCH_INVARIANT=False),
+        logger=types.SimpleNamespace(
+            warning_once=lambda *a: None, error=lambda *a: None
+        ),
+    )
+    load_patch("vllm_sail/patch/enhancement/attention/fa_utils.py")
+    provider.get_flash_attn_version = lambda **kw: 4
+    assert provider.flash_attn_supports_kv_cache_dtype(
+        "fp8_e4m3", head_size=head_size, head_size_v=head_size_v
+    ) is expected

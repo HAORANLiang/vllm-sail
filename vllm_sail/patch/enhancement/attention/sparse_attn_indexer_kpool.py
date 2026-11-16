@@ -55,7 +55,7 @@ from vllm.utils.torch_utils import _encode_layer_name
 import vllm_sail.ops  # noqa: F401  (registers torch.ops.vllm.ppu_sparse_attn_indexer_kpool)
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.models.glm5next.nvidia.sparse_indexer"
 
 if not _unavailable:
@@ -114,32 +114,38 @@ _FORWARD_NATIVE_REMOVE_WHEN = (
 )
 
 
-def fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k):
+def fp8_mqa_logits(
+    q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k,
+    logits_dtype=torch.float32,
+):
     """Keep GLM's FP8 producers on SAIL's legacy FP8 scoring API."""
     if not current_platform.is_ppu():
         return _upstream_mqa_logits(
-            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, max_seqlen_k,
+            logits_dtype=logits_dtype,
         )
     from vllm_sail.utils import deep_gemm
 
     q_values, q_scale = q
     if q_scale is not None or q_values.dtype != torch.float8_e4m3fn:
         raise ValueError("SAIL GLM Kpool expects FP8 Q with scales folded into weights")
-    return deep_gemm.fp8_mqa_logits(
+    logits = deep_gemm.fp8_mqa_logits(
         q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke,
         clean_logits=False, max_seqlen_k=max_seqlen_k,
     )
+    # The legacy SAIL kernel only produces fp32; honor the requested dtype.
+    return logits if logits_dtype == torch.float32 else logits.to(logits_dtype)
 
 
 def fp8_paged_mqa_logits(
     q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
-    max_model_len, indices=None,
+    max_model_len, logits_dtype=torch.float32, indices=None,
 ):
     """Generate the FP8 schedule from the device-built per-query GLM rows."""
     if not current_platform.is_ppu():
         return _upstream_paged_mqa_logits(
             q, kv_cache, weights, context_lens, block_tables, schedule_metadata,
-            max_model_len, indices=indices,
+            max_model_len, logits_dtype=logits_dtype, indices=indices,
         )
     from vllm_sail.utils import deep_gemm
 
@@ -159,10 +165,12 @@ def fp8_paged_mqa_logits(
         contexts, kv_cache.shape[1], deep_gemm.get_num_sms(),
         (1, q_values.shape[2], q_values.shape[3], q_values.dtype),
     )
-    return deep_gemm.fp8_paged_mqa_logits(
+    logits = deep_gemm.fp8_paged_mqa_logits(
         q_values, kv_cache, weights, contexts, block_tables, schedule,
         max_model_len, clean_logits=False,
     )
+    # The legacy SAIL kernel only produces fp32; honor the requested dtype.
+    return logits if logits_dtype == torch.float32 else logits.to(logits_dtype)
 
 
 def forward_ppu(

@@ -75,7 +75,14 @@ def __init__(
         requires_grad=False,
     )
 
-    self.fused_wkv_wgate = MergedColumnParallelLinear(
+    # CPU packs the weight for its GEMM and frees the raw copy, so it keeps
+    # the quant-method forward and upcasts the BF16 output itself.
+    kv_score_linear = (
+        MergedColumnParallelLinear
+        if current_platform.is_cpu()
+        else DeepseekV4CompressorKVScoreLinear
+    )
+    self.fused_wkv_wgate = kv_score_linear(
         self.hidden_size,
         [self.coff * self.head_dim, self.coff * self.head_dim],
         bias=False,
@@ -278,7 +285,7 @@ patch(
         "PPU requires its Triton implementation. The common attention and "
         "indexer constructors do not share a compressor factory hook."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="The compression helper selects kernels through platform capabilities.",
 )(bind_body(_compress_norm_rope_store, _compressor))
 
@@ -291,6 +298,6 @@ patch(
         "identity, bypassing has_cutedsl and the PPU forward guard. PPU must "
         "register the common Triton warmup instead."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="DeepseekCompressor gates warmup registration on backend capabilities.",
 )(bind_body(__init__, _compressor))

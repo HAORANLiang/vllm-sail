@@ -10,8 +10,6 @@ from vllm.platforms import current_platform
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _GRAPH_WARMUP = ContextVar("ppu_dsv4_graph_warmup", default=False)
-_RUNNER = "vllm.v1.worker.gpu_model_runner"
-_RUNNER_TARGET = f"{_RUNNER}.GPUModelRunner._warmup_and_capture"
 _MANAGER = "vllm.v1.worker.gpu.cudagraph_utils"
 _MANAGER_TARGET = f"{_MANAGER}.CudaGraphManager.capture"
 _INDEXER = "vllm.models.deepseek_v4.attention"
@@ -23,22 +21,10 @@ _REMOVE_WHEN = (
 
 
 @patch(
-    _RUNNER,
-    "GPUModelRunner._warmup_and_capture",
-    reason="Mark graph warmups so the V4 short-context path initializes captured JITs.",
-    affected_versions=">=0.32.0,<0.33.0",
-    remove_when=_REMOVE_WHEN,
-)
-def warmup_and_capture(self, *args, **kwargs):
-    original = getattr(warmup_and_capture, PATCH_MARKER)[_RUNNER_TARGET]
-    return _run_graph_warmup(original, self, args, kwargs)
-
-
-@patch(
     _MANAGER,
     "CudaGraphManager.capture",
     reason="V2 runner graph warmup must initialize the omitted V4 query path too.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when=_REMOVE_WHEN,
 )
 def capture(self, *args, **kwargs):
@@ -64,7 +50,7 @@ def _run_graph_warmup(original, self, args, kwargs):
         "runs it. DeepGEMM then loads a new shape inside capture and raises "
         "HGGC_ERROR_STREAM_CAPTURE_UNSUPPORTED. Warm that omitted path first."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when=_REMOVE_WHEN,
 )
 def indexer_forward(

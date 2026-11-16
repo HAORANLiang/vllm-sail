@@ -720,6 +720,17 @@ def test_selector_foreign_class_never_gated(selector) -> None:
     assert selector.gate_state["calls"] == []
 
 
+def test_selector_lora_keeps_split_kv_path(selector) -> None:
+    # Upstream returns FlashMLA for LoRA even with the mega backend requested;
+    # the PPU promotion must not re-select mega attention over that guard.
+    config = SimpleNamespace(lora_config=object())
+    assert selector.select(config) is selector.classes.baseline
+    assert any("gate closed" in msg for msg, _ in selector.logs)
+    assert any("lora" in str(args) for _, args in selector.logs)
+    selector.state["selected"] = selector.classes.upstream_mega
+    assert selector.select(config) is selector.classes.baseline
+
+
 def test_selector_patch_metadata(selector) -> None:
     target = "vllm.models.deepseek_v41.nvidia.model._select_dsv4_attn_cls"
     assert selector.model_stub._select_dsv4_attn_cls is selector.select

@@ -14,7 +14,7 @@ from vllm_sail.patch.utils import PATCH_MARKER, patch
 
 _META = dict(
     reason="PPU GDN uses PLA for supported decode/prefill layouts and Triton for other shapes.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="GDN exposes platform backend registration for PLA prefill and recurrent kernels.",
 )
 
@@ -514,7 +514,8 @@ def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
     # PPU MODIFICATION: begin
 ) -> tuple[
-    str, Literal["triton", "flashinfer", "cutedsl", "aiter_flydsl", "sycl", "pla"]
+    str,
+    Literal["triton", "flashinfer", "cutedsl", "aiter_flydsl", "sycl", "hip", "pla"],
 ]:
     # PPU MODIFICATION: end
     """Resolve GDN prefill backend.
@@ -534,12 +535,19 @@ def _resolve_gdn_prefill_backend(
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
-    * Blackwell (SM10.x) with ``head_k_dim == 128``;
+    * Blackwell (SM10.x or SM11.x) with ``head_k_dim == 128``,
+      ``cuda_runtime >= 13``;
 
     AITER FlyDSL GDN prefill kernels are chosen when:
     * "aiter_flydsl" is requested, or "auto" is requested on gfx942/gfx950;
     * ROCm AITER exposes the optimized VK prefill API and FlyDSL kernels;
     * the model uses BF16 activations with ``head_k_dim == head_v_dim == 128``.
+
+    The HIP GDN prefill kernel is chosen when:
+    * "hip" is requested on RDNA3.5 (gfx1150-gfx1153), or "auto" on gfx1151;
+    * the build includes ``_rocm_C.rdna35_gdn_chunked``;
+    * the model uses BF16 or FP16 activations with
+      ``head_k_dim == head_v_dim == 128``.
     # PPU MODIFICATION: begin
 
     The PPU pla (FlashQLA) CUDA kernel is chosen when:
@@ -599,8 +607,24 @@ def _resolve_gdn_prefill_backend(
                 )
                 return backend, "triton"
             return backend, "aiter_flydsl"
+        if backend == "hip":
+            if not is_hip_gdn_available():
+                raise RuntimeError(
+                    "GDN prefill backend 'hip' was requested but "
+                    "_rocm_C.rdna35_gdn_chunked is unavailable. It is built "
+                    "and registered only for RDNA3.5 (gfx1150-gfx1153)."
+                )
+            reasons = _hip_gdn_unsupported_reasons(vllm_config, head_k_dim, head_v_dim)
+            if reasons:
+                logger.warning_once(
+                    "GDN prefill backend 'hip' was requested but %s. "
+                    "Falling back to Triton/FLA.",
+                    "; ".join(reasons),
+                )
+                return backend, "triton"
+            return backend, "hip"
         if backend == "auto":
-            from vllm.platforms.rocm import on_mi3xx
+            from vllm.platforms.rocm import on_gfx1151, on_mi3xx
 
             if (
                 on_mi3xx()
@@ -610,12 +634,20 @@ def _resolve_gdn_prefill_backend(
                 and rocm_aiter_ops.is_gdn_flydsl_prefill_available()
             ):
                 return backend, "aiter_flydsl"
+            if (
+                on_gfx1151()
+                and not _hip_gdn_unsupported_reasons(
+                    vllm_config, head_k_dim, head_v_dim
+                )
+                and is_hip_gdn_available()
+            ):
+                return backend, "hip"
         return backend, "triton"
 
-    if backend == "aiter_flydsl":
+    if backend in ("aiter_flydsl", "hip"):
         raise RuntimeError(
-            "GDN prefill backend 'aiter_flydsl' was requested but it is a ROCm "
-            f"AITER backend and the current platform is {current_platform.device_name}."
+            f"GDN prefill backend '{backend}' was requested but it is a ROCm "
+            f"backend and the current platform is {current_platform.device_name}."
         )
 
     if not current_platform.is_cuda():
@@ -641,11 +673,17 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
         supports_cutedsl = True
     elif (
+        current_platform.is_device_capability_family(110)
+        and head_k_dim == 128
+        and current_platform.get_cuda_runtime_major() >= 13
+    ):
+        supports_cutedsl = True
+    elif (
         current_platform.is_device_capability_family(120)
         and head_k_dim == 128
         and current_platform.get_cuda_runtime_major() >= 13
     ):
-        # The in-tree CuteDSL kernel targets SM100 only, so it stays off here.
+        # The in-tree CuteDSL kernel targets SM100/SM110 only, so it stays off here.
         supports_flashinfer = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
@@ -692,6 +730,7 @@ def _log_gdn_backend_decision(
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
         "aiter_flydsl": "AITER FlyDSL",
+        "hip": "HIP",
         # PPU MODIFICATION: begin
         "pla": "PLA FlashQLA",
         # PPU MODIFICATION: end
@@ -820,12 +859,17 @@ def __init__(self) -> None:
         )
     _log_gdn_backend_decision(vllm_config, backend, active_backend)
 
+    # On XPU "sycl" bypasses this module entirely (fused whole-layer op),
+    # so the chunked prefill path stays on Triton/FLA.
+
     if active_backend == "flashinfer":
         self._forward_method = self.forward_cuda
     elif active_backend == "cutedsl":
         self._forward_method = self.forward_cutedsl
     elif active_backend == "aiter_flydsl":
         self._forward_method = self.forward_aiter_flydsl
+    elif active_backend == "hip":
+        self._forward_method = self.forward_hip
     # PPU MODIFICATION: begin
     elif active_backend == "pla":
         self._forward_method = self.forward_pla

@@ -13,7 +13,7 @@ from vllm_sail.patch.utils import patch
 from vllm_sail.registry.moe_backends._extend import extend_enum
 
 _MODULE = "vllm.model_executor.layers.fused_moe.oracle.unquantized"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REMOVE_WHEN = (
     "upstream gains a register_moe_backend() extension point mirroring "
     "register_linear_kernel(), which would delete this patch."
@@ -59,7 +59,7 @@ def _get_priority_backends(
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
-        if moe_config.moe_parallel_config.use_batched_activation_format
+        if moe_config.use_batched_activation_format
         or moe_config.moe_backend == "batched_triton"
         else mk.FusedMoEActivationFormat.Standard
     )
@@ -151,7 +151,7 @@ def select_unquantized_moe_backend(
 ) -> tuple[UnquantizedMoeBackend, type[mk.FusedMoEExperts] | None]:
     if (
         moe_config.moe_backend == "ppu_deep_gemm"
-        and moe_config.moe_parallel_config.use_batched_activation_format
+        and moe_config.use_batched_activation_format
     ):
         backend = UnquantizedMoeBackend.BATCHED_PPU_DEEPGEMM
         for kernel_cls in backend_to_kernel_cls(backend):

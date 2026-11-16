@@ -40,7 +40,7 @@ from vllm_sail.patch.utils import patch
 
 logger = init_logger(__name__)
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 _original_select_indexer_impl = _indexer_module.select_indexer_impl_cls
 _original_select_main_backend_and_impl = (

@@ -55,7 +55,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 import vllm_sail.utils.deep_gemm as _ppu_deep_gemm
 from vllm_sail.patch.utils import patch, patch_value
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.v1.attention.backends.mla.indexer"
 
 #: Builder currently inside ``build``. The rebound paged-MQA-logits metadata

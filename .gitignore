@@ -47,6 +47,9 @@ cmake_install.cmake
 compile_commands.json
 .ninja_deps
 .ninja_log
+# SDK-compat headers emitted beside the ported corpus during native builds;
+# reproducible build cache, not part of the maintained manifest corpus.
+csrc/upstream/.ppu_compat/
 /cmake-build-*/
 
 # Generated local tuning results; reviewed package configs are tracked separately.

@@ -18,7 +18,7 @@ from vllm_sail.registry.moe_backends._extend import extend_enum
 logger = init_logger(__name__)
 
 _MODULE = "vllm.model_executor.layers.fused_moe.oracle.int8"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REMOVE_WHEN = (
     "upstream gains a register_moe_backend() extension point mirroring "
     "register_linear_kernel(), which would delete this patch."
@@ -192,7 +192,7 @@ def select_int8_moe_backend(
     weight_key: QuantKey | None = oracle.kInt8StaticChannelSym,
     activation_key: QuantKey | None = oracle.kInt8DynamicTokenSym,
 ) -> tuple[Int8MoeBackend, type[mk.FusedMoEExperts]]:
-    is_batched = config.moe_parallel_config.use_batched_activation_format
+    is_batched = config.use_batched_activation_format
     if not is_batched or config.moe_backend == "auto":
         return _upstream_select_int8_moe_backend(config, weight_key, activation_key)
 

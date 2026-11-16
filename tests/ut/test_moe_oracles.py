@@ -39,12 +39,12 @@ def oracles():
 
 def _config(oracles):
     parallel = SimpleNamespace(
-        use_batched_activation_format=False,
         use_deepep_v2_kernels=False,
         dp_size=1,
         ep_size=1,
     )
     return SimpleNamespace(
+        use_batched_activation_format=False,
         moe_parallel_config=parallel,
         moe_backend="auto",
         activation=oracles.unquantized.oracle.MoEActivation.SILU,
@@ -355,17 +355,27 @@ class _FakeExperts:
 
 
 def _select_config(oracles, *, backend: str, batched: bool):
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEActivationFormat,
+    )
+
     parallel = SimpleNamespace(
-        use_batched_activation_format=batched,
         use_deepep_v2_kernels=False,
         dp_size=1,
         ep_size=1,
     )
     return SimpleNamespace(
+        use_batched_activation_format=batched,
+        activation_format=(
+            FusedMoEActivationFormat.BatchedExperts
+            if batched
+            else FusedMoEActivationFormat.Standard
+        ),
         moe_parallel_config=parallel,
         moe_backend=backend,
         activation=oracles.unquantized.oracle.MoEActivation.SILU,
         has_bias=False,
+        is_lora_enabled=False,
     )
 
 
@@ -622,10 +632,20 @@ def test_select_mxfp4_batched_ppu_deep_gemm_uses_batched_member(
     plugin = oracles.mxfp4
     captured = {}
 
-    def _capture(backend, config, weight_key, activation_key, activation_format):
+    def _capture(
+        self,
+        backend,
+        available_backends=None,
+        kernel_classes=None,
+        activation_key=None,
+        is_lora=False,
+    ):
         # map_mxfp4_backend() lists the standard PPU member followed by its
-        # batched sibling and lets the shared is_supported_config() format check
-        # drop the one that does not match the MoE layout; this stub mirrors it.
+        # batched sibling; the oracle's try_backend() format gate drops the one
+        # that does not match the MoE layout. This stub mirrors that gate on the
+        # Mxfp4MoEKernelOracle.return_or_raise seam, into which upstream folded
+        # the former module-level _return_or_raise helper.
+        activation_format = self.moe_config.activation_format
         own_format = (
             plugin.mk.FusedMoEActivationFormat.BatchedExperts
             if backend.name.startswith("BATCHED_")
@@ -635,13 +655,15 @@ def test_select_mxfp4_batched_ppu_deep_gemm_uses_batched_member(
             raise ValueError(f"{backend.value} rejected: activation format")
         captured.update(
             backend=backend,
-            weight_key=weight_key,
+            weight_key=self.weight_key,
             activation_key=activation_key,
             activation_format=activation_format,
         )
         return backend, _FakeExperts
 
-    monkeypatch.setattr(plugin.oracle, "_return_or_raise", _capture)
+    monkeypatch.setattr(
+        plugin.oracle.Mxfp4MoEKernelOracle, "return_or_raise", _capture
+    )
     monkeypatch.setattr(plugin.oracle, "_resolve_activation_key", lambda key: key)
     backend, kernel_cls = plugin.select_mxfp4_moe_backend(
         _select_config(oracles, backend="ppu_deep_gemm", batched=True)
@@ -663,10 +685,20 @@ def test_select_mxfp4_non_batched_ppu_deep_gemm_uses_standard_member(
     plugin = oracles.mxfp4
     captured = {}
 
-    def _capture(backend, config, weight_key, activation_key, activation_format):
+    def _capture(
+        self,
+        backend,
+        available_backends=None,
+        kernel_classes=None,
+        activation_key=None,
+        is_lora=False,
+    ):
         # map_mxfp4_backend() lists the standard PPU member followed by its
-        # batched sibling and lets the shared is_supported_config() format check
-        # drop the one that does not match the MoE layout; this stub mirrors it.
+        # batched sibling; the oracle's try_backend() format gate drops the one
+        # that does not match the MoE layout. This stub mirrors that gate on the
+        # Mxfp4MoEKernelOracle.return_or_raise seam, into which upstream folded
+        # the former module-level _return_or_raise helper.
+        activation_format = self.moe_config.activation_format
         own_format = (
             plugin.mk.FusedMoEActivationFormat.BatchedExperts
             if backend.name.startswith("BATCHED_")
@@ -676,13 +708,15 @@ def test_select_mxfp4_non_batched_ppu_deep_gemm_uses_standard_member(
             raise ValueError(f"{backend.value} rejected: activation format")
         captured.update(
             backend=backend,
-            weight_key=weight_key,
+            weight_key=self.weight_key,
             activation_key=activation_key,
             activation_format=activation_format,
         )
         return backend, _FakeExperts
 
-    monkeypatch.setattr(plugin.oracle, "_return_or_raise", _capture)
+    monkeypatch.setattr(
+        plugin.oracle.Mxfp4MoEKernelOracle, "return_or_raise", _capture
+    )
     monkeypatch.setattr(plugin.oracle, "_resolve_activation_key", lambda key: key)
     backend, kernel_cls = plugin.select_mxfp4_moe_backend(
         _select_config(oracles, backend="ppu_deep_gemm", batched=False)

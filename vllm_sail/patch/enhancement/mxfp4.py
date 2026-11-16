@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 _QMODULE = "vllm.model_executor.layers.quantization.mxfp4"
 _OMODULE = "vllm.model_executor.layers.fused_moe.oracle.mxfp4"
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.34.0,<0.35.0"
 
 # Explicit per-kind member lists, keyed by the kernel path each member takes:
 # "w4a16" reuses MARLIN's 16-bit activation packing, "w4a16mma" is DeepGEMM's
@@ -523,12 +523,6 @@ def install() -> None:
         activation_key=None,
     ):
         if mxfp4_backend in _ppu_backends("w4a16"):
-            import vllm.envs as envs
-
-            if (envs.VLLM_MARLIN_INPUT_DTYPE or "").lower() in ("int8", "fp8"):
-                raise ValueError(
-                    "PPU MXFP4 BF16 experts require 16-bit activation weight packing; unset VLLM_MARLIN_INPUT_DTYPE."
-                )
             mxfp4_backend = oracle.Mxfp4MoeBackend.MARLIN
         if mxfp4_backend in _ppu_backends("w4a16mma"):
             from vllm_sail.model_executor.layers.fused_moe.deep_gemm_utils import (
@@ -602,12 +596,6 @@ def install() -> None:
         _cache_permute_indices: dict | None = None,
     ):
         if mxfp4_backend in _ppu_backends("w4a16"):
-            import vllm.envs as envs
-
-            if (envs.VLLM_MARLIN_INPUT_DTYPE or "").lower() in ("int8", "fp8"):
-                raise ValueError(
-                    "PPU MXFP4 BF16 experts require 16-bit activation weight packing; unset VLLM_MARLIN_INPUT_DTYPE."
-                )
             mxfp4_backend = oracle.Mxfp4MoeBackend.MARLIN
         if mxfp4_backend in _ppu_backends("w4a16mma"):
             from vllm_sail.model_executor.layers.fused_moe.deep_gemm_utils import (

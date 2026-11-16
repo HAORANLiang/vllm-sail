@@ -42,9 +42,7 @@ making hardware or model-support claims.
   structure and express behavior changes only inside `PPU MODIFICATION:
   begin/end` markers.
 - Runtime patch reports are generated on demand by `tools/patch_manifest.py`;
-  do not commit generated reports. The pilot borrowed bodies in
-  `vllm_sail/patch/_upstream/runtime.py` are maintained source, not generated
-  output. Preserve their attribution and PPU modification markers.
+  do not commit generated reports.
 - Never hand-edit `csrc/upstream/**`, except its input `manifest.toml`.
   Edit inputs or transformations and regenerate.
 - `csrc/plugin/` contains authored HGGC sources and host bindings. Edit these

@@ -352,7 +352,7 @@ def patch(
             resolves the class internally and preserves method descriptors.
         reason: Why this patch exists. Required.
         affected_versions: vLLM version or range the patch applies to, e.g.
-            ``">=0.32.0,<0.33.0"``. Required.
+            ``">=0.34.0,<0.35.0"``. Required.
         remove_when: A verifiable condition under which this patch can be
             deleted, e.g. an upstream PR or capability. Required.
         allow_missing: Permit the target not to exist yet. Use only when

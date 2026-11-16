@@ -21,7 +21,7 @@ from vllm_sail.attention.ops import sparse_mqa as _sail
 from vllm_sail.patch.bodies import bind_body
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REASON = "PPU M890 uses SAIL sparse MXFP4 logits and DeepSelect through the upstream interface."
 _REMOVE_WHEN = "The sparse indexer exposes platform capability and DeepGEMM provider hooks."
 _LAYER = "vllm.model_executor.layers.sparse_mqa_indexer"

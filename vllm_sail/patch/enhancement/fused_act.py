@@ -42,7 +42,7 @@ from vllm_sail.utils.deep_gemm import (
     is_ppu_15,
 )
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.model_executor.layers.activation"
 
 logger = init_logger(__name__)

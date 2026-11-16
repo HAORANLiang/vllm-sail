@@ -18,7 +18,7 @@ from vllm_sail.patch.utils import patch
 
 _META = dict(
     reason="PPU tuned configurations require per-projection launch parameters, VALU and PPU Triton kernels.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="Upstream supports registration of the complete Triton MoE launch strategy.",
 )
 
@@ -44,6 +44,8 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    A_is_sorted: bool = False,
+    C_is_sorted: bool = False,
     # PPU MODIFICATION: begin
     use_valu: bool = False,
     # PPU MODIFICATION: end
@@ -55,8 +57,10 @@ def invoke_fused_moe_triton_kernel(
 
     # PPU MODIFICATION: end
     assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
+    if topk_weights is not None and not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+    assert not (A_is_sorted or C_is_sorted) or sorted_token_ids is not None
 
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -92,10 +96,10 @@ def invoke_fused_moe_triton_kernel(
         assert B_scale is None
 
     M = A.size(0)
-    num_tokens = M * top_k
+    num_tokens = C.size(0) * C.size(1) if A_is_sorted else M * top_k
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)
-        if A.size(0) < config["BLOCK_SIZE_M"]:
+        if not A_is_sorted and A.size(0) < config["BLOCK_SIZE_M"]:
             # optimize for small batch_size.
             # We assume that top_ids of each token is unique,
             # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
@@ -326,7 +330,8 @@ def dispatch_fused_moe_kernel(
     # PPU MODIFICATION: end
 ) -> None:
     assert topk_weights is not None or not mul_routed_weight
-    assert topk_weights is None or topk_weights.stride(1) == 1
+    if topk_weights is not None and not topk_weights.is_contiguous():
+        raise ValueError("topk_weights must be contiguous")
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
 
     M = A.size(0)
@@ -336,6 +341,7 @@ def dispatch_fused_moe_kernel(
         block_shape is not None and block_shape[1] > 0
     ):
         assert B_bias is None
+        assert sorted_token_ids is not None
 
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
@@ -403,7 +409,7 @@ def dispatch_fused_moe_kernel(
             block_shape,
             B_bias,
             # PPU MODIFICATION: begin
-            use_valu,
+            use_valu=use_valu,
             # PPU MODIFICATION: end
         )
 
@@ -437,6 +443,7 @@ def get_moe_configs(
     dtype: str | None,
     block_n: int | None = None,
     block_k: int | None = None,
+    down_moe: bool = False,
     # PPU MODIFICATION: begin
     use_moe_wna16_cuda: bool = False,
     # PPU MODIFICATION: end
@@ -448,6 +455,7 @@ def get_moe_configs(
     batch sizes to configurations of the fused_moe kernel. To evaluate the
     kernel on a given batch size bs, the closest batch size in the grid should
     be picked and the associated configuration chosen to invoke the kernel.
+    A down-projection config is optional and uses a separate `_down.json` file.
     """
 
     # Avoid optimizing for the batch invariant case. Use default config
@@ -460,6 +468,8 @@ def get_moe_configs(
     # PPU MODIFICATION: begin
     json_file_name = get_config_file_name(E, N, dtype, block_shape, use_moe_wna16_cuda)
     # PPU MODIFICATION: end
+    if down_moe:
+        json_file_name = json_file_name.removesuffix(".json") + "_down.json"
 
     config_file_paths = []
 
@@ -492,11 +502,12 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning_once(
-        "Using default MoE config. Performance might be sub-optimal! "
-        "Config file not found at %s",
-        ", ".join(config_file_paths),
-    )
+    if not down_moe:
+        logger.warning_once(
+            "Using default MoE config. Performance might be sub-optimal! "
+            "Config file not found at %s",
+            ", ".join(config_file_paths),
+        )
     return None
 
 
@@ -1267,9 +1278,19 @@ def apply(
             activation, intermediate_cache2, intermediate_cache1.view(-1, N)
         )
 
+        # Row-local schemes quantize per row, but a per-tensor dynamic
+        # scale spans the whole activation. Restrict it to routed rows so
+        # the uninitialized `PaddedStandard` padding rows cannot poison it.
+        a2_quant_scale = a2_scale
+        if self.quant_config.act_scale_is_tensor_wide(a2_scale):
+            a2_quant_scale = masked_amax_scale(
+                intermediate_cache2,
+                self.quant_dtype,
+                row_valid=topk_ids.view(-1) >= 0,
+            )
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
             intermediate_cache2,
-            a2_scale,
+            a2_quant_scale,
             self.quant_dtype,
             self.per_act_token_quant,
             self.block_shape,

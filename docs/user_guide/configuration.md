@@ -185,7 +185,7 @@ packaged kernel manifest. Leave `VLLM_VERSION` and `VLLM_VERSION_OVERRIDE` unset
 so the plugin can verify that identity.
 
 For release-tag metadata, `VLLM_VERSION` can state the actual release base when a
-source build reports an ambiguous version. Use `VLLM_VERSION=0.32.0` only for a
+source build reports an ambiguous version. Use `VLLM_VERSION=0.34.0` only for a
 checkout verified against that release. Commit-pinned installations still
 require their full source SHA.
 

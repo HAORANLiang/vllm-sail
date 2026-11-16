@@ -18,7 +18,7 @@ schema = 1
 
 # The exact upstream vLLM tag the corpus is translated from. Bumping this means
 # re-running tools/port_upstream_kernels.py and reviewing the diff.
-upstream_ref = "8b10bda57ceab3a741d2fb3718af48cef691023e"
+upstream_ref = "62d4bc3c7e33b1b6c906e233e6af2d3506c482ca"
 
 # Compiled tiers, in the order CMake receives them. `x` must never appear here.
 # Must stay above [tiers]: a bare key after a table header belongs to that table.
@@ -143,6 +143,11 @@ _moe_C_stable_libtorch = "_upstream_moe_C"
 "               : \"r\"(smem_addr), \"l\"(gmem_ptr));" = "               : \"r\"(smem_addr), \"l\"(gmem_ptr));\n#endif"
 "  asm volatile(\"cp.async.commit_group;\\n\" ::);" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n#else\n  asm volatile(\"cp.async.commit_group;\\n\" ::);\n#endif"
 "  asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");" = "#if defined(__HGGCCC__)\n  __pipeline_commit();\n  __pipeline_wait_prior(0);\n#else\n  asm volatile(\"cp.async.wait_all;\\n\" ::: \"memory\");\n#endif"
+# v0.34 selects a cluster/DSMEM split (SplitV>1) when the device reports
+# capability major >= 9; below SM90 the kernel body is a __trap(). HGGC maps
+# __CUDA_ARCH__ to 800/890, so pin the host chooser to the plain SplitV=1
+# launch instead of relying on the unverified reported major.
+"int choose_split_v(int num_blocks, int device) {" = "int choose_split_v(int num_blocks, int device) {\n#if defined(__HGGCCC__)\n  return 1;\n#endif"
 
 # ---------------------------------------------------------------------------
 # Tier a -- core inference.
@@ -201,9 +206,9 @@ ops = ["fused_add_rms_norm", "rms_norm"]
 [[entry]]
 path = "csrc/gdn/fused_gdn_decode_kernel.cu"
 tier = "a"
-hazards = ["cp_async", "ptx"]
+hazards = ["cp_async", "ptx", "coop_groups"]
 ops = ["fused_gdn_decode_post_conv_mtp"]
-notes = "GDN MTP post-conv recurrence and gated RMSNorm, BF16/FP32 state. HGGC uses SAIL SDK pipeline primitives for 16-byte copies, commit and wait-all through the declared overlay; double buffering, warp shuffles and block barriers retain upstream semantics. Native compilation and PPU correctness validation pending."
+notes = "GDN MTP post-conv recurrence and gated RMSNorm, BF16/FP32 state. HGGC uses SAIL SDK pipeline primitives for 16-byte copies, commit and wait-all through the declared overlay; double buffering, warp shuffles and block barriers retain upstream semantics. v0.34 adds a cluster/DSMEM SplitV>1 path that traps below SM90: the overlay pins choose_split_v to 1 on HGGC regardless of the reported capability major. kMaxMtpTokens grew 8->9. Native compilation and PPU correctness validation pending."
 
 [[entry]]
 path = "csrc/layernorm_quant_kernels.cu"
@@ -337,11 +342,74 @@ ops = ["grouped_topk"]
 notes = "Heaviest tier-a file: cooperative groups plus PTX in moeTopKFuncs.cuh. Required because PPU MoE models route through grouped_topk."
 
 [[entry]]
-path = "csrc/moe/topk_softplus_sqrt_kernels.cu"
+path = "csrc/moe/topk_softplus_sqrt.cu"
 tier = "a"
 hazards = ["cub"]
 ops = ["topk_softplus_sqrt"]
-notes = "Promoted from tier b for DeepSeek V4 biased and hash routing, including the FP32 top-6 fast path."
+notes = "Promoted from tier b for DeepSeek V4 biased and hash routing, including the FP32 top-6 fast path. v0.34 split the monolithic topk_softplus_sqrt_kernels.cu into this dispatch TU plus topk_softplus_sqrt_kernels.cuh and nine explicit-instantiation TUs (entries below); the dispatch TU only externs the launchers, so every instantiation TU must compile or linking misses symbols."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (bf16 x int32) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (bf16 x int64) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_bf16_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (bf16 x uint32, incl. uint32 hash) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f16 x int32) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f16 x int64) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f16_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f16 x uint32, incl. uint32 hash) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f32 x int32) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_int64.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f32 x int64) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
+
+[[entry]]
+path = "csrc/moe/topk_softplus_sqrt_f32_uint32.cu"
+tier = "a"
+hazards = ["cub"]
+ops = []
+notes = "Explicit launcher instantiations (f32 x uint32, incl. uint32 hash) for the topk_softplus_sqrt dispatch TU; shares its .cuh closure."
 
 [[entry]]
 path = "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"

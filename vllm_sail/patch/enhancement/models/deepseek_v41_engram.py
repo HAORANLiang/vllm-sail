@@ -13,7 +13,7 @@ from vllm.triton_utils import tl, triton
 from vllm_sail.models.deepseek_v41.config import int8_w8a8_enabled
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _FACTORY = "vllm.models.deepseek_v41.common.engram"
 
 

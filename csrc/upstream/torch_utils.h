@@ -28,7 +28,7 @@ inline void do_init_device_vectors() {
   int device_count;
   hggcError_t err = hggcGetDeviceCount(&device_count);
   if (err != hggcSuccess) {
-    STD_TORCH_CHECK(false, "cudaGetDeviceCount failed: " +
+    STD_TORCH_CHECK(false, "hggcGetDeviceCount failed: " +
                                std::string(hggcGetErrorString(err)));
   }
   device_flags.resize(device_count);
@@ -43,7 +43,7 @@ inline void initDeviceProperty(int device_index) {
   hggcDeviceProp device_prop{};
   hggcError_t err = hggcGetDeviceProperties(&device_prop, device_index);
   if (err != hggcSuccess) {
-    STD_TORCH_CHECK(false, "cudaGetDeviceProperties failed: " +
+    STD_TORCH_CHECK(false, "hggcGetDeviceProperties failed: " +
                                std::string(hggcGetErrorString(err)));
   }
   device_properties[device_index] = device_prop;
@@ -58,7 +58,7 @@ inline hggcDeviceProp* get_device_prop() {
   hggcError_t err = hggcGetDevice(&device_index);
   if (err != hggcSuccess) {
     STD_TORCH_CHECK(
-        false, "cudaGetDevice failed: " + std::string(hggcGetErrorString(err)));
+        false, "hggcGetDevice failed: " + std::string(hggcGetErrorString(err)));
   }
   STD_TORCH_CHECK(device_index >= 0 && static_cast<size_t>(device_index) <
                                            device_properties.size(),

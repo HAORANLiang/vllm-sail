@@ -14,7 +14,7 @@ from vllm_sail.patch.utils import patch
 from vllm_sail.registry.moe_backends._extend import extend_enum
 
 _MODULE = "vllm.model_executor.layers.fused_moe.oracle.fp8"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _REMOVE_WHEN = (
     "upstream gains a register_moe_backend() extension point mirroring "
     "register_linear_kernel(), which would delete this patch."
@@ -105,7 +105,7 @@ def map_fp8_backend(runner_backend: MoEBackend) -> Fp8MoeBackend:
 def _select_ppu_backend(config, weight_key, activation_key, backend):
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
-        if config.moe_parallel_config.use_batched_activation_format
+        if config.use_batched_activation_format
         else mk.FusedMoEActivationFormat.Standard
     )
     if (

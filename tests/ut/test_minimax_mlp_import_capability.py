@@ -10,6 +10,7 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tests.support.modules import load_patch
+from tests.support.source import function
 
 
 def load_model(modules, monkeypatch, source, ppu):
@@ -116,10 +117,10 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
     provider.is_flashinfer_autotuning = lambda: autotune
     config = NS(
         hidden_size=8,
-        hidden_act="swigluoai",
         swiglu_limit=7,
         swiglu_alpha=1.702,
-        swiglu_beta=1,
+        # Upstream hardcodes beta=1.0; the checkpoint value must be ignored.
+        swiglu_beta=2,
     )
     name = "vllm.models.minimax_m3.nvidia.ops"
 
@@ -152,7 +153,9 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
         modules(name, dense_gemm1_mxfp8=dense)
     load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
     disable = threshold == 64
-    mlp = provider.MiniMaxM3MLP(config, 16, quant, not disable, disable, "layers.0.mlp")
+    mlp = provider.MiniMaxM3MLP(
+        config, 16, quant, not disable, disable, prefix="layers.0.mlp"
+    )
     assert mlp.initialized
     assert mlp.gate_up_proj.args == (8, [16, 16])
     assert mlp.gate_up_proj.kwargs == dict(
@@ -169,7 +172,7 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
         disable_tp=disable,
         prefix="layers.0.mlp.down_proj",
     )
-    assert mlp.act_fn.kwargs == dict(swiglu_limit=7, alpha=1.702, beta=1)
+    assert mlp.act_fn.kwargs == dict(swiglu_limit=7, alpha=1.702, beta=1.0)
     assert mlp.fused_gemm1_min_tokens == (
         None if ppu or not fuse else max(32, threshold)
     )
@@ -192,13 +195,85 @@ def test_registered_mlp_keeps_constructor_and_forward_contract(
 
 @pytest.mark.upstream_source
 @pytest.mark.parametrize("ppu", [False, True])
-def test_registered_mlp_retains_activation_validation(
+def test_registered_mlp_forwards_sequence_parallel_arguments(
     modules, monkeypatch, upstream_source_root, ppu
 ):
     provider = load_model(modules, monkeypatch, upstream_source_root, ppu)
-    provider.MergedColumnParallelLinear = provider.RowParallelLinear = lambda *a, **k: (
-        object()
+    bound = []
+    provider.MergedColumnParallelLinear = provider.RowParallelLinear = (
+        lambda *a, **k: NS(kwargs=k)
     )
+    provider.SiluAndMulWithClamp = lambda **k: NS()
+    provider._bind_gemm_rs = lambda linear: bound.append(linear) or "gemm-rs"
+    if not ppu:
+        name = "vllm.models.minimax_m3.nvidia.ops"
+        dense = modules(
+            name + ".dense_gemm1_mxfp8",
+            can_fuse_gemm1=lambda *a: False,
+            MIN_TOKENS=32,
+        )
+        modules(name, dense_gemm1_mxfp8=dense)
     load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
-    with pytest.raises(ValueError, match="Only swigluoai is supported"):
-        provider.MiniMaxM3MLP(NS(hidden_size=8, hidden_act="unsupported"), 16)
+    config = NS(hidden_size=8, swiglu_limit=7, swiglu_alpha=1.702)
+    mlp = provider.MiniMaxM3MLP(
+        config,
+        16,
+        use_sequence_parallel=True,
+        run_gemm_rs=True,
+        prefix="layers.0.mlp",
+    )
+    assert mlp.use_sequence_parallel is True
+    # Under SP the forward reduce-scatters the output itself.
+    assert mlp.down_proj.kwargs["reduce_results"] is False
+    assert mlp.gemm_rs == "gemm-rs"
+    assert bound == [mlp.down_proj]
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("sp,gemm_rs", [(False, False), (True, False), (True, True)])
+def test_copied_mlp_body_tracks_upstream_constructor_contract(modules, ppu, sp, gemm_rs):
+    acts, bound = [], []
+    linears = {}
+
+    def linear(name):
+        def factory(*args, **kwargs):
+            linears[name] = NS(args=args, kwargs=kwargs)
+            return linears[name]
+
+        return factory
+
+    cls = type("MiniMaxM3MLP", (), {})
+    namespace = {
+        "MiniMaxM3MLP": cls,
+        "MergedColumnParallelLinear": linear("gate_up"),
+        "RowParallelLinear": linear("down"),
+        "SiluAndMulWithClamp": lambda **kwargs: acts.append(kwargs) or NS(),
+        "_bind_gemm_rs": lambda linear: bound.append(linear) or "gemm-rs",
+        "current_platform": NS(is_ppu=lambda: ppu),
+        "envs": NS(VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=16),
+    }
+    if not ppu:
+        name = "vllm.models.minimax_m3.nvidia.ops"
+        dense = modules(
+            name + ".dense_gemm1_mxfp8",
+            can_fuse_gemm1=lambda *a: True,
+            MIN_TOKENS=32,
+        )
+        modules(name, dense_gemm1_mxfp8=dense)
+    # No hidden_act / swiglu_beta: the upstream constructor no longer reads them.
+    config = NS(hidden_size=8, swiglu_limit=7, swiglu_alpha=1.702)
+    obj = cls()
+    function("vllm_sail/models/minimax_m3_mlp.py", "init_mlp", namespace)(
+        obj,
+        config,
+        16,
+        use_sequence_parallel=sp,
+        run_gemm_rs=gemm_rs,
+        prefix="layers.0.mlp",
+    )
+    assert acts == [dict(swiglu_limit=7, alpha=1.702, beta=1.0)]
+    assert obj.use_sequence_parallel is sp
+    assert linears["down"].kwargs["reduce_results"] is (not sp)
+    assert obj.gemm_rs == ("gemm-rs" if sp and gemm_rs else None)
+    assert bound == ([linears["down"]] if sp and gemm_rs else [])
+    assert obj.fused_gemm1_min_tokens == (None if ppu else 32)

@@ -13,7 +13,7 @@ _original_supported = DSparkContextKVWriter.supported
     "vllm.models.minimax_m3.common.ops.dspark_context_kv",
     "DSparkContextKVWriter.supported",
     reason="PPU advertises CUDA identity and compute stubs, which do not implement the fused DSpark context writer.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="The context writer checks a real platform implementation or PPU implements and verifies this operator.",
 )
 def supported(attn_layers: list) -> bool:

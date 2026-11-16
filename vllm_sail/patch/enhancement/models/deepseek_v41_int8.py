@@ -17,7 +17,7 @@ from vllm_sail.patch.utils import patch
 
 _PREFIX = "vllm.models.deepseek_v41"
 REASON = "PPU V4.1 W8A8 uses INT8 DSA and software FP8 main-cache operators."
-AFFECTED_VERSIONS = ">=0.32.0,<0.33.0"
+AFFECTED_VERSIONS = ">=0.34.0,<0.35.0"
 REMOVE_WHEN = "V4.1 provides quantization-aware PPU operator registration for W8A8."
 _q = ops.fused_indexer_q_rope_quant
 _k = indexer_k_store.indexer_k_norm_rope_store

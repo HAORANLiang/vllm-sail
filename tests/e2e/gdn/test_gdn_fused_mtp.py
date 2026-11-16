@@ -73,8 +73,8 @@ def independent_triton_reference(runtime, monkeypatch):
         pytest.param(8, 4, (4, 4), torch.float32, torch.float32, id="tp4-fp32"),
         pytest.param(8, 16, (4, 2, 0), torch.bfloat16, torch.float32, id="tp16-ragged"),
         pytest.param(8, 4, (4, 2, 0), torch.float32, torch.bfloat16, id="tp4-ragged"),
-        pytest.param(8, 16, (8,), torch.float32, torch.bfloat16, id="tp16-max"),
-        pytest.param(8, 4, (8,), torch.bfloat16, torch.float32, id="tp4-max"),
+        pytest.param(8, 16, (9,), torch.float32, torch.bfloat16, id="tp16-max"),
+        pytest.param(8, 4, (9,), torch.bfloat16, torch.float32, id="tp4-max"),
         pytest.param(1, 1, (4, 4), torch.float32, torch.bfloat16, id="ratio1-tp1"),
         pytest.param(2, 1, (4, 2, 0), torch.bfloat16, torch.bfloat16, id="ratio2-tp1"),
         pytest.param(2, 4, (8,), torch.float32, torch.float32, id="ratio2-tp4"),
@@ -136,7 +136,7 @@ def test_all_head_and_dtype_combinations(
     check_case(inp, runtime, record_property)
 
 
-@pytest.mark.parametrize("length", range(1, 9))
+@pytest.mark.parametrize("length", range(1, 10))
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @torch.inference_mode()
@@ -337,7 +337,7 @@ def test_layer_post_conv_entrypoint_matches_both_references(
 
 @pytest.mark.parametrize(
     "lengths,width,message",
-    [((0,), 1, "at least one token"), ((8,), 9, "1 <= S <= 8")],
+    [((0,), 1, "at least one token"), ((8,), 10, "1 <= S <= 9")],
 )
 def test_empty_input_and_excess_mtp_width_are_rejected(
     runtime, lengths, width, message

@@ -143,6 +143,14 @@ def context(modules, resident, source_root=None, copied=True, functional=False):
         "vllm.model_executor.layers.fused_moe.config",
         _get_config_dtype_str=lambda **kw: None,
     )
+    # Upstream's TritonExperts.apply imports get_config from the fused_moe
+    # package to gate the sorted-A TMA down-config lookup. The fixture runs the
+    # unquantized path (use_fp8_w8a8=False), so the lookup short-circuits, but
+    # the import itself must resolve against the real package export.
+    modules(
+        "vllm.model_executor.layers.fused_moe",
+        get_config=lambda: None,
+    )
     return NS(
         namespace=namespace,
         hidden=hidden,
@@ -198,6 +206,11 @@ def check_apply(modules, resident, router, source_root=None, copied=True):
             use_fp8_w8a8=False,
             use_int8_w8a8=False,
             config_name=lambda dtype: None,
+            # Unquantized fixture: upstream's act_scale_is_tensor_wide is
+            # `scale is None and is_per_tensor and (use_fp8_w8a8 or
+            # use_int8_w8a8)`, which is False here, so the routed-row masked
+            # amax reduction never fires and a2_scale passes through unchanged.
+            act_scale_is_tensor_wide=lambda scale: False,
         ),
         expects_unquantized_inputs=False,
         quant_dtype=None,

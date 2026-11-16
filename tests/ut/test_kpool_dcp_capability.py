@@ -14,6 +14,7 @@ def kpool(modules):
         calls = []
         modules(
             "torch",
+            float32="fp32",
             ops=NS(
                 vllm=NS(
                     ppu_sparse_attn_indexer_kpool=lambda *args: calls.append(args)

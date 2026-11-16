@@ -49,6 +49,61 @@ BATCHED_SIBLING = {
 }
 
 
+def _install_oracle_class(upstream, namespace):
+    """Assemble ``Mxfp4MoEKernelOracle`` from the real upstream bodies.
+
+    Upstream moved the selection helpers (``_return_or_raise`` /
+    ``_make_log_*``) into the shared ``MoEKernelOracle`` base class; the
+    selector now probes through an oracle instance. Extract the actual base
+    methods plus the MXFP4 ``backend_to_kernel_cls`` override so the selector
+    body runs against genuine upstream logic, not a re-implementation.
+    """
+    base = upstream.with_name("base.py")
+    methods = []
+    for name in (
+        "__init__",
+        "make_log_backend",
+        "make_log_unsupported",
+        "try_backend",
+        "return_or_raise",
+    ):
+        node = definition(base, f"MoEKernelOracle.{name}")
+        node.decorator_list = []
+        methods.append(node)
+    node = definition(upstream, "Mxfp4MoEKernelOracle.backend_to_kernel_cls")
+    node.decorator_list = []
+    methods.append(node)
+    cls = ast.ClassDef(
+        name="Mxfp4MoEKernelOracle",
+        bases=[],
+        keywords=[],
+        body=[
+            ast.Assign(
+                targets=[ast.Name(id="name", ctx=ast.Store())],
+                value=ast.Constant(value="Mxfp4"),
+            ),
+            *methods,
+        ],
+        decorator_list=[],
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            cls,
+        ],
+        type_ignores=[],
+    )
+    # ``_UNSET`` is the per-call activation_key sentinel used as a default
+    # argument in try_backend/return_or_raise (evaluated at def time).
+    namespace.setdefault("_UNSET", object())
+    exec(
+        compile(ast.fix_missing_locations(module), str(upstream), "exec"),
+        namespace,
+    )
+
+
 def selection(
     candidates,
     *,
@@ -61,7 +116,10 @@ def selection(
 ):
     """Run upstream's selector body with the PPU helpers installed as globals."""
     calls, warnings = [], []
-    standard, batch = object(), object()
+    # Upstream now reads config.activation_format directly (and checks
+    # ``.is_batched``), then hands that same object to is_supported_config.
+    # Make the sentinels carry is_batched so identity and attribute checks agree.
+    standard, batch = NS(is_batched=False), NS(is_batched=True)
 
     def own_format(backend):
         return batch if backend.name.startswith("BATCHED_") else standard
@@ -106,8 +164,6 @@ def selection(
         # requested candidates keeps one candidate source for both paths.
         "_get_priority_backends_for_gpt_oss": lambda: map_backend(None),
         "_resolve_activation_key": lambda key: key,
-        "_make_log_backend": lambda backend: f"Using '{backend.value}' Mxfp4 MoE.",
-        "_make_log_unsupported": lambda backend, reason: reason or backend.value,
         "logger": NS(
             info_once=lambda *a, **kw: None,
             warning_once=lambda *a, **kw: warnings.append(Backend(a[-1])),
@@ -115,6 +171,7 @@ def selection(
         ),
         "current_platform": NS(is_xpu=lambda: False),
     }
+    _install_oracle_class(upstream, namespace)
     namespace["_upstream_backend_activation_key"] = function(
         upstream, "_backend_activation_key", namespace
     )
@@ -137,7 +194,6 @@ def selection(
         "_get_requested_backends",
         "_warn_on_bf16_fallback",
         "_requested_kernel_cls",
-        "_return_or_raise",
     ):
         if helper != "_requested_kernel_cls" or any(
             isinstance(node, ast.FunctionDef) and node.name == helper
@@ -146,7 +202,7 @@ def selection(
             function(upstream, helper, namespace)
     config = NS(
         moe_backend="explicit" if explicit else "auto",
-        moe_parallel_config=NS(use_batched_activation_format=batched),
+        activation_format=batch if batched else standard,
         is_lora_enabled=lora,
     )
     result = function(upstream, "select_mxfp4_moe_backend", namespace)(

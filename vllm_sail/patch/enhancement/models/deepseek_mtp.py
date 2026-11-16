@@ -21,9 +21,6 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.model_loader.mtp_validation import (
-    is_mtp_completeness_check_enabled,
-)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -38,7 +35,7 @@ from vllm.model_executor.models.utils import (
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 # Captured before patching so the delegating replacement can call upstream.
 _upstream_init = DeepSeekMTP.__init__
@@ -107,6 +104,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         ckpt_gate_proj_name="gate_proj",
         ckpt_down_proj_name="down_proj",
         ckpt_up_proj_name="up_proj",
+        # NOTE: global despite per-layer FSE; non-fused layers skip the extras.
         num_experts=self.config.n_routed_experts
         + (self.config.n_shared_experts if fused_shared_expert_layers else 0),
     )
@@ -114,7 +112,9 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     pp_missing_layer_names = get_pp_missing_layer_names(self)
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
-    # Weight and scale can arrive in separate load_weights calls.
+    # Reordering loaders (e.g. runai_streamer) can split an FP8 indexer wk
+    # weight/scale pair across load_weights() calls; keep the pending
+    # buffer on the model so pairs survive the call boundary.
     _pending_wk_fp8 = getattr(self, "_pending_indexer_wk_fp8", None)
     if _pending_wk_fp8 is None:
         self._pending_indexer_wk_fp8 = _pending_wk_fp8 = {}
@@ -133,6 +133,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
             continue
+        # Only parse the layer index when FSE is enabled.
         is_fusion_moe_shared_experts_layer = (
             "mlp.shared_experts" in name
             and bool(rocm_aiter_ops.is_fusion_moe_shared_experts_enabled())
@@ -300,24 +301,5 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
                     weight_loader(param, loaded_weight)
         if not is_fusion_moe_shared_experts_layer:
             loaded_params.add(name)
-
-    # Validate that weights were loaded for each expected MTP layer.
-    loaded_layers: set[int] = set()
-    for param_name in loaded_params:
-        spec_layer = get_spec_layer_idx_from_weight_name(self.config, param_name)
-        if spec_layer is not None:
-            loaded_layers.add(spec_layer)
-    for layer_idx in range(
-        self.model.mtp_start_layer_idx,
-        self.model.mtp_start_layer_idx + self.model.num_mtp_layers,
-    ):
-        if layer_idx not in loaded_layers and is_mtp_completeness_check_enabled():
-            raise ValueError(
-                f"MTP speculative decoding layer {layer_idx} weights "
-                f"missing from checkpoint. The checkpoint may have "
-                f"been quantized without including the MTP layers. "
-                f"Use a checkpoint that includes MTP layer weights, "
-                f"or disable speculative decoding."
-            )
 
     return loaded_params

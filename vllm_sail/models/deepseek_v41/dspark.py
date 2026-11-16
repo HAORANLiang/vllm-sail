@@ -89,7 +89,12 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
 
     params_dict = dict(self.named_parameters())
     loaded_params: set[str] = set()
+    # PPU MODIFICATION: begin
+    # Upstream removed the unshipped-confidence-head fallback in #49459; PPU
+    # keeps it (see deepseek_v4/dspark.py) because PPU checkpoints may lack
+    # the weights and the speculator gates on ``confidence_head is not None``.
     loaded_confidence_head = False
+    # PPU MODIFICATION: end
 
     weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
     for name, loaded_weight in weights:
@@ -97,8 +102,10 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         if mapped is None:
             continue
         name = mapped
+        # PPU MODIFICATION: begin
         if "confidence_head." in name:
             loaded_confidence_head = True
+        # PPU MODIFICATION: end
 
         # ``.scale`` -> per-method scale suffix.
         if name.endswith(".scale"):
@@ -184,8 +191,10 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+    # PPU MODIFICATION: begin
     if self.model.confidence_head is not None and not loaded_confidence_head:
         self.model.confidence_head = None
+    # PPU MODIFICATION: end
     logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
     return loaded_params
 

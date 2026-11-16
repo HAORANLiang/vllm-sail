@@ -30,7 +30,7 @@ from vllm.v1.attention.ops.triton_decode_attention import (
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.v1.attention.ops.triton_decode_attention"
 
 
@@ -65,6 +65,7 @@ def _decode_grouped_att_m_fwd(
     k_scale,
     v_scale,
     is_mla=False,
+    sliding_window=0,
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
@@ -172,5 +173,6 @@ def _decode_grouped_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         IS_MLA=is_mla,
+        SLIDING_WINDOW=sliding_window,
         **extra_kargs,
     )

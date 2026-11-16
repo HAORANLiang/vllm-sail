@@ -250,6 +250,16 @@ def test_upstream_dequantizes_at_load_or_per_forward(
             return getattr(self.data, name)
 
     modules("vllm.envs", VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD=dequant_at_load)
+    # replace_parameter imports direct_reload_enabled lazily on the dtype-change
+    # branch; bind the real body to the upstream default reload mode.
+    modules(
+        "vllm.model_executor.model_loader.reload.direct",
+        direct_reload_enabled=function(
+            upstream_source_root / "vllm/model_executor/model_loader/reload/direct.py",
+            "direct_reload_enabled",
+            {"envs": SimpleNamespace(VLLM_RELOAD_MODE="layerwise")},
+        ),
+    )
     namespace = {
         "torch": SimpleNamespace(
             nn=SimpleNamespace(

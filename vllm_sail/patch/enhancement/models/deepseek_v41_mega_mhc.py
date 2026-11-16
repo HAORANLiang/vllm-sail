@@ -35,7 +35,7 @@ logger = init_logger("vllm.vllm_sail.deepseek_v41_mega_mhc")
 
 _MODULE = "vllm.models.deepseek_v41.nvidia.ops.mega_mhc"
 _MHC_MODULE = "vllm.models.deepseek_v41.nvidia.ops.mhc"
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 # The PPU Mega mHC kernel is generated for exactly one shape.
 _PPU_HIDDEN_SIZE = 5120

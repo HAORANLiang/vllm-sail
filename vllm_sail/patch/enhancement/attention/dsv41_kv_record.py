@@ -37,7 +37,7 @@ from vllm.platforms import current_platform
 import vllm_sail.envs as ppu_envs
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 _MODULE = "vllm.models.deepseek_v41.attention"
 
 logger = init_logger(__name__)

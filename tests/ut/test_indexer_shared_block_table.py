@@ -280,11 +280,12 @@ def test_selected_upstream_producer_preserves_the_same_table(
         use_flattening=False,
         supports_varlen=False,
         use_pcp=False,
+        use_shardq=False,
+        fused_mqa_topk_eligible=False,
         max_prefill_buffer_size=128,
         indexer_uses_fp4=False,
         vllm_config=object(),
         dcp_world_size=1,
-        tp_size=1,
         _prefill_split_seq_lens=lambda values: values,
         _split_indexer_prefill_chunks=lambda *args, **kwargs: [],
     )
@@ -295,7 +296,6 @@ def test_selected_upstream_producer_preserves_the_same_table(
             float32="float32",
         ),
         "envs": NS(VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=1),
-        "tp_prefill_row_sharding_supported": lambda config, dcp, pcp, tp: False,
         "split_decodes_and_prefills": lambda *args, **kwargs: (0, 1, 0, 1),
         "DeepseekV32IndexerMetadata": lambda **kwargs: NS(**kwargs),
         "DeepseekV32IndexerPrefillMetadata": lambda chunks, **kwargs: NS(
@@ -305,3 +305,6 @@ def test_selected_upstream_producer_preserves_the_same_table(
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     result = namespace["build"](builder, 0, common)
     assert result.block_table is block_table
+    assert result.slot_mapping is common.slot_mapping
+    assert result.prefill.shardq_gather_indices is None
+    assert result.prefill.max_prefill_seq_len == 17

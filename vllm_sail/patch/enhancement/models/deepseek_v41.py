@@ -37,7 +37,7 @@ _TARGET = f"{_MODULE}._select_dsv4_attn_cls"
         "selects the fused norm-rope mega-attention subclass (528B KV record, "
         "padded 64/128 heads, QuantizedActivation output)."
     ),
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="vLLM exposes a V4.1 attention-class registry supporting PPU overrides.",
 )
 def _select_dsv4_attn_cls(vllm_config):
@@ -63,6 +63,11 @@ def _select_dsv4_attn_cls(vllm_config):
         DeepseekV41FlashMLAAttention,
     ):
         ok, gate_report = fused_gate(vllm_config)
+        if ok and getattr(vllm_config, "lora_config", None) is not None:
+            # Upstream guards mega attention against LoRA: the grouped wo_a
+            # direct read cannot apply the adapter delta, so LoRA must stay
+            # on the split-KV FlashMLA path.
+            ok, gate_report = False, "lora: mega attention needs the split-KV path"
         if ok:
             logger.info_once(
                 "[vllm_sail] DSV4.1 attention class: "
@@ -85,7 +90,7 @@ def _select_dsv4_attn_cls(vllm_config):
     _MODULE,
     "_linear_scale_param_name",
     reason="PPU channelwise FP8 dense layers register weight_scale for V4.1 target and draft loaders.",
-    affected_versions=">=0.32.0,<0.33.0",
+    affected_versions=">=0.34.0,<0.35.0",
     remove_when="The V4.1 scale-name helper queries the linear quantization method's parameter contract.",
 )
 def _linear_scale_param_name(vllm_config, expert_dtype):
@@ -117,7 +122,7 @@ def _rebind_scale_aliases():
                 name,
                 "_linear_scale_param_name",
                 reason="Preloaded V4.1 target and draft consumers must retain PPU channelwise scale names.",
-                affected_versions=">=0.32.0,<0.33.0",
+                affected_versions=">=0.34.0,<0.35.0",
                 remove_when="V4.1 loaders resolve the scale-name helper through its provider module.",
             )(_linear_scale_param_name)
 

@@ -56,7 +56,7 @@ from vllm.platforms import current_platform
 
 from vllm_sail.patch.utils import patch
 
-_AFFECTED = ">=0.32.0,<0.33.0"
+_AFFECTED = ">=0.34.0,<0.35.0"
 
 # Captured before patching so delegating replacements can call upstream.
 _upstream_indexer_init = Indexer.__init__
