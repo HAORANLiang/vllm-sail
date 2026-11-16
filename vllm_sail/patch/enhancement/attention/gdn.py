@@ -818,7 +818,9 @@ def forward_pla(
         output_final_state=output_final_state,
     )
     if final_state is not None:
-        final_state = final_state.transpose(-1, -2)
+        # vLLM 0.34 scatter_states asserts src[0].is_contiguous(); the layout
+        # transpose back to [N, H, DV, DK] must be materialized, not a view.
+        final_state = final_state.transpose(-1, -2).contiguous()
     if core_attn_out is not None:
         o_flat = o.reshape(-1)
         co_flat = core_attn_out.reshape(-1)
