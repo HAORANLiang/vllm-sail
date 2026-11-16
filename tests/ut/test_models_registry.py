@@ -63,6 +63,7 @@ EXPECTED_ARCHITECTURES = {
     "DeepSeekV4MTPModel",
     "DSparkDraftModel",
     "DSparkV41DraftModel",
+    "DeepseekV32ForCausalLM",
     "GlmMoeDsaForCausalLM",
     "DeepseekV32MTPModel",
     "MiniMaxM3SparseForCausalLM",
@@ -85,7 +86,11 @@ def test_registered_architecture_inventory() -> None:
 def test_registration_targets_are_lazy_strings() -> None:
     for arch, target in models_pkg._PPU_MODELS.items():
         module_path, _, class_name = target.partition(":")
-        if arch not in {"GlmMoeDsaForCausalLM", "DeepseekV32MTPModel"}:
+        if arch not in {
+            "DeepseekV32ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+            "DeepseekV32MTPModel",
+        }:
             assert module_path.startswith("vllm_sail."), (arch, target)
         assert class_name, (arch, target)
 
@@ -113,6 +118,27 @@ def test_glm_and_mtp_replace_fp8_fused_models(
     models_pkg.register_model()
 
     assert fake_vllm.models[arch] == ppu_target
+
+
+def test_deepseek_v32_replaces_fp8_fused_attention(
+    fresh_models_package, fake_vllm
+) -> None:
+    """V3.2 must use the model whose indexer producers SAIL adapts.
+
+    The new upstream V3.2 model invokes fused_q and sparse_attn_indexer
+    directly, bypassing the PPU Indexer.forward and CustomOp dispatch.
+    That compiles fp8e4nv on 810E and sends FP8 Q to an MXFP4-only API
+    on M890. The existing legacy model preserves the PPU producer and
+    scorer pair for both architectures.
+    """
+    architecture = "DeepseekV32ForCausalLM"
+    fake_vllm.models[architecture] = "vllm.models.deepseek_v32:DeepseekV32ForCausalLM"
+
+    models_pkg.register_model()
+
+    assert fake_vllm.models[architecture] == (
+        "vllm.model_executor.models.deepseek_v2:DeepseekV3ForCausalLM"
+    )
 
 
 def test_module_imports_without_vllm() -> None:
@@ -296,7 +322,12 @@ def test_one_broken_model_does_not_break_the_hook(
 
 @pytest.mark.parametrize(
     "failed_arch",
-    ["DeepSeekV4MTPModel", "GlmMoeDsaForCausalLM", "DeepseekV32MTPModel"],
+    [
+        "DeepSeekV4MTPModel",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "DeepseekV32MTPModel",
+    ],
 )
 def test_required_registration_failure_is_transactional(
     fresh_models_package, fake_vllm: _RecordingRegistry, failed_arch
