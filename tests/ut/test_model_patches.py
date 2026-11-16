@@ -31,6 +31,7 @@ from tests.support.source import assert_accepts_upstream_keywords
 MODELS_PATCH_DIR = (
     pathlib.Path(__file__).parents[2] / "vllm_sail" / "patch" / "enhancement" / "models"
 )
+REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 EXPECTED_MODULES = {
     "deepseek_mtp",
@@ -50,6 +51,7 @@ EXPECTED_MODULES = {
     "kimi_k3",
     "llama4",
     "minimax_m3",
+    "minimax_m3_msa",
     "moe_marlin_gate",
     "qwen3_fused_quant",
     "qwen3_moe",
@@ -133,6 +135,66 @@ def test_every_patch_has_well_formed_metadata() -> None:
             remove_when = _string_value(keywords["remove_when"], constants)
             assert remove_when.strip().lower() != "todo", (
                 f"{path.name}: remove_when must be a verifiable condition"
+            )
+
+
+def _plugin_source(dotted: str) -> pathlib.Path | None:
+    """The file that defines plugin module ``dotted``, if it exists in-tree."""
+    path = REPO_ROOT.joinpath(*dotted.split("."))
+    for candidate in (path.with_suffix(".py"), path / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _top_level_names(path: pathlib.Path) -> set[str]:
+    names: set[str] = set()
+    for node in ast.parse(path.read_text(), filename=str(path)).body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign | ast.AnnAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names.update(t.id for t in targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.Import | ast.ImportFrom):
+            names.update(
+                (alias.asname or alias.name).split(".")[0] for alias in node.names
+            )
+    return names
+
+
+def test_plugin_imports_and_targets_exist_in_tree() -> None:
+    """Every ``vllm_sail`` module a patch module imports or targets is in-tree.
+
+    The modules import their targets eagerly and ``install()`` has no fallback,
+    so a dangling plugin path breaks plugin load for every model on PPU. Only
+    a vLLM run would notice; this AST check catches it on a bare CPU.
+    """
+    for path in _patch_module_files():
+        tree = ast.parse(path.read_text(), filename=str(path))
+        constants = _module_constants(tree)
+        modules = {
+            _string_value(call.args[0], constants)
+            for call in _patch_calls(tree)
+            if call.args
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                modules.add(node.module)
+                source = _plugin_source(node.module)
+                if source is None or source.name == "__init__.py":
+                    continue
+                # A plain module has no submodules: every name must be defined.
+                missing = {alias.name for alias in node.names} - _top_level_names(
+                    source
+                )
+                assert not missing, (
+                    f"{path.name}: {node.module} defines no {sorted(missing)}"
+                )
+        for module in sorted(m for m in modules if m.startswith("vllm_sail.")):
+            assert _plugin_source(module) is not None, (
+                f"{path.name}: {module} does not exist in the source tree"
             )
 
 

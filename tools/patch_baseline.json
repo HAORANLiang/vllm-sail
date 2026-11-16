@@ -1,4 +1,5 @@
 {
+  "vllm.config.attention.AttentionConfig.resolve_indexer_kv_dtype": "a0f25a7cbb4048d64f3731e2a386940d2f1e793c7c4576782f7131843ae9b0f2",
   "vllm.config.compilation.CompilationConfig.set_splitting_ops_for_v1": "96e322f7af2c2e86381fc46042036484b3e229029b0722ba80bb87ef82a8fc7a",
   "vllm.config.kernel.MoEBackend": "additive",
   "vllm.config.model._get_and_verify_dtype": "77610d0d74705260d816441f3d414ab19fa84d1eb9e24cd9614c9af555097429",
@@ -247,10 +248,12 @@
   "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner._select_tail_tier": "a1e3f86b22ba9bb6b1cf34c95664590cff4b5cb3d5589a8e864128ba8cd20537",
   "vllm.models.kimi_k3.nvidia.model.DeepGemmMegaMoEExperts": "fa6f0121be875ced595c3ab7978c914f56a3f649b0d95afd0e48642bd6a81891",
   "vllm.models.kimi_k3.nvidia.model.KimiRoutedOutputTransform.forward": "c1d277f467086512ce836fc2f2b4a6cec9967c61921e2e5fb5b37c4e5099175c",
+  "vllm.models.minimax_m3.common.indexer.select_indexer_impl_cls": "8d0d636fc0a8e14433520f01ee5d0065652f2c668187a3e613f8d6550356fb5d",
   "vllm.models.minimax_m3.common.ops.dspark_context_kv.DSparkContextKVWriter.supported": "dc39b42749a12cfb5977833090b492c379d3cdb0b58ab3f80d44edf64f051524",
   "vllm.models.minimax_m3.nvidia.model.DeepGemmMegaMoEExperts": "fa6f0121be875ced595c3ab7978c914f56a3f649b0d95afd0e48642bd6a81891",
   "vllm.models.minimax_m3.nvidia.model.MiniMaxM3MLP.__init__": "6894b83c1fd264c5a2fa5058650616f9058dc6dbda1147423be3efd9fc4299a4",
   "vllm.models.minimax_m3.nvidia.model.MiniMaxM3Model._init_fused_moe_finalize": "59affa32f3018843f24119607d0b55df2676dca93ff8bbf00eeb4b9d93c1fff7",
+  "vllm.models.minimax_m3.nvidia.model.select_main_backend_and_impl_cls": "b4c60e7295f77999031f8d09e3c3c6108576beaed4de03f1c174e29d431afeef",
   "vllm.models.muse_spark.common.moe.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.muse_spark.common.ops.fused_routing.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.muse_spark.nvidia.model.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",

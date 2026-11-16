@@ -51,6 +51,9 @@ if TYPE_CHECKING:
     VLLM_SAIL_ENABLE_FP8_TO_INT8: bool = False
     VLLM_SAIL_KPOOL_DECODE_LOGITS: str = "non_paged"
     VLLM_SAIL_KPOOL_MAX_DENSE_POOLS: int = 1 << 21
+    VLLM_SAIL_MINIMAX_M3_MSA: bool = True
+    VLLM_SAIL_MINIMAX_M3_MSA_INDEXER_TRITON: bool = False
+    VLLM_SAIL_MINIMAX_M3_MSA_ATTEND_TRITON: bool = False
     VLLM_SAIL_NVTX_PROFILE: bool = False
     VLLM_SAIL_NVTX_DUMP_TOPK: bool = False
     VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN: bool = False
@@ -226,6 +229,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # matrix (the 1M-context warmup needs ~256 GiB), so fail loudly instead.
     "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS": _positive_int(
         "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS", 1 << 21
+    ),
+    # -- MiniMax M3 SAIL MSA sparse attention -------------------------------
+    # Enabled by default: the SAIL path is selected whenever the platform, the
+    # model shape and the installed `msa_for_sail` allow it; the dtypes follow
+    # the platform and the KV cache dtype (see models/minimax_m3_msa/gating.py).
+    # 0 keeps the PPU Triton implementation for both halves.
+    "VLLM_SAIL_MINIMAX_M3_MSA": _bool("VLLM_SAIL_MINIMAX_M3_MSA", True),
+    # Bisection switches: keep one half on the PPU Triton implementation while
+    # the other half runs the SAIL kernels.
+    "VLLM_SAIL_MINIMAX_M3_MSA_INDEXER_TRITON": _bool(
+        "VLLM_SAIL_MINIMAX_M3_MSA_INDEXER_TRITON", False
+    ),
+    "VLLM_SAIL_MINIMAX_M3_MSA_ATTEND_TRITON": _bool(
+        "VLLM_SAIL_MINIMAX_M3_MSA_ATTEND_TRITON", False
     ),
     # -- Attention / linear attention --------------------------------------
     # Legacy getter only. Current PLA/Triton dispatch uses VLLM_SAIL_USE_PLA.
