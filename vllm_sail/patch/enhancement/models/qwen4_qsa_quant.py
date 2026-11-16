@@ -23,7 +23,10 @@ def _qsa_body(fn):
 @patch(
     "vllm.models.qwen4_exp.nvidia.qsa",
     "Qwen4ExpQSAAttention.__init__",
-    reason="PPU channelwise FP8 QKV cannot share a projection with a BF16 QSA indexer.",
+    reason=(
+        "Quantized QKV (PPU channelwise FP8 or compressed-tensors) cannot share "
+        "a projection with a BF16 QSA indexer listed in the checkpoint ignore."
+    ),
     affected_versions=">=0.33.0,<0.34.0",
     remove_when="QSA fusion accounts for distinct QKV and indexer quantization schemes.",
 )
@@ -39,11 +42,35 @@ def qsa_init(
     prefix: str = "",
 ) -> None:
     nn.Module.__init__(self)
-    # PPU MODIFICATION: begin -- checkpoint QKV is channelwise FP8 while
-    # index_qk_proj remains BF16. Keep their schemes and parameters separate.
+    # PPU MODIFICATION: begin -- checkpoint QKV is channelwise FP8 (or
+    # compressed-tensors quantized) while index_qk_proj remains BF16. Keep
+    # their schemes and parameters separate.
     separate_indexer = current_platform.is_ppu() and bool(
         getattr(quant_config, "fp8_channelwise_layers", None)
     )
+    ignore = getattr(quant_config, "ignore", None)
+    if current_platform.is_ppu() and not separate_indexer and ignore:
+        from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+            should_ignore_layer,
+        )
+
+        # The fused qkv_proj packs q/k/v plus the QSA indexer shard; the
+        # checkpoint ignore must cover all four or none of them, otherwise
+        # get_scheme_dict rejects the mixed shards. Compare per-shard ignore
+        # status (no fused_mapping: these are already shard names).
+        qkv_ignored = [
+            should_ignore_layer(f"{prefix}.{name}", ignore=ignore)
+            for name in ("q_proj", "k_proj", "v_proj")
+        ]
+        if any(qkv_ignored) != all(qkv_ignored):
+            raise ValueError(
+                f"QSA checkpoint at {prefix} ignores only some of q/k/v; "
+                "mixed-precision QKV shards cannot share a fused projection."
+            )
+        indexer_ignored = should_ignore_layer(
+            f"{prefix}.indexer.index_qk_proj", ignore=ignore
+        )
+        separate_indexer = indexer_ignored != all(qkv_ignored)
     if separate_indexer:
         import copy
 

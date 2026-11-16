@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise QSA construction with differently quantized QKV/indexer shards."""
 
+import re
 from types import SimpleNamespace as NS
 
 import pytest
@@ -20,14 +21,36 @@ def construct_qsa(modules, patch_utils_module):
         def __init__(self, **kwargs):
             raise AssertionError("the installed constructor must run")
 
+    def ignored(name, ignore):
+        return any(
+            re.match(entry[3:], name) if entry.startswith("re:") else entry == name
+            for entry in ignore
+        )
+
+    def should_ignore_layer(layer_name, ignore=(), fused_mapping=None):
+        return ignored(layer_name, ignore)
+
     def linear(*args, quant_config=None, prefix="", **kwargs):
         if prefix.endswith("qkv_proj") and quant_config is not None:
             shards = quant_config.packed_modules_mapping["qkv_proj"]
-            selected = [name in quant_config.fp8_channelwise_layers for name in shards]
+            if getattr(quant_config, "fp8_channelwise_layers", None):
+                selected = [
+                    name in quant_config.fp8_channelwise_layers for name in shards
+                ]
+            else:
+                base = prefix[: -len("qkv_proj")]
+                selected = [
+                    ignored(base + name, quant_config.ignore) for name in shards
+                ]
             if any(selected) and not all(selected):
                 raise ValueError("some but not all shards are quantized")
         state.projections.append((prefix, quant_config))
         return NS(output_size=16)
+
+    modules(
+        "vllm.model_executor.layers.quantization.compressed_tensors.utils",
+        should_ignore_layer=should_ignore_layer,
+    )
 
     def fused(qkv, size, quant):
         state.fused = True
@@ -137,6 +160,89 @@ def test_unquantized_projection_keeps_upstream_fusion(construct_qsa):
 def test_non_ppu_preserves_mixed_precision_rejection(construct_qsa):
     with pytest.raises(ValueError, match="some but not all shards"):
         construct_qsa(mixed_quant(), ppu=False)
+
+
+def int8_quant(ignore):
+    return NS(
+        ignore=ignore,
+        packed_modules_mapping={
+            "qkv_proj": ["q_proj", "k_proj", "v_proj", "indexer.index_qk_proj"]
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "ignore",
+    [
+        ["self_attn.indexer.index_qk_proj"],
+        ["re:.*indexer\\.index_qk_proj$"],
+    ],
+)
+def test_int8_qkv_keeps_ignored_indexer_separate(construct_qsa, ignore):
+    quant = int8_quant(ignore)
+    attn, state = construct_qsa(quant)
+    assert not attn.fuse_indexer_projection and not state.fused
+    assert hasattr(attn.indexer, "index_qk_proj")
+    qkv_quant = state.projections[0][1]
+    assert qkv_quant is not quant
+    assert qkv_quant.packed_modules_mapping["qkv_proj"] == [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+    ]
+    assert quant.packed_modules_mapping["qkv_proj"][-1] == "indexer.index_qk_proj"
+
+
+@pytest.mark.parametrize(
+    "ignore",
+    [
+        ["lm_head"],
+        [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.indexer.index_qk_proj",
+        ],
+    ],
+)
+def test_homogeneous_ignore_keeps_upstream_fusion(construct_qsa, ignore):
+    attn, state = construct_qsa(int8_quant(ignore))
+    assert attn.fuse_indexer_projection and state.fused
+    assert not hasattr(attn.indexer, "index_qk_proj")
+
+
+def test_non_ppu_preserves_int8_mixed_rejection(construct_qsa):
+    with pytest.raises(ValueError, match="some but not all shards"):
+        construct_qsa(int8_quant(["self_attn.indexer.index_qk_proj"]), ppu=False)
+
+
+def test_int8_ignored_qkv_keeps_quantized_indexer_separate(construct_qsa):
+    quant = int8_quant(
+        ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    )
+    attn, state = construct_qsa(quant)
+    assert not attn.fuse_indexer_projection and not state.fused
+    assert hasattr(attn.indexer, "index_qk_proj")
+    qkv_quant = state.projections[0][1]
+    assert qkv_quant is not quant
+    assert qkv_quant.packed_modules_mapping["qkv_proj"] == [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+    ]
+
+
+@pytest.mark.parametrize(
+    "ignore",
+    [
+        ["self_attn.q_proj"],
+        ["self_attn.k_proj", "self_attn.indexer.index_qk_proj"],
+        ["re:.*self_attn\\.v_proj$"],
+    ],
+)
+def test_mixed_qkv_shards_raise_clear_error(construct_qsa, ignore):
+    with pytest.raises(ValueError, match="ignores only some of q/k/v"):
+        construct_qsa(int8_quant(ignore))
 
 
 def test_lora_keeps_unfused_projection(construct_qsa):
