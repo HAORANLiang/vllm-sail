@@ -260,6 +260,8 @@
   "vllm.models.muse_spark.common.ops.fused_routing.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.muse_spark.nvidia.model.fused_musespark1x_routing": "a20f18d30ee2dc67b0cbd0943c83396ad0b64643f49e56a28f0933679e872185",
   "vllm.models.qwen4_exp.nvidia.ops.qsa._select_config": "ce493f6cc9044f703b5c292862fe6e4ff45a328b01448f4847b4987cbe6c3661",
+  "vllm.models.qwen4_exp.nvidia.qsa.Qwen4ExpQSAImpl.__init__": "217c5d9dc612b980556722b892b02894d0844ea8eb36e6ab7d504fe992e08e02",
+  "vllm.models.qwen4_exp.nvidia.qsa.Qwen4ExpQSAImpl.forward": "5d4d58731e96a06211b7bb228106e480a76c4552186e0b4b05638f6d55508557",
   "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.__init__": "22fd2b6ea4c4698a31aef313cfdd5cda885a06ee788650eb2e34991253604e7d",
   "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.decode_logits": "ca9eb407326af0d73a97298a7ff28022f2b53c262f98e093109c057953816043",
   "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.logits": "9892cec571eefca76aac8b4a609cdeb1e61c142f38c2407d2f09ee4666e25788",
