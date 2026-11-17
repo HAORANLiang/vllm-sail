@@ -102,6 +102,11 @@ def register_out_of_tree() -> None:
         # still running, so the package may already be cached at this point.
         vllm_sail.registry.register()
 
+        # Layer NVTX follows its config flag, independent of the outer profiling env.
+        from vllm_sail.profiling.layerwise import install as _install_layerwise
+
+        _install_layerwise()
+
         # NVTX instrumentation is opt-in: this installs nothing unless
         # VLLM_SAIL_NVTX_PROFILE is set and the optional deps import.
         from vllm_sail.profiling import install as _install_profiling

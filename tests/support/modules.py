@@ -4,11 +4,12 @@
 import importlib.util
 import sys
 
-from tests.support.source import ROOT
+from tests.support.source import PACKAGE_ROOT, ROOT
 
 
 def load_patch(relative):
-    spec = importlib.util.spec_from_file_location("_capability_patch", ROOT / relative)
+    root = PACKAGE_ROOT if str(relative).startswith("vllm_sail/") else ROOT
+    spec = importlib.util.spec_from_file_location("_capability_patch", root / relative)
     mod = importlib.util.module_from_spec(spec)
     previous = sys.modules.get(spec.name)
     sys.modules[spec.name] = mod

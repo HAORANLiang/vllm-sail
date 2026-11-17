@@ -11,7 +11,9 @@ behaviour tests against stub upstreams.
 from __future__ import annotations
 
 import ast
+import contextlib
 import importlib.util
+import os
 import sys
 import types
 from collections.abc import Iterator
@@ -254,10 +256,30 @@ def _build_fused_moe_stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         downcast,
     )
 
+    naive_dp_ep = types.ModuleType(
+        "vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep"
+    )
+
+    def setup_dispatch(a1, quant_config, defer_input_quant=False):
+        scale = None if defer_input_quant else state.get("setup_scale")
+        scales = None if scale is None or scale.ndim == 0 else [scale]
+        return a1, scales, scale
+
+    def unwrap_scale(scales, quant_config):
+        assert scales is not None and len(scales) == 1
+        state.setdefault("unwrap_calls", []).append((scales, quant_config))
+        return scales[0]
+
+    naive_dp_ep._quantize_and_setup_dispatch = setup_dispatch
+    naive_dp_ep._unwrap_scale_and_prepare_for_moe = unwrap_scale
+    _register_chain(monkeypatch, naive_dp_ep.__name__, naive_dp_ep)
+
     state["config"] = config
     state["int8_oracle"] = int8_oracle
     state["utils"] = utils
     state["triton_moe"] = triton_moe
+    state["naive_dp_ep"] = naive_dp_ep
+    state["downcast"] = downcast
     return state
 
 
@@ -349,11 +371,12 @@ def test_mxfp4_quantize_consumer_import_order(
     monkeypatch.setattr(_Platform, "ppu", True)
     name = "vllm.model_executor.layers.fused_moe." + consumer_suffix
     # Use only our stubs: other consumers may be real modules in PPU-host UTs.
-    consumer = (
-        state["triton_moe"]
-        if consumer_suffix == "experts.triton_moe"
-        else types.ModuleType(name)
-    )
+    if consumer_suffix == "experts.triton_moe":
+        consumer = state["triton_moe"]
+    elif consumer_suffix == "prepare_finalize.naive_dp_ep":
+        consumer = state["naive_dp_ep"]
+    else:
+        consumer = types.ModuleType(name)
     _register_chain(monkeypatch, name, consumer)
 
     def import_consumer():
@@ -422,6 +445,239 @@ def test_mxfp4_quantize_alias_inventory_matches_vllm_source(
                         )
                     )
     assert discovered == set(module._QUANTIZE_INPUT_CONSUMERS)
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("tokens,pairs", [(0, 4), (1, 1), (1, 4), (3, 4), (256, 256)])
+def test_mxfp4_dispatch_packed_scale_roundtrip(monkeypatch, tokens, pairs):
+    torch = pytest.importorskip("torch")
+    module = _leaf("fused_moe_ppu")
+    state = _build_fused_moe_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", True)
+    # The last case covers every uint16 bit pattern, including byte boundaries.
+    scale = torch.arange(tokens * pairs).reshape(pairs, tokens).to(torch.uint16).t()
+    state["setup_scale"] = scale
+    module.install()
+    naive = state["naive_dp_ep"]
+    config = types.SimpleNamespace(quant_dtype="mxfp4")
+    activation = torch.empty((tokens, 64), dtype=torch.uint8)
+    a1q, scales, original = naive._quantize_and_setup_dispatch(activation, config)
+    assert a1q is activation and original is scale
+    wire = scales[0]
+    assert wire.dtype == torch.uint8
+    assert wire.shape == (tokens, pairs, 2)
+    assert wire.is_contiguous()
+    assert wire.numel() == scale.numel() * scale.element_size()
+    expected_bytes = scale.contiguous().reshape(-1).view(torch.uint8)
+    assert torch.equal(wire.reshape(-1), expected_bytes)
+    # The gather allocates fresh receive tensors, so no Python attribute or
+    # list-subclass marker may carry the format across.
+    restored = naive._unwrap_scale_and_prepare_for_moe([wire.clone()], config)
+    assert restored.dtype == torch.uint16
+    assert restored.shape == scale.shape
+    assert restored.t().is_contiguous()
+    assert torch.equal(restored, scale)
+    assert "unwrap_calls" not in state
+
+
+@pytest.mark.requires_runtime
+def test_mxfp4_dispatch_uneven_ranks_and_token_slices(monkeypatch):
+    torch = pytest.importorskip("torch")
+    module = _leaf("fused_moe_ppu")
+    state = _build_fused_moe_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", True)
+    module.install()
+    naive = state["naive_dp_ep"]
+    config = types.SimpleNamespace(quant_dtype="mxfp4")
+    wires, expected = [], []
+    for rank, tokens in enumerate((3, 0, 1, 5)):
+        # Slices with a non-zero offset and odd strides: check token order,
+        # not storage order.
+        base = torch.arange(4 * (tokens + 2)).reshape(4, tokens + 2) + rank * 257
+        scale = base.to(torch.uint16).t()[1 : tokens + 1]
+        state["setup_scale"] = scale
+        _, scales, _ = naive._quantize_and_setup_dispatch(None, config)
+        wires.append(scales[0])
+        expected.append(scale.to(torch.int32))
+    gathered = torch.cat(wires, dim=0)
+    restored = naive._unwrap_scale_and_prepare_for_moe([gathered], config)
+    assert restored.stride() == (1, sum((3, 0, 1, 5)))
+    assert torch.equal(restored.to(torch.int32), torch.cat(expected, dim=0))
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize(
+    "ppu,quant_dtype,scale_kind,defer",
+    [
+        (False, "mxfp4", "uint16", False),
+        (True, "fp8", "float32", False),
+        (True, "nvfp4", "uint8", False),
+        (True, "mxfp4", "uint8", False),
+        (True, "mxfp4", "scalar", False),
+        (True, "mxfp4", "none", False),
+        (True, "mxfp4", "uint16", True),
+    ],
+)
+def test_mxfp4_dispatch_preserves_other_paths(
+    monkeypatch, ppu, quant_dtype, scale_kind, defer
+):
+    torch = pytest.importorskip("torch")
+    module = _leaf("fused_moe_ppu")
+    state = _build_fused_moe_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", ppu)
+    scale = {
+        "uint16": torch.empty((3, 4), dtype=torch.uint16),
+        "uint8": torch.empty((3, 8), dtype=torch.uint8),
+        "float32": torch.ones((3, 4)),
+        "scalar": torch.tensor(1.0),
+        "none": None,
+    }[scale_kind]
+    state["setup_scale"] = scale
+    module.install()
+    naive = state["naive_dp_ep"]
+    config = types.SimpleNamespace(quant_dtype=quant_dtype)
+    activation = object()
+    a1q, scales, original = naive._quantize_and_setup_dispatch(
+        activation, config, defer
+    )
+    assert a1q is activation
+    assert original is (None if defer else scale)
+    if defer or scale is None or scale.ndim == 0:
+        assert scales is None
+    else:
+        assert scales[0] is scale
+        assert naive._unwrap_scale_and_prepare_for_moe(scales, config) is scale
+        assert len(state["unwrap_calls"]) == 1
+
+
+def _load_naive_dp_ep_source(state):
+    """Exec only upstream's functions and classes; no vLLM import, no GPU init."""
+    torch = pytest.importorskip("torch")
+    source = os.environ.get("VLLM_SOURCE_ROOT")
+    if not source:
+        pytest.skip("the prepare integration test needs VLLM_SOURCE_ROOT")
+    path = (
+        Path(source)
+        / "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree.body = [
+        ast.ImportFrom(
+            module="__future__", names=[ast.alias(name="annotations")], level=0
+        )
+    ] + [node for node in tree.body if isinstance(node, ast.FunctionDef | ast.ClassDef)]
+    naive = state["naive_dp_ep"]
+    naive.__dict__.update(
+        torch=torch,
+        contextmanager=contextlib.contextmanager,
+        current_platform=_Platform,
+        # DBO is off in these tests, so _comm_region yields on the caller.
+        dbo_enabled=lambda: False,
+        dbo_switch_to_compute_sync=lambda: None,
+        dbo_yield_and_switch_from_compute_to_comm=lambda: None,
+        mk=types.SimpleNamespace(
+            FusedMoEPrepareAndFinalizeModular=object,
+            FusedMoEPrepareAndFinalizeMonolithic=object,
+        ),
+        moe_kernel_quantize_input=state["utils"].moe_kernel_quantize_input,
+        nvfp4_block_scale_interleave=lambda scale: scale + 1,
+    )
+    exec(compile(ast.fix_missing_locations(tree), str(path), "exec"), naive.__dict__)
+    return naive
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize(
+    "kind,lora", [("modular", False), ("modular", True), ("monolithic", False)]
+)
+@pytest.mark.parametrize("defer", [False, True])
+def test_mxfp4_upstream_prepare_and_lora(monkeypatch, kind, lora, defer):
+    torch = pytest.importorskip("torch")
+    module = _leaf("fused_moe_ppu")
+    state = _build_fused_moe_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", True)
+    naive = _load_naive_dp_ep_source(state)
+    scale = (torch.arange(12).reshape(4, 3) * 257).to(torch.uint16).t()
+    quantized = torch.zeros((3, 64), dtype=torch.uint8)
+    state["downcast"].downcast_to_mxfp4 = lambda A, axis: (quantized, scale)
+    module.install()
+    seen = []
+
+    def dispatch(*args, is_sequence_parallel, extra_tensors):
+        assert is_sequence_parallel
+        seen.append(extra_tensors)
+        gathered = tuple(torch.cat([tensor, tensor], dim=0) for tensor in args)
+        if extra_tensors is None:
+            return gathered
+        for tensor in extra_tensors:
+            assert tensor.dtype in (torch.uint8, torch.int32)
+            assert tensor.is_contiguous()
+        return (*gathered, [torch.cat([t, t], dim=0) for t in extra_tensors])
+
+    naive.get_ep_group = lambda: types.SimpleNamespace(
+        dispatch=dispatch, dispatch_router_logits=dispatch
+    )
+    config = types.SimpleNamespace(
+        quant_dtype="mxfp4",
+        use_nvfp4_w4a4=False,
+        a1_scale=None,
+        per_act_token_quant=False,
+        block_shape=None,
+        mx_alignment=64,
+    )
+    activation = torch.ones((3, 128))
+    if kind == "modular":
+        prepare = naive.MoEPrepareAndFinalizeNaiveDPEPModular(True)
+        if lora:
+            mapping = torch.tensor([2, 0, 1], dtype=torch.int32)
+            ctx = types.SimpleNamespace(
+                punica_wrapper=types.SimpleNamespace(
+                    token_mapping_meta=types.SimpleNamespace(token_lora_mapping=mapping)
+                )
+            )
+            prepare.set_lora_context(ctx)
+        result = prepare.prepare(
+            activation,
+            torch.ones((3, 1)),
+            torch.zeros((3, 1), dtype=torch.int64),
+            4,
+            None,
+            False,
+            config,
+            defer,
+        )
+        if lora:
+            assert torch.equal(ctx.local_token_lora_mapping, mapping.repeat(2))
+    else:
+        prepare = naive.MoEPrepareAndFinalizeNaiveDPEPMonolithic(True)
+        result = prepare.prepare(activation, torch.ones((3, 4)), config, defer)
+    assert result[0].shape[0] == 6
+    if defer:
+        assert result[1] is None
+        if lora:
+            assert len(seen[0]) == 1
+        else:
+            assert seen[0] is None
+    else:
+        assert seen[0][0].shape == (3, 4, 2)
+        assert result[1].stride() == (1, 6)
+        assert torch.equal(
+            result[1].to(torch.int32), scale.to(torch.int32).repeat(2, 1)
+        )
+
+
+@pytest.mark.requires_runtime
+def test_nvfp4_unwrap_still_swizzles_upstream(monkeypatch):
+    torch = pytest.importorskip("torch")
+    module = _leaf("fused_moe_ppu")
+    state = _build_fused_moe_stubs(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", True)
+    naive = _load_naive_dp_ep_source(state)
+    module.install()
+    scale = torch.zeros((3, 8), dtype=torch.uint8)
+    config = types.SimpleNamespace(quant_dtype="nvfp4", is_scale_swizzled=True)
+    result = naive._unwrap_scale_and_prepare_for_moe([scale], config)
+    assert torch.equal(result, torch.ones_like(scale))
 
 
 def test_triton_moe_sum_prefers_triton_reduce_on_ppu(

@@ -27,7 +27,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.support.source import source_root
+from tests.support.source import PACKAGE_ROOT, source_root
 
 
 class DeviceCapability(NamedTuple):
@@ -520,7 +520,9 @@ def ppu_sdk_stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, StrictStubModule
 def patch_utils_module() -> Iterator[types.ModuleType]:
     """Load patch/utils.py without executing the runtime patch package init."""
     name = f"_vllm_sail_patch_utils_test_{uuid4().hex}"
-    path = Path(__file__).parents[1] / "vllm_sail" / "patch" / "utils.py"
+    from vllm_sail import envs
+
+    path = Path(envs.__file__).resolve().parent / "patch" / "utils.py"
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -540,7 +542,7 @@ def modules(monkeypatch, patch_utils_module):
         if name not in loaded:
             mod = types.ModuleType(name)
             mod.__path__ = (
-                [str(Path(__file__).parents[1].joinpath(*name.split(".")))]
+                [str(PACKAGE_ROOT.joinpath(*name.split(".")))]
                 if name.startswith("vllm_sail")
                 else []
             )
@@ -562,7 +564,7 @@ def modules(monkeypatch, patch_utils_module):
     )
     spec = importlib.util.spec_from_file_location(
         "vllm_sail.patch.bodies",
-        Path(__file__).parents[1] / "vllm_sail/patch/bodies.py",
+        PACKAGE_ROOT / "vllm_sail/patch/bodies.py",
     )
     helpers = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helpers)

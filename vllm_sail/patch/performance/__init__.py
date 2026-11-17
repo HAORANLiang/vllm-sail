@@ -6,13 +6,18 @@ Optimisations that PPU needs on top of upstream's code paths. Unlike the
 performance.
 
 Contains `fla` (flash-linear-attention): the fork's cache_results autotune
-additions and the Qwen3-Next fused GDN decode path; and `qsa_select_config`: a
+additions and the Qwen3-Next fused GDN decode path; `qsa_select_config`: a
 PPU-measured launch-config table for the Qwen4Exp/Qwen3.8-Flash-Next QSA
-sparse-attention split-K kernel.
+sparse-attention split-K kernel; and `step5_dsa`: the opt-in resident-block
+Step5 DSA indexer scoring kernel.
 """
 
 from vllm_sail.patch.performance import fla  # noqa: F401
 from vllm_sail.patch.performance import qsa_select_config
+from vllm_sail.patch.performance import step5_dsa  # noqa: F401
+from vllm_sail.patch.performance import step5_dsa_selector  # noqa: F401
+from vllm_sail.patch.performance import step5_dsa_prefill  # noqa: F401
+from vllm_sail.patch.performance import step5_norm  # noqa: F401
 
 # Leaf-style module (like enhancement/mxfp4): defines its replacement without
 # vLLM imports at module scope, so installation is explicit.

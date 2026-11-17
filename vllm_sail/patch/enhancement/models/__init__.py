@@ -38,6 +38,17 @@ Modules, and why each is import-on-install like the rest of the framework:
 * ``qwen3_moe`` — per-layer mix_layer quant overrides (+36).
 * ``qwen3_next`` — NVTX profiling scaffold (+19).
 * ``step3p5_mtp`` — zero-point buffers as optional checkpoint params (+12).
+* ``step5_dsa_backend`` — admits SM 8.x PPU to Step5 DSA and runs upstream's
+  Triton indexer scorer there, since PPU FlashInfer has no ``attn_scores``;
+  resolves the region top-k to PPU DeepSelect or ``per_row``.
+* ``step5_soft_fp8`` — byte-based Step5 indexer kernels with software E4M3
+  for PPU 1.0, whose Triton has no ``fp8e4nv``.
+* ``step5_indexer_fp16`` — ``VLLM_STEP5_INDEXER_FP8_AS_FP16``: stores the
+  Step5 indexer summaries and query as exact FP16 values of their E4M3 codes.
+* ``step5_mtp`` — maps the checkpoint ignore names of BF16 Step5 MTP layers
+  to the draft model's ``mtp_block`` / ``shared_head.head`` module paths.
+* ``step5_norm`` — keeps Step5 RMSNorm on upstream's PyTorch fallback on PPU
+  instead of its ``is_cuda``-selected CuTeDSL kernel.
 * ``moe_marlin_gate`` — VLLM_PPU_ENABLE_MOE_MARLIN default-off gate.
 """
 
@@ -65,4 +76,9 @@ from vllm_sail.patch.enhancement.models import (
     qwen3_moe,  # noqa: F401
     qwen3_next,  # noqa: F401
     step3p5_mtp,  # noqa: F401
+    step5_dsa_backend,  # noqa: F401
+    step5_indexer_fp16,  # noqa: F401
+    step5_mtp,  # noqa: F401
+    step5_norm,  # noqa: F401
+    step5_soft_fp8,  # noqa: F401
 )

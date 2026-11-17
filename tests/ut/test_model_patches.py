@@ -57,6 +57,11 @@ EXPECTED_MODULES = {
     "qwen3_moe",
     "qwen3_next",
     "step3p5_mtp",
+    "step5_dsa_backend",
+    "step5_indexer_fp16",
+    "step5_mtp",
+    "step5_norm",
+    "step5_soft_fp8",
 }
 
 REQUIRED_METADATA = ("reason", "affected_versions", "remove_when")
@@ -311,6 +316,40 @@ _EXPECTED_TARGETS = {
     "vllm.model_executor.models.qwen3_next.th_nvtx_range_pop",
     "vllm.model_executor.models.step3p5_mtp.Step3p5MTP.load_weights",
     (
+        "vllm.models.step5.nvidia.sparse_attention.Step5DSAAttentionBackend."
+        "supports_compute_capability"
+    ),
+    "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.__init__",
+    (
+        "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse."
+        "warmup_prefill_scoring"
+    ),
+    (
+        "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse."
+        "prefill_pair_inputs"
+    ),
+    ("vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.select_regions"),
+    "vllm.models.step5.nvidia.layernorm.apply_step5_rms_norm",
+    "vllm.models.step5.nvidia.layernorm.apply_step5_add_rms_norm",
+    "vllm.models.step5.nvidia.ops.summary_update._store_summary",
+    "vllm.models.step5.nvidia.ops.qkv_indexer_norm_rope._indexer_norm_rope",
+    "vllm.models.step5.nvidia.ops.qkv_indexer_norm_rope._joint_prepare",
+    "vllm.models.step5.nvidia.ops.indexer_norm_rope._indexer_norm_rope",
+    "vllm.models.step5.nvidia.ops.sparse_indexer_scores._direct_scores",
+    "vllm.models.step5.nvidia.ops.sparse_indexer_scores._paged_scores_sm90",
+    "vllm.models.step5.nvidia.ops.sparse_indexer._copy_summary_page",
+    "vllm.models.step5.nvidia.ops.sparse_indexer._copy_summary_tile",
+    "vllm.models.step5.nvidia.ops.sparse_indexer._pack_summaries",
+    "vllm.models.step5.nvidia.ops.indexer_norm_rope.indexer_norm_rope",
+    "vllm.models.step5.nvidia.ops.qkv_indexer_norm_rope.qkv_indexer_norm_rope",
+    (
+        "vllm.models.step5.nvidia.sparse_summary_cache."
+        "Step5SparseSummaryCacheLayer.get_kv_cache_spec"
+    ),
+    "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.decode_logits",
+    "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.logits",
+    "vllm.models.step5.nvidia.mtp.Step5MTP.__init__",
+    (
         "vllm.model_executor.layers.quantization.utils.marlin_utils."
         "check_moe_marlin_supports_config"
     ),
@@ -472,6 +511,408 @@ def test_marlin_gate_defaults_off_on_ppu(installed_model_patches) -> None:
     os.environ.pop("VLLM_PPU_ENABLE_MOE_MARLIN", None)
     with mock.patch.object(type(current_platform), "is_ppu", return_value=True):
         assert marlin_utils.check_moe_marlin_supports_config(object()) is False
+
+
+@pytest.mark.requires_runtime
+def test_step5_dsa_admits_only_ppu_sm8x(installed_model_patches) -> None:
+    from unittest import mock
+
+    from vllm.models.step5.nvidia.sparse_attention import Step5DSAAttentionBackend
+    from vllm.platforms import current_platform
+    from vllm.platforms.interface import DeviceCapability
+
+    supports = Step5DSAAttentionBackend.supports_compute_capability
+    platform_type = type(current_platform)
+    with mock.patch.object(platform_type, "is_ppu", return_value=True):
+        assert supports(DeviceCapability(8, 9)) is True
+        assert supports(DeviceCapability(8, 0)) is True
+        assert supports(DeviceCapability(7, 5)) is False
+        assert supports(DeviceCapability(9, 0)) is True
+    with mock.patch.object(platform_type, "is_ppu", return_value=False):
+        assert supports(DeviceCapability(8, 9)) is False
+        assert supports(DeviceCapability(8, 0)) is False
+        assert supports(DeviceCapability(9, 0)) is True
+
+
+@pytest.mark.requires_runtime
+def test_step5_pair_inputs_skip_flashinfer_schedule_on_ppu(
+    installed_model_patches,
+) -> None:
+    """PPU's Triton scorer needs no FlashInfer schedule; nothing imports it."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    import torch
+    from vllm.models.step5.nvidia.flashinfer_sparse import Step5FlashInferSparse
+    from vllm.platforms import current_platform
+
+    meta = SimpleNamespace(
+        lengths=torch.tensor([3, 4, 5, 6], dtype=torch.int32),
+        block_table=torch.arange(8, dtype=torch.int32).view(4, 2),
+    )
+    with (
+        mock.patch.object(type(current_platform), "is_ppu", return_value=True),
+        mock.patch.dict(sys.modules, {"flashinfer.attn_scores": None}),
+    ):
+        ((lengths, table, schedule),) = Step5FlashInferSparse.prefill_pair_inputs(
+            object(), [meta]
+        )
+    assert lengths.tolist() == [4, 6]
+    assert table.tolist() == [[0, 1], [4, 5]]
+    assert schedule is None
+
+
+@pytest.fixture
+def installed_step5_patches(monkeypatch):
+    """Install only Step5 patches so unrelated model imports never probe a GPU."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("vllm")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **kw: (8, 0))
+    from vllm_sail.patch.utils import PATCH_REGISTRY
+
+    for name, target in (
+        (
+            "step5_soft_fp8",
+            "vllm.models.step5.nvidia.ops.summary_update._store_summary",
+        ),
+        (
+            "step5_dsa_backend",
+            "vllm.models.step5.nvidia.flashinfer_sparse.Step5FlashInferSparse.__init__",
+        ),
+        (
+            "step5_indexer_fp16",
+            "vllm.models.step5.nvidia.ops.indexer_norm_rope.indexer_norm_rope",
+        ),
+    ):
+        if any(record.target == target for record in PATCH_REGISTRY):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            f"_step5_cpu_patch_{name}", MODELS_PATCH_DIR / f"{name}.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, module)
+        spec.loader.exec_module(module)
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("mode", ["1"])
+def test_step5_summary_cache_dtype_follows_fp16_switch(
+    installed_step5_patches, monkeypatch, mode
+) -> None:
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.models.step5.nvidia.sparse_summary_cache import (
+        Step5SparseSummaryCacheLayer,
+    )
+
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=64))
+    get_spec = Step5SparseSummaryCacheLayer.get_kv_cache_spec
+    monkeypatch.delenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", raising=False)
+    byte_spec = get_spec(object(), config)
+    assert byte_spec.dtype == torch.uint8
+    monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", mode)
+    half_spec = get_spec(object(), config)
+    assert half_spec.dtype == torch.float16
+    assert (half_spec.head_size, half_spec.tokens_per_state) == (
+        byte_spec.head_size,
+        byte_spec.tokens_per_state,
+    )
+    assert half_spec.page_size_bytes == 2 * byte_spec.page_size_bytes
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("mode", ["1"])
+def test_step5_fp16_switch_selects_triton_scorer_off_ppu(
+    installed_step5_patches, monkeypatch, mode
+) -> None:
+    """FP16 pages are scored only by soft_fp8's scorer, on any platform."""
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.models.step5.nvidia.flashinfer_sparse import Step5FlashInferSparse
+    from vllm.platforms import current_platform
+
+    from vllm_sail.models.step5.ops import soft_fp8
+
+    meta = SimpleNamespace(
+        lengths=torch.tensor([3, 4], dtype=torch.int32),
+        block_table=torch.arange(4, dtype=torch.int32).view(2, 2),
+    )
+    monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", mode)
+    assert soft_fp8.indexer_fp16() is True
+    assert soft_fp8.indexer_query_dtype() == torch.float16
+    with (
+        _mock_is_ppu(current_platform, False),
+        _no_module("flashinfer.attn_scores"),
+    ):
+        ((_, _, schedule),) = Step5FlashInferSparse.prefill_pair_inputs(
+            object(), [meta]
+        )
+    assert schedule is None
+
+    captured = {}
+    owner = SimpleNamespace(_logits=lambda **kwargs: captured.update(kwargs))
+    query = torch.zeros((4, 1, 8, 256), dtype=torch.float16)
+    weights = torch.zeros((4, 1, 8))
+    packed = torch.zeros((4, 32, 1, 258), dtype=torch.float16)
+    Step5FlashInferSparse.logits(
+        owner,
+        query,
+        weights,
+        packed,
+        4,
+        torch.zeros(4, dtype=torch.long),
+        torch.ones(4, dtype=torch.int32),
+        8,
+    )
+    assert captured["q"].dtype == torch.float16
+    assert captured["q"].shape == (4, 1, 8, 256)
+    assert captured["kv_fused"] is packed
+
+
+def _load_step5_soft_bodies(names, namespace):
+    """Run the real production bodies; CPU numeric tests import no device module."""
+    path = MODELS_PATCH_DIR.parents[2] / "models/step5/ops/soft_fp8.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    bodies = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.ClassDef) and node.name in names
+    ]
+    assert {node.name for node in bodies} == set(names)
+    for node in bodies:
+        node.decorator_list = []
+    module = ast.Module(
+        body=[*ast.parse("from __future__ import annotations").body, *bodies],
+        type_ignores=[],
+    )
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_step5_store_value_modes_on_cpu(dtype):
+    """FP16 Q and summary outputs keep the E4M3 quantization and saturation."""
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    namespace = dict(
+        tl=SimpleNamespace(float16=torch.float16),
+        encode_e4m3=lambda x: x.clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8),
+        e4m3_to_fp16=lambda x: x.view(torch.float8_e4m3fn).to(torch.float16),
+    )
+    _load_step5_soft_bodies(["_indexer_store_value"], namespace)
+    value = torch.tensor([0.0, -0.0, 0.333, 1.125, -2.75, 500, -1000]).to(
+        getattr(torch, dtype)
+    )
+    store = namespace["_indexer_store_value"]
+    raw = store(value, False)
+    assert torch.equal(store(value, True), raw.view(torch.float8_e4m3fn).half())
+    half = store(value, True)
+    assert half.dtype == torch.float16
+    assert not torch.equal(half, value.half())
+    assert half[-1].item() == -448
+
+
+@pytest.mark.requires_runtime
+def test_step5_summary_quantizes_after_bf16_rounding_on_cpu():
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    output = torch.zeros(4096, dtype=torch.float16)
+
+    class Pointer:
+        dtype = SimpleNamespace(element_ty=torch.float16)
+
+        def __init__(self, offset=0):
+            self.offset = offset
+
+        def __add__(self, offset):
+            return Pointer(self.offset + offset)
+
+    def encode(value):
+        assert value.dtype == torch.bfloat16
+        return value.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+
+    namespace = dict(
+        tl=SimpleNamespace(
+            float16=torch.float16,
+            bfloat16=torch.bfloat16,
+            div_rn=lambda a, b: a / b,
+            store=lambda pointer, values: output.__setitem__(pointer.offset, values),
+        ),
+        _maximum=lambda a, b: torch.clamp_min(a, b),
+        encode_e4m3=encode,
+        e4m3_to_fp16=lambda x: x.view(torch.float8_e4m3fn).half(),
+    )
+    _load_step5_soft_bodies(["_indexer_store_value", "_store_summary"], namespace)
+    numerator = torch.linspace(-1000, 1000, 256)
+    denominator = torch.full((256,), 1.7)
+    namespace["_store_summary"](
+        Pointer(), 23, torch.arange(256), numerator, denominator, 4096, 64
+    )
+    ref = (
+        (numerator / denominator)
+        .bfloat16()
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .half()
+    )
+    assert torch.equal(output[512:768], ref)
+    assert ref.abs().max() == 448
+    assert torch.count_nonzero(output[:512]) == 0
+    assert torch.count_nonzero(output[768:]) == 0
+
+
+@pytest.mark.parametrize("ppu", [False, True])
+@pytest.mark.parametrize("half", [False, True])
+def test_step5_kernel_launch_modes_are_lazy_on_cpu(monkeypatch, ppu, half):
+    """Toggling modes 0/1 repeatedly converts only the indexer pointers.
+
+    The main attention FP8 cache is never touched.
+    """
+    from types import SimpleNamespace
+
+    from vllm_sail import envs
+
+    class Tensor:
+        def __init__(self, dtype):
+            self.dtype = dtype
+
+        def view(self, dtype):
+            return Tensor(dtype)
+
+    class Kernel:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            return lambda *args, **kw: (self.name, args, kw)
+
+    namespace = dict(
+        torch=SimpleNamespace(
+            Tensor=Tensor, float16="half", float8_e4m3fn="fp8", uint8="byte"
+        ),
+        current_platform=SimpleNamespace(is_ppu=lambda: ppu),
+        envs=envs,
+    )
+    _load_step5_soft_bodies(["indexer_fp16", "ByteFP8Launch"], namespace)
+    launch = namespace["ByteFP8Launch"](Kernel("upstream"), Kernel("software"), (0,))
+    query, main_cache = Tensor("half" if half else "fp8"), Tensor("fp8")
+    for mode in (0, 1, 0, 1):
+        monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", str(mode))
+        assert namespace["indexer_fp16"]() is bool(mode)
+        name, args, kw = launch[(1,)](query, main_cache, sentinel=3)
+        expected = "software" if half or ppu else "upstream"
+        assert name == expected
+        assert args[0].dtype == ("byte" if not half and ppu else query.dtype)
+        assert args[1] is main_cache
+        assert kw == {"sentinel": 3}
+
+
+def _mock_is_ppu(platform, value: bool):
+    from unittest import mock
+
+    return mock.patch.object(type(platform), "is_ppu", return_value=value)
+
+
+def _no_module(name: str):
+    from unittest import mock
+
+    return mock.patch.dict(sys.modules, {name: None})
+
+
+@pytest.mark.requires_runtime
+def test_step5_mtp_quant_config_ignores_bf16_draft_layers(
+    installed_model_patches, monkeypatch
+) -> None:
+    """Checkpoint ignore names of a BF16 MTP layer reach its module paths."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsConfig,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+        should_ignore_layer,
+    )
+    from vllm.model_executor.models.utils import WeightsMapper
+    from vllm.models.step5.nvidia import mtp
+    from vllm.models.step5.nvidia.model import STEP5_PACKED_MODULES_MAPPING
+
+    int8 = {"num_bits": 8, "type": "int", "symmetric": True}
+    projections = ("q_proj", "k_proj", "v_proj", "g_proj", "o_proj")
+    checkpoint_names = [f"self_attn.{name}" for name in projections] + [
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+        "eh_proj",
+        "transformer.shared_head.output",
+    ]
+    target = CompressedTensorsConfig.from_config(
+        {
+            "quant_method": "compressed-tensors",
+            "format": "int-quantized",
+            "config_groups": {
+                "W8A8": {
+                    "targets": ["Linear"],
+                    "weights": {**int8, "strategy": "channel", "dynamic": False},
+                    "input_activations": {
+                        **int8,
+                        "strategy": "token",
+                        "dynamic": True,
+                    },
+                }
+            },
+            # The VL target's view: hf_to_vllm_mapper added language_model.
+            "ignore": [
+                f"language_model.model.layers.{layer}.{name}"
+                for layer in (1, 2)
+                for name in checkpoint_names
+            ],
+        }
+    )
+    target.packed_modules_mapping = dict(STEP5_PACKED_MODULES_MAPPING)
+    snapshot = list(target.ignore)
+
+    @dataclasses.dataclass
+    class _Config:
+        quant_config: object
+
+    captured = {}
+    init = mtp.Step5MTP.__init__
+    monkeypatch.setitem(
+        init.__globals__,
+        "_upstream_init",
+        lambda self, *, vllm_config, prefix: captured.update(config=vllm_config),
+    )
+    monkeypatch.setattr(
+        mtp,
+        "_get_mtp_config",
+        lambda _: SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1),
+    )
+    init(object(), vllm_config=_Config(target), prefix="")
+
+    draft = captured["config"].quant_config
+    # Upstream's own Step5MTP strip.
+    draft.apply_vllm_mapper(WeightsMapper(orig_to_new_prefix={"language_model.": ""}))
+    for module in (
+        "mtp_block.self_attn.qkvg_proj",
+        "mtp_block.self_attn.o_proj",
+        "mtp_block.mlp.gate_up_proj",
+        "mtp_block.mlp.down_proj",
+        "shared_head.head",
+    ):
+        name = f"model.layers.2.{module}"
+        assert should_ignore_layer(name, draft.ignore, draft.packed_modules_mapping)
+    # Only the draft layers move, and the target's config is untouched.
+    assert "model.layers.1.mlp.down_proj" in draft.ignore
+    assert "model.layers.2.mlp.down_proj" not in draft.ignore
+    assert target.ignore == snapshot
 
 
 @pytest.mark.requires_runtime

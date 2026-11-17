@@ -29,7 +29,12 @@ BOOL_DEFAULTS = {
     "DISABLE_MEGA_MHC": False,
     "USE_TRITON_INT8_QUANT": True,
     "ENABLE_FP8_TO_INT8": False,
+    "STEP5_DSA_SCORES": False,
+    "STEP5_DSA_SELECTOR_PPU": False,
+    "STEP5_DSA_PREFILL_PPU": False,
+    "STEP5_DSA_PREFILL_BATCH_ATTENTION": False,
     "NVTX_PROFILE": False,
+    "NVTX_DUMP_DICT": False,
     "NVTX_DUMP_TOPK": False,
     "NVTX_VFA_DUMP_SEQLEN": False,
     "MINIMAX_M3_MSA": True,
@@ -40,13 +45,15 @@ BOOL_DEFAULTS = {
     "PPU_KV_NVFP4": False,
     "FUSED_ATTN_PER_TOKEN_SCALE": False,
 }
+INT_DEFAULTS = {
+    "KPOOL_MAX_DENSE_POOLS": 1 << 21,
+}
 BACKENDS = ("MOE_BACKEND", "DENSE_BACKEND")
 # String env vars with a non-None default.
 STRING_DEFAULTS = {
     "KPOOL_DECODE_LOGITS": "non_paged",
     "MEGA_MOE_MMA_TYPE": "fp8xfp4",
 }
-INT_DEFAULTS = {"KPOOL_MAX_DENSE_POOLS": 1 << 21}
 
 
 @pytest.fixture(autouse=True)
@@ -57,18 +64,20 @@ def clean_plugin_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_defaults_and_canonical_snapshot() -> None:
     expected = {f"VLLM_SAIL_{key}": value for key, value in BOOL_DEFAULTS.items()}
+    expected.update({f"VLLM_SAIL_{key}": value for key, value in INT_DEFAULTS.items()})
     expected.update({f"VLLM_SAIL_{key}": None for key in BACKENDS})
     expected.update(
         {f"VLLM_SAIL_{key}": value for key, value in STRING_DEFAULTS.items()}
     )
-    expected.update({f"VLLM_SAIL_{key}": value for key, value in INT_DEFAULTS.items()})
     expected["VLLM_DEEPEPLL_RECV_HOOK"] = True
+    expected["VLLM_STEP5_INDEXER_FP8_AS_FP16"] = False
     expected["PPU_SDK"] = "/usr/local/PPU_SDK"
     expected["VLLM_GDN_DECODE_KERNEL"] = "auto"
     expected["VLLM_SAIL_FP8_LOAD_POLICY"] = None
+    expected["VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND"] = "flashinfer"
     assert envs.snapshot() == expected
     assert set(envs.environment_variables) == set(expected)
-    for suffix in (*BOOL_DEFAULTS, *BACKENDS):
+    for suffix in (*BOOL_DEFAULTS, *INT_DEFAULTS, *BACKENDS):
         assert getattr(envs, f"VLLM_PPU_{suffix}") == expected[f"VLLM_SAIL_{suffix}"]
 
 
@@ -81,6 +90,80 @@ def test_mega_moe_mma_type_is_lazy_and_checks_choices(monkeypatch):
     monkeypatch.setenv(name, "unsupported")
     with pytest.raises(ValueError, match=name):
         getattr(envs, name)
+
+
+@pytest.mark.parametrize("prefix", ["VLLM_SAIL", "VLLM_PPU"])
+def test_prefill_backend_lazy_choices_and_precedence(monkeypatch, prefix):
+    sail = "VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND"
+    ppu = "VLLM_PPU_STEP5_DSA_PREFILL_BACKEND"
+    assert getattr(envs, sail) == getattr(envs, ppu) == "flashinfer"
+    for raw, expected in (
+        ("NATIVE", "native"),
+        ("FlashInfer", "flashinfer"),
+        ("", "flashinfer"),
+    ):
+        monkeypatch.setenv(prefix + "_STEP5_DSA_PREFILL_BACKEND", raw)
+        assert getattr(envs, sail) == getattr(envs, ppu) == expected
+    monkeypatch.setenv(prefix + "_STEP5_DSA_PREFILL_BACKEND", " V023 ")
+    with pytest.raises(ValueError, match="flashinfer, native"):
+        _ = getattr(envs, sail)
+    monkeypatch.setenv(ppu, "native")
+    monkeypatch.setenv(sail, "")
+    assert getattr(envs, ppu) == "flashinfer"
+    monkeypatch.setenv(sail, "invalid")
+    with pytest.raises(ValueError, match=sail):
+        _ = getattr(envs, sail)
+
+
+@pytest.mark.parametrize("prefix", ["VLLM_SAIL", "VLLM_PPU"])
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "STEP5_FUSED_NORM",
+        "STEP5_DSA_SCORE_MQA",
+        "STEP5_DSA_SCORE_MQA_BQ",
+        "STEP5_DSA_PREFILL_MULTI_QUERY",
+        "STEP5_DSA_PREFILL_MULTI_QUERY_BQ",
+        "STEP5_DSA_SCORE_TILE",
+        "STEP5_DSA_SCORE_WORKERS",
+        "STEP5_DSA_SCORE_WARPS",
+        "STEP5_DSA_NATIVE_DEBUG",
+        "STEP5_DSA_NATIVE_DEBUG_LIMIT",
+        "STEP5_DSA_PREFILL_CUDA",
+        "STEP5_DSA_SELECTOR_V2",
+    ],
+)
+def test_removed_configuration_is_not_recognized(monkeypatch, prefix, suffix):
+    name = prefix + "_" + suffix
+    baseline = envs.snapshot()
+    monkeypatch.setenv(name, "invalid")
+    assert name not in dir(envs) and not envs.is_set(name)
+    with pytest.raises(AttributeError, match=name):
+        getattr(envs, name)
+    assert envs.snapshot() == baseline
+
+
+def test_removed_upstream_prefill_alias(monkeypatch):
+    monkeypatch.setenv("VLLM_STEP5_DSA_PREFILL_CUDA", "1")
+    assert not envs.is_set("VLLM_STEP5_DSA_PREFILL_CUDA")
+    assert not envs.is_set("VLLM_SAIL_STEP5_DSA_PREFILL_PPU")
+    assert envs.VLLM_SAIL_STEP5_DSA_PREFILL_PPU is False
+
+
+@pytest.mark.parametrize("suffix", INT_DEFAULTS)
+def test_integer_aliases_and_parsing(
+    monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    sail, ppu = f"VLLM_SAIL_{suffix}", f"VLLM_PPU_{suffix}"
+    monkeypatch.setenv(ppu, "64")
+    assert getattr(envs, sail) == 64
+    monkeypatch.setenv(sail, " 32 ")
+    assert getattr(envs, sail) == 32
+    monkeypatch.setenv(sail, "")
+    assert getattr(envs, sail) == INT_DEFAULTS[suffix]
+    monkeypatch.setenv(sail, "many")
+    with pytest.raises(ValueError, match=sail):
+        _ = getattr(envs, sail)
 
 
 @pytest.mark.parametrize("suffix", BOOL_DEFAULTS)
@@ -180,6 +263,44 @@ def test_shared_upstream_variable_keeps_its_name(
     monkeypatch.setenv("VLLM_DEEPEPLL_RECV_HOOK", "0")
     assert envs.VLLM_DEEPEPLL_RECV_HOOK is False
     assert envs.is_set("VLLM_DEEPEPLL_RECV_HOOK") is True
+
+
+def test_step5_fork_variable_keeps_its_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert envs.VLLM_STEP5_INDEXER_FP8_AS_FP16 is False
+    for mode in (1, 0, 1, 0):
+        monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", str(mode))
+        assert envs.VLLM_STEP5_INDEXER_FP8_AS_FP16 is bool(mode)
+        assert envs.snapshot()["VLLM_STEP5_INDEXER_FP8_AS_FP16"] is bool(mode)
+    assert envs.is_set("VLLM_STEP5_INDEXER_FP8_AS_FP16") is True
+    assert "VLLM_PPU_STEP5_INDEXER_FP8_AS_FP16" not in dir(envs)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("0", False),
+        ("true", True),
+        ("YES", True),
+        (" On ", True),
+        ("1", True),
+    ],
+)
+def test_step5_indexer_switch_preserves_boolean_spelling(monkeypatch, raw, expected):
+    monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", raw)
+    assert envs.VLLM_STEP5_INDEXER_FP8_AS_FP16 is expected
+
+
+@pytest.mark.parametrize("raw", ["2", "3", "-1", "1.0", "invalid"])
+def test_step5_indexer_switch_non_truthy_values_are_false(monkeypatch, raw):
+    """The original bool parser: non-truthy values do not enable FP16 storage."""
+    monkeypatch.setenv("VLLM_STEP5_INDEXER_FP8_AS_FP16", raw)
+    assert envs.VLLM_STEP5_INDEXER_FP8_AS_FP16 is False
 
 
 def test_choice_helper_supports_unregistered_names(

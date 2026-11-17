@@ -21,7 +21,7 @@ import sys
 import types
 from collections.abc import Iterator
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MappingProxyType, ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -478,6 +478,68 @@ def test_get_quant_method_ignores_experts_and_channelwise_linear(
     _Platform.ppu = False
     assert config.get_quant_method(dense, dense_prefix) == "upstream-method"
     _Platform.ppu = True
+
+
+@pytest.mark.upstream_source
+@pytest.mark.parametrize("ppu", [True, False])
+@pytest.mark.parametrize("namespace", ["", "language_model."])
+@pytest.mark.parametrize("layer_idx", [88, 89, 90])
+def test_step5_bf16_experts_honor_checkpoint_ignore(
+    monkeypatch, mxfp4_module, upstream_source_root, ppu, namespace, layer_idx
+):
+    """Real upstream matcher: BF16 tail experts behind the routed_experts path."""
+    state, modules = _build_stub_vllm(monkeypatch)
+    real_skip = function(
+        str(
+            upstream_source_root
+            / "vllm/model_executor/layers/quantization/utils/quant_utils.py"
+        ),
+        "is_layer_skipped",
+        {"MappingProxyType": MappingProxyType},
+    )
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.layers.quantization.utils.quant_utils"],
+        "is_layer_skipped",
+        real_skip,
+    )
+    monkeypatch.setattr(_Platform, "ppu", ppu)
+    mxfp4_module.install()
+    config_cls = modules["quant_mxfp4"].Mxfp4Config
+    prefix = f"model.layers.{layer_idx}.moe.experts"
+    ignored = [f"{prefix}.w13_weight", f"{prefix}.w2_weight"]
+    config = config_cls.from_config({"ignore": ignored})
+    config.apply_vllm_mapper(
+        SimpleNamespace(apply_list=lambda names: [namespace + name for name in names])
+    )
+    experts = modules["fused_moe"].RoutedExperts()
+    method = config.get_quant_method(experts, namespace + prefix + ".routed_experts")
+    assert type(method).__name__ == "UnquantizedFusedMoEMethod"
+    assert method.moe_config is experts.moe_config
+    assert ignored == [f"{prefix}.w13_weight", f"{prefix}.w2_weight"]
+    for idx in (8, 87, 91):
+        other = f"{namespace}model.layers.{idx}.moe.experts.routed_experts"
+        assert config.get_quant_method(experts, other) == "upstream-method"
+        assert state.upstream_get_quant_method[-1] == (experts, other)
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("ppu", [True, False])
+def test_mapper_remaps_ignored_layers_without_mutating_input(
+    monkeypatch, mxfp4_module, ppu
+):
+    _, modules = _build_stub_vllm(monkeypatch)
+    monkeypatch.setattr(_Platform, "ppu", ppu)
+    mxfp4_module.install()
+    ignored = ["model.layers.88.moe.experts.w2_weight", "lm_head"]
+    config = modules["quant_mxfp4"].Mxfp4Config(ignored_layers=ignored)
+    config.apply_vllm_mapper(
+        SimpleNamespace(apply_list=lambda names: [f"language_model.{n}" for n in names])
+    )
+    assert config.ignored_layers == [f"language_model.{n}" for n in ignored]
+    assert ignored == ["model.layers.88.moe.experts.w2_weight", "lm_head"]
+    config.ignored_layers = None
+    config.apply_vllm_mapper(SimpleNamespace(apply_list=lambda names: list(names)))
+    assert config.ignored_layers is None
 
 
 @pytest.mark.requires_runtime

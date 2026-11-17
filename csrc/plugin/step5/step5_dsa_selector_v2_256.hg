@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Compiles the ported source directly so only one radix implementation is
+// maintained; the plugin uses an exact FP32 cutoff.
+#define STEP4_DSA_SELECTOR_THREADS 256
+#define STEP5_DSA_EXACT_FP32 1
+#include "step5_dsa/step4_dsa_radix_selector.cuh"

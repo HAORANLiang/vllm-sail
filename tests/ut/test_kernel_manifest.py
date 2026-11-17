@@ -137,9 +137,7 @@ def test_rename_extension_targets_match_the_cmake_and_python_module_names(
     # from an installed wheel that intentionally does not ship build sources.
     root = Path(__file__).resolve().parents[2]
     cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
-    loader = (root / "vllm_sail" / "native" / "extensions.py").read_text(
-        encoding="utf-8"
-    )
+    loader = Path(m.__file__).with_name("extensions.py").read_text(encoding="utf-8")
 
     targets = set(shipped.rename_extension.values())
     cmake_targets = set(re.findall(r"^ppu_add_extension\((_\w+)", cmake, re.MULTILINE))
@@ -256,6 +254,21 @@ def test_model_kernel_dependencies_are_compiled_and_bound(shipped, op):
         f"STABLE_TORCH_LIBRARY_IMPL({namespace}, CUDA, ops) {{"
     )[1].split("\n}")[0]
     assert f"TORCH_BOX(&{op})" in cuda_block
+    from vllm_sail.native.stubs import load_schemas
+
+    assert op not in {entry.name for entry in load_schemas()}
+
+
+def test_step5_qknorm_rope_cache_is_compiled_and_bound(shipped: m.Manifest) -> None:
+    # Step5 attention calls this for every non-fused-prepare forward; upstream
+    # binds it through the vllm:: namespace rather than a bare symbol.
+    op = "fused_qknorm_rope_cache"
+    assert op in shipped.ops(shipped.compiled())
+    root = Path(__file__).parents[2]
+    bindings = (root / "csrc/upstream/torch_bindings.cpp").read_text()
+    assert f'"{op}("' in bindings
+    cuda_block = bindings.split("STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {")[1]
+    assert f"TORCH_BOX(&vllm::{op})" in cuda_block.split("\n}")[0]
     from vllm_sail.native.stubs import load_schemas
 
     assert op not in {entry.name for entry in load_schemas()}

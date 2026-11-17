@@ -685,6 +685,32 @@ def test_every_unresolved_installation_has_a_feature_contract():
             )
             for method in ("__init__", "__eq__", "__hash__")
         ),
+        # Step5 kernel/launcher rebinding through one metadata helper; the
+        # targets and fallbacks are exercised in test_model_patches.py and
+        # test_step5_score_pipeline.py.
+        (
+            "patch/enhancement/models/step5_indexer_fp16.py",
+            "_install",
+            "module",
+            "name",
+        ),
+        ("patch/enhancement/models/step5_soft_fp8.py", "_install", "module", "name"),
+        # Loaded consumer aliases of sparse_decode_attention; covered by
+        # test_step5_dsa_native.py::test_decode_bound_aliases.
+        (
+            "patch/performance/step5_dsa_prefill.py",
+            "_install_native_decode",
+            "name",
+            "attr",
+        ),
+        # V1/V2 runner module paths come from the caller's literal loop;
+        # covered by test_layerwise_nvtx.py.
+        (
+            "profiling/layerwise.py",
+            "_install_v2_dummy_run",
+            "module_path",
+            "'GPUModelRunner._dummy_run'",
+        ),
     }
     for site in unresolved:
         call = ast.parse(site.expression, mode="eval").body

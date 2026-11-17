@@ -234,6 +234,13 @@ ops = ["fused_qk_norm_rope"]
 notes = "Upstream packed-QKV RMSNorm/RoPE kernel, including partial NeoX/GPT-J rotation and forced 1/2/4/8-head schedules. HGGC uses ordinary copies plus warp fences in the async helper. PPU device validation pending."
 
 [[entry]]
+path = "csrc/fused_qknorm_rope_cache_kernel.cu"
+tier = "a"
+hazards = []
+ops = ["fused_qknorm_rope_cache"]
+notes = "Step5 attention dependency: per-head Q/K RMSNorm, partial NeoX RoPE and paged BF16/FP16 or per-tensor FP8 K/V cache insertion. Warp shuffles and fences name only the participating per-head subwarp lanes; the SDK FP8 conversion closure is shared with cache_kernels.cu."
+
+[[entry]]
 path = "csrc/pos_encoding_kernels.cu"
 tier = "a"
 hazards = []

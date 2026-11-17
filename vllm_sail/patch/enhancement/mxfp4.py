@@ -11,8 +11,9 @@ priority lists and activation keys are already covered by
 * ``Mxfp4Config`` gains ``fp8_channelwise_layers`` (PPU dense layers quantized
   FP8 channelwise via a CompressedTensors scheme), reads ``ignore`` /
   ``fp8_channelwise_layers`` in ``from_config``, routes ignored ``RoutedExperts``
-  to ``UnquantizedFusedMoEMethod`` (mixed-precision MTP blocks), and remaps the
-  channelwise list in ``apply_vllm_mapper``.
+  to ``UnquantizedFusedMoEMethod`` (mixed-precision MTP blocks and the BF16
+  tail experts of Step5), and remaps the ignore and channelwise lists in
+  ``apply_vllm_mapper``.
 * ``GptOssMxfp4MoEMethod`` / ``Mxfp4MoEMethod`` select W4A4
   (``kMxfp4Dynamic`` activations) on PPU sm90+, falling back to W4A16 on sm80.
 * ``Mxfp4MoEMethod.get_fused_moe_quant_config`` threads ``swiglu_alpha`` /
@@ -61,8 +62,10 @@ REASON_CONFIG = (
     "The fork adds fp8_channelwise_layers to Mxfp4Config (PPU dense layers "
     "quantized FP8 channelwise), reads 'ignore'/'fp8_channelwise_layers' in "
     "from_config, routes ignored RoutedExperts to UnquantizedFusedMoEMethod "
-    "for mixed-precision checkpoints, and remaps the list in "
-    "apply_vllm_mapper; upstream has none of this."
+    "for mixed-precision checkpoints (matching both the runtime "
+    "'.routed_experts' prefix and the checkpoint 'experts' prefix), and "
+    "remaps the ignore/channelwise lists in apply_vllm_mapper; upstream has "
+    "none of this, so BF16 expert layers get half-width packed FP4 params."
 )
 REASON_METHOD_SELECT = (
     "PPU runs MXFP4 as W4A4 (mxfp4 activations) on sm90+ and W4A16 on sm80; "
@@ -231,10 +234,17 @@ def install() -> None:
         from vllm.platforms import current_platform
 
         if isinstance(layer, RoutedExperts):
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
+            # Checkpoints list ``<moe>.experts.w*_weight`` while the factory
+            # registers the layer one level deeper at ``.routed_experts``;
+            # keep matching ignore entries that name the runtime path too.
+            expert_prefixes = (prefix, prefix.removesuffix(".routed_experts"))
+            if self.ignored_layers and any(
+                is_layer_skipped(
+                    prefix=expert_prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                )
+                for expert_prefix in expert_prefixes
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
         elif (
@@ -285,6 +295,10 @@ def install() -> None:
         _upstream_apply_mapper(self, hf_to_vllm_mapper)
         from vllm.platforms import current_platform
 
+        # Upstream's inherited mapper is a no-op; the VL/MTP renames must reach
+        # the ignore list too, or BF16 layers are allocated as packed FP4.
+        if self.ignored_layers:
+            self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
         if current_platform.is_ppu() and self.fp8_channelwise_layers:
             self.fp8_channelwise_layers = hf_to_vllm_mapper.apply_list(
                 self.fp8_channelwise_layers

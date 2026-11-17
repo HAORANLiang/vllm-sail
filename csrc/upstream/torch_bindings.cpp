@@ -186,6 +186,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 #endif
 
 #ifndef USE_ROCM
+  ops.def(
+      "fused_qknorm_rope_cache("
+      "Tensor! q_out, Tensor! k_out, Tensor! v_out, Tensor qkv, "
+      "Tensor q_weight, Tensor k_weight, Tensor cos, Tensor sin, "
+      "Tensor positions, Tensor slot_mapping, Tensor! k_cache, "
+      "Tensor! v_cache, int head_dim, int num_q_heads, int num_kv_heads, "
+      "int rotary_pairs, float epsilon, float norm_weight_bias, "
+      "str kv_cache_dtype=\"auto\", Tensor? k_scale=None, Tensor? "
+      "v_scale=None) -> ()");
 #endif
 
   // Horizontally-fused MiniMax-M3 QK-norm + partial NeoX RoPE + KV-insert.
@@ -438,6 +447,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("fused_kimi_k3_mla_decode_q_concat_ds_mla_insert",
            TORCH_BOX(&fused_kimi_k3_mla_decode_q_concat_ds_mla_insert));
 #ifndef USE_ROCM
+  ops.impl("fused_qknorm_rope_cache",
+           TORCH_BOX(&vllm::fused_qknorm_rope_cache));
 #endif
   ops.impl("fused_minimax_m3_qknorm_rope_kv_insert",
            TORCH_BOX(&fused_minimax_m3_qknorm_rope_kv_insert));

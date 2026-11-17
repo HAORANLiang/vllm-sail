@@ -72,6 +72,10 @@ def test_general_hook_runs_the_complete_lifecycle_once(
     profiling = _module(
         "vllm_sail.profiling", install=lambda: events.append("profiling")
     )
+    layerwise = _module(
+        "vllm_sail.profiling.layerwise", install=lambda: events.append("layerwise")
+    )
+    monkeypatch.setitem(sys.modules, layerwise.__name__, layerwise)
     ops = _module("vllm_sail.ops")
 
     for module in (compat, patch, registry, models, profiling, ops):
@@ -95,6 +99,7 @@ def test_general_hook_runs_the_complete_lifecycle_once(
         "compat",
         "patch",
         "registry",
+        "layerwise",
         "profiling",
         "models",
         "compat",

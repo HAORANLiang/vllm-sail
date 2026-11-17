@@ -118,6 +118,77 @@ def range_pop() -> None:
         pass
 
 
+def step5_sparse_label(
+    pd_type: str, args: tuple, kwargs: dict, *, dump_dict: bool = False
+) -> str:
+    """Record shape/dtype only; dicts are opt-in; tensor/scalar values are not read."""
+    proxy_prefix = "dsa_proxy" if pd_type == "prefill" else "proxy"
+    names = (
+        "self",
+        "query",
+        "kv_cache",
+        "attn_metadata" if pd_type == "prefill" else "metadata",
+        "output",
+        f"{proxy_prefix}_query",
+        f"{proxy_prefix}_key",
+        f"{proxy_prefix}_weights",
+        f"{proxy_prefix}_z",
+    )
+    values = dict(zip(names, args, strict=False))
+    values.update(kwargs)
+    fields = [
+        f"[FW_SPARSE] op:_forward_{pd_type}",
+        "fw:vllm",
+        "model:step5",
+        "backend:default",
+        f"pd_type:{pd_type}",
+    ]
+
+    active_dicts = set()
+
+    def tensor_field(name, value, depth=0):
+        if isinstance(value, dict):
+            # Dicts are not walked when off; when on, the raw dict, tensor values and
+            # arbitrary object keys are still never formatted.
+            if not dump_dict or depth >= 4 or id(value) in active_dicts:
+                return
+            active_dicts.add(id(value))
+            try:
+                for key, item in value.items():
+                    if type(key) not in (str, int):
+                        continue
+                    if (
+                        isinstance(item, dict)
+                        or getattr(item, "shape", None) is not None
+                    ):
+                        tensor_field(f"{name}.{key}", item, depth + 1)
+            finally:
+                active_dicts.remove(id(value))
+            return
+        shape = getattr(value, "shape", None)
+        fields.append(f"{name}:{tuple(shape) if shape is not None else None}")
+        if shape is not None and hasattr(value, "dtype"):
+            fields.append(f"{name}_dtype:{value.dtype}")
+
+    for name in ("query", "kv_cache", "output", *names[5:]):
+        tensor_field(name, values.get(name))
+    metadata = values.get(names[3])
+    if isinstance(metadata, dict):
+        tensor_field(names[3], metadata)
+    else:
+        for name in ("block_table", "slot_mapping", "seq_lens", "query_start_loc"):
+            tensor_field(name, getattr(metadata, name, None))
+    scales = values.get("kv_scales", (None, None))
+    if isinstance(scales, dict):
+        tensor_field("kv_scales", scales)
+    else:
+        tensor_field("k_scale", scales[0])
+        tensor_field("v_scale", scales[1])
+    if pd_type == "decode":
+        tensor_field("gate", values.get("gate"))
+    return ",".join(fields)
+
+
 def prof_iter(iteration: int) -> None:
     """Per-iteration hook for the PPU SDK profiler; no-op without model_prof."""
     if _model_prof_iter is not None:

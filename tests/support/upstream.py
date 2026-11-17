@@ -9,7 +9,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
-ROOT = Path(__file__).resolve().parents[2]
+from vllm_sail import envs
+
+ROOT = Path(envs.__file__).resolve().parents[1]
 PATCH_ROOT = ROOT / "vllm_sail/patch"
 SKIP_DIRS = frozenset({"template", "__pycache__"})
 SUPPORTED_RANGE = ">=0.32.0,<0.33.0"
