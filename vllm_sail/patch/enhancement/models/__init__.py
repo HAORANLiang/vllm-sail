@@ -56,11 +56,16 @@ from vllm_sail.patch.enhancement.models import (
     deepseek_v41_mega_mhc,  # noqa: F401
     glm5_next,  # noqa: F401
     glm5_next_mtp,  # noqa: F401
+    kimi_k25_processor,  # noqa: F401
     kimi_k3,  # noqa: F401
     llama4,  # noqa: F401
     minimax_m3,  # noqa: F401
     minimax_m3_msa,  # noqa: F401
+    minimax_m3_ops,  # noqa: F401
     moe_marlin_gate,  # noqa: F401
     qwen3_moe,  # noqa: F401
     qwen3_next,  # noqa: F401
 )
+
+# Leaf-style: preload the MiniMax ops package without quack on PPU.
+minimax_m3_ops.install()

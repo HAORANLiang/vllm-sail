@@ -39,6 +39,9 @@ _INT8_MOE_MODULE = (
     "vllm.model_executor.layers.quantization.compressed_tensors."
     "compressed_tensors_moe.compressed_tensors_moe_w8a8_int8"
 )
+_UTILS_MODULE = (
+    "vllm.model_executor.layers.quantization.compressed_tensors.utils"
+)
 AFFECTED_VERSIONS = ">=0.34.0,<0.35.0"
 
 REASON_CHANNELWISE = (
@@ -132,6 +135,32 @@ METADATA += (
     ),
 )
 
+REASON_GROUPED_WOA = (
+    "The grouped wo_a class (DeepseekV4GroupedWoA) has no 'Linear' in its "
+    "leaf name, so compressed-tensors targets=['Linear'] misses it and wo_a "
+    "stays BF16 while the checkpoint ships INT8 weight+scale; on PPU also "
+    "match module-type targets against base class names in the MRO."
+)
+REMOVE_WHEN_GROUPED_WOA = (
+    "upstream find_matched_target matches module-type targets against the "
+    "full MRO, or the grouped wo_a class name contains 'Linear'."
+)
+
+METADATA += (
+    (
+        f"{_UTILS_MODULE}.find_matched_target",
+        REASON_GROUPED_WOA,
+        AFFECTED_VERSIONS,
+        REMOVE_WHEN_GROUPED_WOA,
+    ),
+    (
+        f"{_MODULE}.find_matched_target",
+        REASON_GROUPED_WOA,
+        AFFECTED_VERSIONS,
+        REMOVE_WHEN_GROUPED_WOA,
+    ),
+)
+
 _KV_PARAM_NAMES = ("k_scale", "k_zero_point", "v_zero_point", "q_zero_point")
 
 _installed = False
@@ -156,6 +185,11 @@ def install() -> None:
         is_layer_skipped,
     )
 
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        utils as _ct_utils,
+    )
+
+    _upstream_find_matched_target = _ct_utils.find_matched_target
     _upstream_init = _ct.CompressedTensorsConfig.__init__
     _upstream_from_config = _ct.CompressedTensorsConfig.from_config
     _upstream_get_scheme = _ct.CompressedTensorsConfig.get_scheme
@@ -324,5 +358,42 @@ def install() -> None:
             config.gemm1_alpha = getattr(layer, "swiglu_alpha", None)
             config.gemm1_beta = getattr(layer, "swiglu_beta", None)
         return config
+
+    @patch(
+        _UTILS_MODULE,
+        "find_matched_target",
+        reason=REASON_GROUPED_WOA,
+        affected_versions=AFFECTED_VERSIONS,
+        remove_when=REMOVE_WHEN_GROUPED_WOA,
+    )
+    def _find_matched_target(layer_name, module, targets, fused_mapping=None):
+        from types import MappingProxyType
+
+        from vllm.platforms import current_platform
+
+        if fused_mapping is None:
+            fused_mapping = MappingProxyType({})
+        matched = _upstream_find_matched_target(
+            layer_name, module, targets, fused_mapping
+        )
+        if matched is not None or not current_platform.is_ppu():
+            return matched
+        # Module-type targets like "Linear" must also reach subclasses whose
+        # leaf name drops it (DeepseekV4GroupedWoA -> ColumnParallelLinear).
+        for base in type(module).__mro__[1:]:
+            matched = _ct_utils._find_first_match(base.__name__, targets, True)
+            if matched is not None:
+                return matched
+        return None
+
+    # compressed_tensors.py imports the helper by value; rebind it too.
+    if getattr(_ct, "find_matched_target", None) is _upstream_find_matched_target:
+        patch(
+            _MODULE,
+            "find_matched_target",
+            reason=REASON_GROUPED_WOA,
+            affected_versions=AFFECTED_VERSIONS,
+            remove_when=REMOVE_WHEN_GROUPED_WOA,
+        )(_find_matched_target)
 
     _installed = True
