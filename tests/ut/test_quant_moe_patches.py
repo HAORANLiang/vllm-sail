@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import re
 import sys
 import types
 from collections.abc import Iterator
@@ -598,6 +599,41 @@ def _build_ct_stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         quant_utils,
     )
 
+    # compressed_tensors.utils.find_matched_target / _find_first_match: mirror
+    # upstream's layer-name then module-type (substring) matching, which is what
+    # the grouped-wo_a MRO fallback exercises. Fused mapping is empty in these
+    # tests, so the upstream _match_fused_layer branch is a no-op here.
+    def _is_equal_or_regex_match(value, target, check_contains=False):
+        if target.startswith("re:"):
+            return re.search(target[3:], value) is not None
+        if check_contains:
+            return target in value
+        return value == target
+
+    def _find_first_match(value, targets, check_contains=False):
+        for target in targets:
+            if _is_equal_or_regex_match(value, target, check_contains):
+                return target
+        return None
+
+    def find_matched_target(layer_name, module, targets, fused_mapping=None):
+        if layer_name is None:
+            layer_name = ""
+        return _find_first_match(layer_name, targets) or _find_first_match(
+            module.__class__.__name__, targets, True
+        )
+
+    ct_utils = types.ModuleType(
+        "vllm.model_executor.layers.quantization.compressed_tensors.utils"
+    )
+    ct_utils.find_matched_target = find_matched_target  # type: ignore[attr-defined]
+    ct_utils._find_first_match = _find_first_match  # type: ignore[attr-defined]
+    _register_chain(monkeypatch, ct_utils.__name__, ct_utils)
+    # compressed_tensors.py imports the helper by value; mirror that alias so the
+    # patch's identity-guarded consumer rebind fires.
+    ct.find_matched_target = find_matched_target  # type: ignore[attr-defined]
+    state["ct_utils"] = ct_utils
+
     state["ct"] = ct
     state["ct_moe"] = ct_moe
     state["ct_int8"] = ct_int8
@@ -752,3 +788,37 @@ def test_ct_fp8_and_int8_preserve_swiglu_parameters(monkeypatch):
     ):
         result = getattr(state[provider], cls_name)().get_fused_moe_quant_config(layer)
         assert (result.gemm1_alpha, result.gemm1_beta) == (1.7, 0.3)
+
+
+def test_ct_find_matched_target_grouped_wo_a_mro(monkeypatch):
+    """The grouped wo_a leaf drops 'Linear'; PPU recovers it via the base MRO."""
+    module = _leaf("compressed_tensors_ppu")
+    state = _build_ct_stubs(monkeypatch)
+    module.install()
+
+    class ColumnParallelLinear:
+        pass
+
+    class DeepseekV4GroupedWoA(ColumnParallelLinear):
+        pass
+
+    wo_a = DeepseekV4GroupedWoA()
+    targets = ["Linear"]
+    find = state["ct_utils"].find_matched_target
+
+    # Upstream alone misses the grouped leaf; on PPU the MRO fallback matches the
+    # ColumnParallelLinear base so the INT8 weight+scale scheme is selected.
+    _Platform.ppu = True
+    assert find("model.layers.0.self_attn.wo_a", wo_a, targets) == "Linear"
+    # Non-PPU keeps upstream behaviour exactly: no match, no MRO walk.
+    _Platform.ppu = False
+    assert find("model.layers.0.self_attn.wo_a", wo_a, targets) is None
+    _Platform.ppu = True
+
+    # A leaf upstream already matches is returned unchanged (early return).
+    class Linear(ColumnParallelLinear):
+        pass
+
+    assert find("model.layers.0.mlp.gate_proj", Linear(), targets) == "Linear"
+    # The by-value consumer alias in compressed_tensors.py is rebound as well.
+    assert state["ct"].find_matched_target is find

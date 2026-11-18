@@ -146,15 +146,12 @@ REMOVE_WHEN_GROUPED_WOA = (
     "full MRO, or the grouped wo_a class name contains 'Linear'."
 )
 
+# The provider decorator patches utils.find_matched_target; the by-value alias
+# rebind in compressed_tensors.py below reuses this declaration (same convention
+# as fused_moe_ppu's consumer rebinds), so METADATA lists the provider once.
 METADATA += (
     (
         f"{_UTILS_MODULE}.find_matched_target",
-        REASON_GROUPED_WOA,
-        AFFECTED_VERSIONS,
-        REMOVE_WHEN_GROUPED_WOA,
-    ),
-    (
-        f"{_MODULE}.find_matched_target",
         REASON_GROUPED_WOA,
         AFFECTED_VERSIONS,
         REMOVE_WHEN_GROUPED_WOA,

@@ -48,10 +48,12 @@ EXPECTED_MODULES = {
     "deepseek_v41_mega_mhc",
     "glm5_next",
     "glm5_next_mtp",
+    "kimi_k25_processor",
     "kimi_k3",
     "llama4",
     "minimax_m3",
     "minimax_m3_msa",
+    "minimax_m3_ops",
     "moe_marlin_gate",
     "qwen3_fused_quant",
     "qwen3_moe",
@@ -76,6 +78,26 @@ def _patch_calls(tree: ast.AST) -> list[ast.Call]:
         if isinstance(func, ast.Name) and func.id == "patch":
             calls.append(node)
         elif isinstance(func, ast.Attribute) and func.attr == "patch":
+            calls.append(node)
+    return calls
+
+
+def _registration_calls(tree: ast.AST) -> list[ast.Call]:
+    """@patch providers plus module-style ``PatchRecord`` registrations.
+
+    Most model patches replace a callable via ``@patch``; a module-preload
+    patch (e.g. minimax_m3_ops) instead registers a ``PatchRecord`` directly
+    because its target cannot be imported without a temporary stub. Both must
+    carry well-formed metadata, so the audit covers both registration forms.
+    """
+    calls = _patch_calls(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "PatchRecord":
+            calls.append(node)
+        elif isinstance(func, ast.Attribute) and func.attr == "PatchRecord":
             calls.append(node)
     return calls
 
@@ -123,8 +145,8 @@ def test_every_patch_has_well_formed_metadata() -> None:
     for path in _patch_module_files():
         tree = ast.parse(path.read_text(), filename=str(path))
         constants = _module_constants(tree)
-        calls = _patch_calls(tree)
-        assert calls, f"{path.name} contains no @patch call"
+        calls = _registration_calls(tree)
+        assert calls, f"{path.name} contains no @patch or PatchRecord registration"
         for call in calls:
             keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg}
             for field in REQUIRED_METADATA:

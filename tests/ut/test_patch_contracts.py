@@ -661,6 +661,11 @@ def test_every_unresolved_installation_has_a_feature_contract():
             "module_name",
             "name",
         ),
+        # Module-preload registration (kind="module"): the CuTeDSL kernel cannot
+        # be imported without a temporary quack stub, so it registers a
+        # PatchRecord directly instead of @patch. The preload + loud-error
+        # rebind + stub cleanup are exercised in test_minimax_m3_ops.py.
+        ("patch/enhancement/models/minimax_m3_ops.py", "install"),
         (
             "patch/enhancement/triton_moe.py",
             "_install",
