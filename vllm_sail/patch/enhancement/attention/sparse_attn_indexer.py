@@ -19,6 +19,12 @@ The fork makes three changes to ``SparseAttnIndexer``:
 The fork's module-level ``from vllm._ppu_ops import ppu_ops`` is what
 ``vllm_sail.ops`` replaces; importing it here ensures the custom op is
 registered before any forward call.
+
+Dense indexers call the module-level ``sparse_attn_indexer`` op directly
+(``models/kimi_k3/nvidia/dsa.py``), bypassing ``SparseAttnIndexer`` entirely.
+Two helper patches keep that path on the PPU kernels: ``mqa_logits_mx_inputs``
+caps FP4 producer weights to BF16, and the ``fp8_fp4_*`` logits helpers pin the
+BF16 output dtype SAIL emits.
 """
 
 from __future__ import annotations
@@ -34,8 +40,9 @@ from vllm.utils.deep_gemm import has_deep_gemm
 from vllm.utils.torch_utils import _encode_layer_name
 
 import vllm_sail.ops  # noqa: F401  (registers torch.ops.vllm.ppu_sparse_attn_indexer)
+import vllm_sail.utils.deep_gemm as _ppu_deep_gemm
 from vllm_sail.patch.bodies import bind_body
-from vllm_sail.patch.utils import patch
+from vllm_sail.patch.utils import PATCH_MARKER, patch
 from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 
 _AFFECTED = ">=0.34.0,<0.35.0"
@@ -197,6 +204,163 @@ def sparse_attn_indexer_init(
 
 
 _upstream_forward_native = _indexer.SparseAttnIndexer.forward_native
+_upstream_mqa_logits_mx_inputs = _indexer.mqa_logits_mx_inputs
+
+
+@patch(
+    _MODULE,
+    "mqa_logits_mx_inputs",
+    reason=(
+        "PPU's MXFP4 MQA logits kernels require BF16 weights, but upstream "
+        "gates the weights cast behind mqa_logits_use_mx_scales(), which is "
+        "SM100-only; on PPU (capability 89) FP32 producer weights pass "
+        "through and the SAIL DeepGEMM kernel rejects them. Cast FP32 "
+        "weights to BF16 for FP4 queries (non-None q_scale); FP8 queries "
+        "(q_scale folded into FP32 weights) are untouched. The signature "
+        "follows upstream's ``logits_dtype`` (the dtype its SM100 kernels "
+        "reduce in) and forwards it, but PPU's SAIL kernels emit BF16 logits "
+        "whatever it says, so the signalled dtype cannot be honoured here."
+    ),
+    affected_versions=_AFFECTED,
+    remove_when="mqa_logits_use_mx_scales() covers PPU, or the cast moves out of the SM100 gate.",
+)
+def mqa_logits_mx_inputs_ppu(q, q_scale, weights, logits_dtype=torch.float32):
+    result = _upstream_mqa_logits_mx_inputs(q, q_scale, weights, logits_dtype)
+    if q_scale is None or not current_platform.is_ppu():
+        return result
+    q_scale_out, weights_out = result
+    if weights_out.dtype != torch.bfloat16:
+        weights_out = weights_out.to(torch.bfloat16)
+    return q_scale_out, weights_out
+
+
+_upstream_fp8_fp4_mqa_logits = _indexer.fp8_fp4_mqa_logits
+_upstream_fp8_fp4_paged_mqa_logits = _indexer.fp8_fp4_paged_mqa_logits
+
+_LOGITS_PIN_REASON = (
+    "Upstream's weighted MXFP4 logits take a ``logits_dtype`` that defaults to "
+    "FP32, while SAIL's MXFP4 kernels emit BF16 only (and reject an unsupported "
+    "requested dtype). Pin BF16 for PPU's packed-FP4 queries, whose Q reaches "
+    "the kernel as int8 values with int32 scales, and let upstream's "
+    "``as_fp32_logits`` upcast when its own path needs FP32; FP8 queries "
+    "(q_scale folded into FP32 weights) keep the upstream call."
+)
+_LOGITS_PIN_REMOVE_WHEN = (
+    "SAIL's MXFP4 logits emit FP32, or upstream resolves the logits dtype "
+    "through the platform instead of a single default."
+)
+
+
+def fp8_fp4_mqa_logits_ppu(
+    q,
+    kv,
+    weights,
+    cu_seqlen_ks,
+    cu_seqlen_ke,
+    max_seqlen_k=None,
+    logits_dtype=torch.float32,
+):
+    if not current_platform.is_ppu():
+        return _upstream_fp8_fp4_mqa_logits(
+            q,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            max_seqlen_k,
+            logits_dtype=logits_dtype,
+        )
+    # Q reaches the kernel either as int8-packed FP4 values with int32 scales
+    # or as FP8 values with per-token scales folded into FP32 weights
+    # (q_scale=None). SAIL's wrapper accepts both and emits BF16 logits only,
+    # so the producer weights must be BF16 too.
+    if weights.dtype != torch.bfloat16:
+        weights = weights.to(torch.bfloat16)
+    return _ppu_deep_gemm.fp8_fp4_mqa_logits(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=False,
+        logits_dtype=torch.bfloat16,
+        max_seqlen_k=max_seqlen_k,
+    )
+
+
+def fp8_fp4_paged_mqa_logits_ppu(
+    q,
+    kv_cache,
+    weights,
+    context_lens,
+    block_tables,
+    schedule_metadata,
+    max_model_len=None,
+    logits_dtype=torch.float32,
+    indices=None,
+):
+    if not current_platform.is_ppu():
+        return _upstream_fp8_fp4_paged_mqa_logits(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+            logits_dtype=logits_dtype,
+            indices=indices,
+        )
+    if weights.dtype != torch.bfloat16:
+        weights = weights.to(torch.bfloat16)
+    if indices is None:
+        # SAIL's paged kernel needs request ownership per query row; the indexer
+        # metadata builder supplies it whenever it selects varlen decode.
+        raise ValueError("SAIL paged MXFP4 logits require request indices on PPU")
+    return _ppu_deep_gemm.fp8_fp4_paged_mqa_logits(
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata,
+        max_model_len,
+        clean_logits=False,
+        logits_dtype=torch.bfloat16,
+        indices=indices,
+    )
+
+
+def _install_logits_dtype_pin() -> None:
+    """Pin the FP4 logits dtype unless the int8 indexer patch owns these names.
+
+    SM80-class PPUs load ``enhancement.models.kimi_k3_dsa_indexer``, which
+    patches both names for its int8 scoring path and accepts arbitrary keyword
+    arguments already; a second registration would trip the double-patch guard.
+    """
+    if current_platform.is_ppu() and not current_platform.supports_fp8():
+        return
+    for name, replacement in (
+        ("fp8_fp4_mqa_logits", fp8_fp4_mqa_logits_ppu),
+        ("fp8_fp4_paged_mqa_logits", fp8_fp4_paged_mqa_logits_ppu),
+    ):
+        if getattr(getattr(_indexer, name), PATCH_MARKER, None) is not None:
+            logger.info(
+                "Keeping the existing %s patch; it already selects the PPU "
+                "logits dtype.",
+                name,
+            )
+            continue
+        patch(
+            _MODULE,
+            name,
+            reason=_LOGITS_PIN_REASON,
+            affected_versions=_AFFECTED,
+            remove_when=_LOGITS_PIN_REMOVE_WHEN,
+        )(replacement)
+
+
+_install_logits_dtype_pin()
 
 
 @patch(
