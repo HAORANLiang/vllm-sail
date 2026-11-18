@@ -44,4 +44,5 @@ from vllm_sail.patch.enhancement.attention import (
     sparse_attn_indexer_kpool,  # noqa: F401
     triton_decode_attention,  # noqa: F401
     dsv41_kv_record,  # noqa: F401
+    packed_token_cache_split,  # noqa: F401
 )
