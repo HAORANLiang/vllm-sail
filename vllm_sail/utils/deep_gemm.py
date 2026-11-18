@@ -1114,7 +1114,7 @@ def fp4_paged_mqa_avg_logits(
             dtype int32. The 2-D form is what selects average mode. Logits
             outside a row's valid window are left undefined rather than masked,
             so the caller has to keep them out of the selection itself: the QSA
-            select passes the per-row valid block count to `persistent_topk`
+            select passes the per-row valid block count to DeepSelect's ``end``
             instead of pre-masking the row.
         block_tables: Logical-to-physical page map, shape `[B, max_blocks]`,
             dtype int32. One framework block is one page, so these are the

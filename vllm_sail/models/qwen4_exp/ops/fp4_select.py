@@ -7,7 +7,7 @@ the paged kernel for uniform decode and the non-paged kernel for prefill, which
 is the only route to a compressed-key scoring pass because the paged entry caps
 ``next_n`` at six query rows per request.
 
-Both paths hand ``persistent_topk`` the same request-relative compressed column
+Both paths hand DeepSelect the same request-relative compressed column
 indices upstream produces, so selection and index expansion are unchanged. The
 public signatures mirror ``vllm.models.qwen4_exp.nvidia.ops.qsa_indexer`` so
 the indexer's dispatch needs no PPU-specific arguments.
@@ -34,9 +34,8 @@ from vllm_sail.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
 )
 
-_TOPK_WORKSPACE_BYTES = 1024 * 1024
-# The logits row stride stays cooperative-topk friendly at this granularity,
-# which is also the width upstream rounds its prefill logits to.
+# Upstream rounds its prefill logits width to this granularity; DeepGEMM pads
+# the allocation's row stride to 1024 bytes, which is DeepSelect's requirement.
 _LOGITS_WIDTH_GRANULARITY = 64
 _FP4_AVG_NUM_HEADS = 4
 # The paged kernel hard-caps the query rows it packs into one request tile.
@@ -53,18 +52,19 @@ def _topk(
     block_indices: torch.Tensor,
     block_topk: int,
 ) -> None:
-    # Zhenwu reports capability (8, 9), so upstream's cooperative_topk branch —
-    # gated on has_device_capability(90) — would not select here either.
-    workspace = torch.empty(
-        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=logits.device
-    )
-    torch.ops._C.persistent_topk(
+    import deep_select
+
+    # DeepSelect scans only [0, end) per row, matching DeepGEMM's undefined
+    # out-of-window logits. Keep persistent_topk's contract: negative lengths
+    # (padded decode slots) clamp to zero and short rows pad with -1.
+    deep_select.topk(
         logits,
-        visible_blocks,
-        block_indices,
-        workspace,
         block_topk,
-        logits.shape[1],
+        end=visible_blocks.clamp(min=0),
+        indices_type=torch.int32,
+        return_value=False,
+        output_idx=block_indices,
+        idx_oob_fill_value=-1,
     )
 
 
@@ -132,6 +132,7 @@ def qsa_select_paged_decode(
             fp4_avg_metadata_extra(decode_query_len),
         ),
         columns,
+        logits_dtype=torch.bfloat16,
     )
     _topk(logits, visible_blocks, block_indices, token_topk // compress_ratio)
 
@@ -208,7 +209,12 @@ def qsa_select_paged_prefill(
 
     q_values, q_sf = qsa_quant_q_mxfp4(q)
     logits = fp4_mqa_avg_logits(
-        (q_values, q_sf), (k_values, k_sf), row_starts, row_ends, logits_width
+        (q_values, q_sf),
+        (k_values, k_sf),
+        row_starts,
+        row_ends,
+        logits_width,
+        logits_dtype=torch.bfloat16,
     )
     _topk(logits, visible_blocks, block_indices, token_topk // compress_ratio)
 
@@ -279,6 +285,7 @@ def warmup_qsa_mqa_paged_decode(
                 fp4_avg_metadata_extra(next_n),
             ),
             page_rows,
+            logits_dtype=torch.bfloat16,
         )
         profiles.append((next_n, 1))
 
@@ -303,6 +310,7 @@ def warmup_qsa_mqa_paged_decode(
         row_starts,
         row_starts + 1,
         MXFP4_PAGE_ROWS_GRANULARITY,
+        logits_dtype=torch.bfloat16,
     )
     return tuple(profiles)
 

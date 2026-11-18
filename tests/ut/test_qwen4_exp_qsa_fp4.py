@@ -330,6 +330,40 @@ def test_require_fp4_mqa_avg_logits_needs_both_kernels(monkeypatch):
                 fp4_select.require_fp4_mqa_avg_logits()
 
 
+def test_topk_keeps_persistent_topk_contract_on_deepselect(monkeypatch):
+    """DeepSelect must receive the selection contract persistent_topk had.
+
+    ``end`` carries the per-row valid block count so undefined out-of-window
+    logits are never scanned; negative lengths (padded decode slots) clamp to
+    zero; short rows pad with -1, not DeepSelect's default 2147483647; and the
+    indices land in the caller's int32 buffer without a values return.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("vllm", reason="requires vLLM")
+    import sys
+
+    from vllm_sail.models.qwen4_exp.ops import fp4_select
+
+    calls: list[tuple[tuple, dict]] = []
+    fake = SimpleNamespace(topk=lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setitem(sys.modules, "deep_select", fake)
+
+    logits = torch.zeros(3, 512, dtype=torch.bfloat16)
+    visible = torch.tensor([100, -2, 0], dtype=torch.int32)
+    out = torch.full((3, 512), -777, dtype=torch.int32)
+    fp4_select._topk(logits, visible, out, 512)
+
+    ((args, kwargs),) = calls
+    assert args[0] is logits
+    assert args[1] == 512
+    assert kwargs["end"].dtype is torch.int32
+    assert kwargs["end"].tolist() == [100, 0, 0]
+    assert kwargs["indices_type"] is torch.int32
+    assert kwargs["output_idx"] is out
+    assert kwargs["return_value"] is False
+    assert kwargs["idx_oob_fill_value"] == -1
+
+
 @pytest.fixture(scope="module")
 def qsa_fp4_patch():
     """The module object whose globals the installed wrappers actually read.
