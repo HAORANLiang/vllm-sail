@@ -100,6 +100,7 @@ addopts = ["--import-mode=importlib"]
 markers = [
     "ppu: requires real PPU hardware (skipped when absent)",
     "upstream_source: checks the source selected by VLLM_SOURCE_ROOT without importing vLLM",
+    "requires_runtime: needs installed torch/vLLM, plugin distribution or accelerator runtime",
 ]
 filterwarnings = ["ignore::DeprecationWarning"]
 
