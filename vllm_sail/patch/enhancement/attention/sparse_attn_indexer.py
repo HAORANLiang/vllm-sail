@@ -42,6 +42,7 @@ from vllm.utils.torch_utils import _encode_layer_name
 import vllm_sail.ops  # noqa: F401  (registers torch.ops.vllm.ppu_sparse_attn_indexer)
 import vllm_sail.utils.deep_gemm as _ppu_deep_gemm
 from vllm_sail.patch.bodies import bind_body
+from vllm_sail.patch.enhancement.dsa_indexer_gate import int8_indexer_active
 from vllm_sail.patch.utils import PATCH_MARKER, patch
 from vllm_sail.utils.deep_gemm import is_deep_gemm_supported
 
@@ -337,8 +338,11 @@ def _install_logits_dtype_pin() -> None:
     SM80-class PPUs load ``enhancement.models.kimi_k3_dsa_indexer``, which
     patches both names for its int8 scoring path and accepts arbitrary keyword
     arguments already; a second registration would trip the double-patch guard.
+    The shared gate answers for that patch's *effective* mode: when its int8
+    path is downgraded (an older DeepGEMM without the int8 kernels), the FP8
+    path here is the live one and this pin must stay installed.
     """
-    if current_platform.is_ppu() and not current_platform.supports_fp8():
+    if int8_indexer_active():
         return
     for name, replacement in (
         ("fp8_fp4_mqa_logits", fp8_fp4_mqa_logits_ppu),
