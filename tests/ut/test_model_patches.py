@@ -322,6 +322,7 @@ _EXPECTED_TARGETS = {
     ),
     ("vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner._select_tail_tier"),
     "vllm.models.kimi_k3.nvidia.latent_moe_runner.LatentMoERunner.__init__",
+    "vllm.models.kimi_k3.nvidia.model.KimiMoE.__init__",
     "vllm.models.kimi_k3.nvidia.model.KimiRoutedOutputTransform.forward",
     "vllm.model_executor.models.llama4.Llama4MoE.custom_routing_function",
     "vllm.models.minimax_m3.nvidia.model.MiniMaxM3Model._init_fused_moe_finalize",
@@ -384,6 +385,106 @@ def test_kimi_k3_quantized_up_proj_forces_tier_one(
         LatentMoERunner._select_tail_tier(runner, None, None)
         is LatentTailTier.ALLREDUCE_OVERLAP
     )
+
+
+@pytest.mark.requires_runtime
+def test_kimi_k3_megamoe_owes_shared_reduction_only_without_sequence_parallel(
+    installed_model_patches, monkeypatch
+) -> None:
+    """Only the eager MegaMoE path with TP-sharded shared experts owes a sum."""
+    from types import SimpleNamespace
+
+    from vllm.platforms import current_platform
+
+    from vllm_sail.patch.enhancement.models import kimi_k3 as patch_module
+
+    monkeypatch.setattr(type(current_platform), "is_ppu", lambda self=None: True)
+    # The upstream initializer builds the whole MoE layer; the flag logic below
+    # only needs the attributes it publishes.
+    monkeypatch.setattr(patch_module, "_upstream_moe_init", lambda self, *a, **k: None)
+
+    def flag(**overrides):
+        transform = SimpleNamespace()
+        moe = SimpleNamespace(
+            routed_output_transform=transform,
+            use_mega_moe=True,
+            tp_size=8,
+            use_sequence_parallel=False,
+        )
+        for name, value in overrides.items():
+            setattr(moe, name, value)
+        patch_module.moe_init(moe)
+        return getattr(transform, "_mega_shared_partial", None)
+
+    # Pipeline parallelism disables sequence parallelism, so the shared expert
+    # falls back to a TP-sharded down_proj whose partial nobody sums.
+    assert flag() is True
+    # Sequence parallelism replicates the shared expert: no collective is owed.
+    assert flag(use_sequence_parallel=True) is False
+    # A single TP rank holds the whole expert, so its output is already complete.
+    assert flag(tp_size=1) is False
+    # Every other backend runs the shared expert through a MoERunner tail.
+    assert flag(use_mega_moe=False) is None
+
+
+@pytest.mark.requires_runtime
+def test_kimi_k3_megamoe_sums_shared_partial_before_the_epilogue(
+    installed_model_patches, monkeypatch
+) -> None:
+    """The flagged shared output is all-reduced before the residual epilogue."""
+    from types import SimpleNamespace
+
+    from vllm.models.kimi_k3.nvidia.model import KimiRoutedOutputTransform
+    from vllm.platforms import current_platform
+
+    from vllm_sail.patch.enhancement.models import kimi_k3 as patch_module
+
+    class UpProj:
+        # Anything but UnquantizedLinearMethod takes the layer-GEMM branch, so
+        # the epilogue below runs without touching a real weight.
+        quant_method = object()
+
+        def __call__(self, hidden_states):
+            return hidden_states, None
+
+    class Residual:
+        def __init__(self) -> None:
+            self.added: list[object] = []
+
+        def add_(self, value):
+            self.added.append(value)
+            return self
+
+    reduced = []
+
+    def fake_all_reduce(tensor):
+        reduced.append(tensor)
+        return tensor
+
+    monkeypatch.setattr(
+        patch_module, "tensor_model_parallel_all_reduce", fake_all_reduce
+    )
+    monkeypatch.setattr(type(current_platform), "is_ppu", lambda self=None: True)
+
+    def run(flag):
+        transform = SimpleNamespace(norm=None, up_proj=UpProj())
+        if flag is not None:
+            transform._mega_shared_partial = flag
+        residual = Residual()
+        result = KimiRoutedOutputTransform.forward(transform, "routed", residual)
+        return residual, result
+
+    residual, result = run(True)
+    assert reduced == [residual]
+    assert result is residual
+    assert residual.added == ["routed"]
+
+    for flag in (False, None):
+        reduced.clear()
+        residual, result = run(flag)
+        assert reduced == []
+        assert result is residual
+        assert residual.added == ["routed"]
 
 
 @pytest.mark.requires_runtime

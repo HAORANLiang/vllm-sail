@@ -30,7 +30,8 @@ Modules, and why each is import-on-install like the rest of the framework:
   is rebound by ``bugfix/glm5_next_int8_mla_dequant`` through its ``_CONSUMERS``
   list.
 * ``kimi_k3`` — quantized routed up-projection support for the latent-MoE
-  tail's fused tiers.
+  tail's fused tiers, plus the tensor-parallel sum of the shared-expert partial
+  that the eager MegaMoE path drops when sequence parallelism is off.
 * ``llama4`` — torch.compile on the custom router (+1).
 * ``minimax_m3`` — retain ordinary MoE finalize on PPU before NVIDIA imports.
 * ``minimax_m3_msa`` — route MiniMax M3 indexer + sparse attend to the SAIL
