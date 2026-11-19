@@ -24,6 +24,7 @@ _original_stride = _topk.get_deep_select_stride_requirement
 _original_supported = _topk.is_deep_select_supported
 _original_topk = _topk.deep_select_topk
 _original_resolve = _topk.SparseIndexerTopk.resolve_backend
+_original_takes_bf16 = _topk.SparseIndexerTopk.takes_bf16_logits
 
 
 @patch(
@@ -99,6 +100,26 @@ def deep_select_topk(
 
 @patch(
     _MODULE,
+    "SparseIndexerTopk.takes_bf16_logits",
+    reason=_REASON,
+    affected_versions=_AFFECTED,
+    remove_when=_REMOVE_WHEN,
+)
+def takes_bf16_logits(self, logits, topk_tokens, num_rows) -> bool:
+    # The upstream flags (self._has_deep_select, _HAS_DEEP_SELECT_C) describe
+    # the CUDA C extension and are cached at construction, so on PPU they are
+    # always False: the caller then upcasts the BF16 logits to FP32, which the
+    # SAIL wheel rejects in resolve_backend. Resolve at call time instead.
+    # "auto" is included so PPU prefers DeepSelect without an explicit
+    # --kernel-config; when the wheel or shape does not qualify, upstream's
+    # FP32 chain still runs.
+    if current_platform.is_ppu() and self._backend in ("auto", "deep_select"):
+        return _sail.can_use_deep_select(logits, topk_tokens)
+    return _original_takes_bf16(self, logits, topk_tokens, num_rows)
+
+
+@patch(
+    _MODULE,
     "SparseIndexerTopk.resolve_backend",
     reason=_REASON,
     affected_versions=_AFFECTED,
@@ -152,6 +173,8 @@ def _rebind_consumers():
         (
             (
                 "vllm.model_executor.kernels.attention.dsa.candidate_blocks",
+                "vllm.model_executor.layers.sparse_attn_indexer",
+                "vllm.v1.attention.backends.mla.sparse_indexer",
                 _SPARSE_MODULE,
             ),
             _original_topk,
