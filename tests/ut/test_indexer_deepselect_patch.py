@@ -53,6 +53,9 @@ def installed(modules):
         return "cuda-result"
 
     class Topk:
+        # The patch module snapshots both methods at import; the stub must
+        # provide every upstream attribute it reads.
+        takes_bf16_logits = original
         resolve_backend = original
 
     modules("torch", int32="int32")

@@ -136,15 +136,28 @@ def test_mxfp4_default_is_available_to_both_deepseek_producers(
     assert uses_fp4(config("auto", model_type)) is True
 
 
-@pytest.mark.parametrize("model_type", ["glm5", "glm5_next", "deepseek_v3", "kimi_k3"])
+@pytest.mark.parametrize("model_type", ["glm5", "glm5_next", "deepseek_v3"])
 def test_fixed_fp8_models_do_not_inherit_deepseek_mxfp4_metadata(
     installed_indexer, model_type
 ):
     uses_fp4, _ = installed_indexer(89)
     assert uses_fp4(config("auto", model_type)) is False
     assert uses_fp4(config("fp8", model_type)) is False
-    with pytest.raises(ValueError, match="requires DeepSeek V4 or V4.1"):
+    with pytest.raises(ValueError, match="requires DeepSeek V4/V4.1 or Kimi K3.1"):
         uses_fp4(config("mxfp4", model_type))
+
+
+@pytest.mark.parametrize("model_type", ["kimi_k3", "kimi_k31", "kimi_linear"])
+def test_kimi_models_join_the_mxfp4_default(installed_indexer, model_type):
+    # Kimi K3.1 shares the DSA indexer and quantises its cache through
+    # dsa_cache, so sm_89 defaults it to mxfp4 like the DeepSeek producers;
+    # an explicit fp8 still wins over the default.
+    uses_fp4, _ = installed_indexer(89)
+    assert uses_fp4(config("auto", model_type)) is True
+    assert uses_fp4(config("fp8", model_type)) is False
+    # Kimi models join the DeepSeek producers: an explicit mxfp4 is accepted
+    # on sm_89, not just the auto default.
+    assert uses_fp4(config("mxfp4", model_type)) is True
 
 
 def test_non_ppu_delegates_to_upstream(installed_indexer):

@@ -124,15 +124,21 @@ def test_ppu_deep_gemm_warmup_gate(monkeypatch: pytest.MonkeyPatch, installed) -
 
     assert kw_patch._ppu_deep_gemm_warmup_enabled() is True
 
-    monkeypatch.setenv("VLLM_PPU_MOE_BACKEND", "deepgemm")
+    # The gate reads the canonical VLLM_SAIL_* names, which take precedence
+    # over their VLLM_PPU_* aliases — a host that exports the canonical names
+    # (e.g. a serving env) must not leak into these assertions.
+    monkeypatch.delenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", raising=False)
+    monkeypatch.delenv("VLLM_PPU_DENSE_BF16_DEEPGEMM", raising=False)
+
+    monkeypatch.setenv("VLLM_SAIL_MOE_BACKEND", "deepgemm")
     assert kw_patch._ppu_deep_gemm_warmup_enabled() is True
 
-    monkeypatch.setenv("VLLM_PPU_MOE_BACKEND", "acext")
-    monkeypatch.setenv("VLLM_PPU_DENSE_BACKEND", "acext")
+    monkeypatch.setenv("VLLM_SAIL_MOE_BACKEND", "acext")
+    monkeypatch.setenv("VLLM_SAIL_DENSE_BACKEND", "acext")
     assert kw_patch._ppu_deep_gemm_warmup_enabled() is False
 
     # Either selector allowing DeepGEMM is enough.
-    monkeypatch.setenv("VLLM_PPU_DENSE_BACKEND", "deepgemm")
+    monkeypatch.setenv("VLLM_SAIL_DENSE_BACKEND", "deepgemm")
     assert kw_patch._ppu_deep_gemm_warmup_enabled() is True
 
 
