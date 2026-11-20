@@ -28,6 +28,8 @@
 #   reason      why this entry is direct|adapted (audited on every bump)
 #   min_tests   minimum number of upstream test cases that must be collected;
 #               guards against a silently-empty run after an upstream refactor
+#   hub_repos   optional list of Hub repo IDs required by the selected tests;
+#               only declared repos are checked before offline execution
 #   # --- optional adaptation knobs (mode = "adapted" only) ---
 #   markers     pytest -m expression narrowing the run
 #   keywords    pytest -k expression narrowing the run
@@ -158,15 +160,6 @@ reason = "v1 scheduler output dataclasses; pure CPU structures."
 min_tests = 1
 
 [[entry]]
-id = "spec_decode_ngram"
-path = "tests/v1/spec_decode/test_ngram.py"
-mode = "direct"
-chips = ["cpu", "810e", "890p"]
-category = "spec_decode"
-reason = "ngram proposer is pure-CPU matching logic (analysis: near-L1 subset of spec_decode)."
-min_tests = 1
-
-[[entry]]
 id = "logits_processor_loader"
 path = "tests/v1/logits_processors/test_loader.py"
 mode = "direct"
@@ -184,14 +177,10 @@ category = "tokenization"
 reason = "Incremental detokenize / stop-string scanning; pure CPU text logic."
 min_tests = 1
 
-[[entry]]
-id = "v1_sample_sampler"
-path = "tests/v1/sample/test_sampler.py"
-mode = "direct"
-chips = ["cpu", "810e", "890p"]
-category = "sample"
-reason = "Sampler applies top-k/top-p/penalties on current_platform.device_type; runs verbatim on CPU and on PPU (cuda-disguised), no narrowing required."
-min_tests = 1
+# spec_decode_ngram (tests/v1/spec_decode/test_ngram.py) and v1_sample_sampler
+# (tests/v1/sample/test_sampler.py) were deleted upstream by aac1b2a4f
+# "[Core] Remove Model Runner V1 (#63373)", which is inside the v0.34 pin;
+# their coverage moved to device-only files with no direct CPU replacement.
 
 # ---------------------------------------------------------------------------
 # L2 少量适配 -- skeleton reusable, but the file mixes CPU logic with
@@ -206,9 +195,13 @@ path = "tests/test_pooling_params.py"
 mode = "adapted"
 chips = ["cpu", "810e", "890p"]
 category = "params"
-reason = "PoolingParams validation excluding the Snowflake embedding-dimension case; its offline model configuration is not provisioned."
-deselect = ["tests/test_pooling_params.py::test_embed_dimensions[model_info1]"]
-min_tests = 40
+reason = "PoolingParams validation excluding the two embedding-dimension cases that require Hugging Face model configuration."
+deselect = [
+    "tests/test_pooling_params.py::test_embed_dimensions[model_info0]",
+    "tests/test_pooling_params.py::test_embed_dimensions[model_info1]",
+]
+hub_repos = []
+min_tests = 39
 
 [[entry]]
 id = "prefix_caching"
