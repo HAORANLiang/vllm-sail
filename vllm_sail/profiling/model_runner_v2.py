@@ -34,6 +34,8 @@ consume iteration numbers.
 
 from __future__ import annotations
 
+import functools
+
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_sail.patch.utils import patch
@@ -94,6 +96,7 @@ def sample(self, hidden_states, *args, **kwargs):
 @patch(
     _UPSTREAM_MODULE,
     "GPUModelRunner.execute_model",
+    allow_wrapping=True,
     reason=(
         "[profiling, opt-in] Wraps one V2 worker iteration in the fork's "
         "`[prof_range]: iter N` range, the `total bs=..., P bs=...` range, the "
@@ -103,6 +106,7 @@ def sample(self, hidden_states, *args, **kwargs):
     affected_versions=_AFFECTED,
     remove_when=_REMOVE_WHEN,
 )
+@functools.wraps(_upstream_execute_model)
 def execute_model(
     self,
     scheduler_output,

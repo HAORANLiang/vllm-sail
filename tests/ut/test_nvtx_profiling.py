@@ -223,23 +223,36 @@ def profiling_pkg(fake_vllm: SimpleNamespace, monkeypatch: pytest.MonkeyPatch):
     return module
 
 
-@pytest.fixture
+@pytest.fixture(params=[False, True], ids=["plain", "dp-scope-first"])
 def installed(
     profiling_pkg,
     nvtx_stub: dict[str, list],
     monkeypatch: pytest.MonkeyPatch,
     fake_vllm: SimpleNamespace,
+    request: pytest.FixtureRequest,
 ):
     """Run install() with the gate on and return the faked targets."""
     monkeypatch.setenv("VLLM_PPU_NVTX_PROFILE", "1")
-    registry_before = len(PATCH_REGISTRY)
-    profiling_pkg.install()
-    return SimpleNamespace(
-        pkg=profiling_pkg,
-        fakes=fake_vllm,
-        nvtx_calls=nvtx_stub,
-        registry_before=registry_before,
-    )
+    saved_registry = PATCH_REGISTRY[:]
+    PATCH_REGISTRY.clear()
+    try:
+        if request.param:
+            from vllm_sail.patch.bugfix import dp_idle_mtp_dummy_batch
+
+            dp_idle_mtp_dummy_batch._install_execute_model_scope()
+            fake_vllm.originals["gpu.model_runner.GPUModelRunner.execute_model"] = (
+                fake_vllm.GPUModelRunnerV2.execute_model
+            )
+        registry_before = len(PATCH_REGISTRY)
+        profiling_pkg.install()
+        yield SimpleNamespace(
+            pkg=profiling_pkg,
+            fakes=fake_vllm,
+            nvtx_calls=nvtx_stub,
+            registry_before=registry_before,
+        )
+    finally:
+        PATCH_REGISTRY[:] = saved_registry
 
 
 def _records_for(targets) -> dict[str, Any]:
