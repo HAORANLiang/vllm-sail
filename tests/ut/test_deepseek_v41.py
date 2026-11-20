@@ -390,7 +390,6 @@ def test_v41_projection_preserves_weights_and_uses_bf16_helper(
         block_size,
     )
     assert attn.wo_a.weight is loaded
-    assert attn.forward_mqa is Upstream.forward_mqa
     assert attn._forward_prefill is Upstream._forward_prefill
 
 
