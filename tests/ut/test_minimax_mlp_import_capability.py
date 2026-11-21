@@ -229,9 +229,33 @@ def test_registered_mlp_forwards_sequence_parallel_arguments(
     assert bound == [mlp.down_proj]
 
 
+@pytest.mark.upstream_source
+def test_channelwise_qkv_skips_nvidia_provider_import(
+    modules, monkeypatch, upstream_source_root
+):
+    provider = load_model(modules, monkeypatch, upstream_source_root, True)
+    name = "vllm.model_executor.kernels.linear.mxfp8.flashinfer"
+
+    class Forbidden(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == name:
+                raise ModuleNotFoundError("NVIDIA MXFP8 provider", name="flashinfer")
+
+    modules("vllm.model_executor.kernels.linear.mxfp8")
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Forbidden(), *sys.meta_path])
+    # The pin imports this provider before it looks at either the chip or weight.
+    with pytest.raises(ModuleNotFoundError, match="NVIDIA MXFP8"):
+        provider._supports_qkv_fused_epilogue(object())
+    load_patch("vllm_sail/patch/enhancement/models/minimax_m3.py")
+    assert provider._supports_qkv_fused_epilogue(object()) is False
+
+
 @pytest.mark.parametrize("ppu", [False, True])
 @pytest.mark.parametrize("sp,gemm_rs", [(False, False), (True, False), (True, True)])
-def test_copied_mlp_body_tracks_upstream_constructor_contract(modules, ppu, sp, gemm_rs):
+def test_copied_mlp_body_tracks_upstream_constructor_contract(
+    modules, ppu, sp, gemm_rs
+):
     acts, bound = [], []
     linears = {}
 
