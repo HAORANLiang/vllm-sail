@@ -243,8 +243,10 @@ _LOGITS_PIN_REASON = (
     "FP32, while SAIL's MXFP4 kernels emit BF16 only (and reject an unsupported "
     "requested dtype). Pin BF16 for PPU's packed-FP4 queries, whose Q reaches "
     "the kernel as int8 values with int32 scales, and let upstream's "
-    "``as_fp32_logits`` upcast when its own path needs FP32; FP8 queries "
-    "(q_scale folded into FP32 weights) keep the upstream call."
+    "``as_fp32_logits`` upcast when its own path needs FP32. Legacy FP8 "
+    "queries (indexer_kv_dtype=\"fp8\"; Q is float8_e4m3fn with q_scale "
+    "folded into FP32 weights) dispatch to SAIL's FP8 kernels, which keep "
+    "FP32 weights and emit FP32 logits."
 )
 _LOGITS_PIN_REMOVE_WHEN = (
     "SAIL's MXFP4 logits emit FP32, or upstream resolves the logits dtype "
@@ -273,8 +275,19 @@ def fp8_fp4_mqa_logits_ppu(
         )
     # Q reaches the kernel either as int8-packed FP4 values with int32 scales
     # or as FP8 values with per-token scales folded into FP32 weights
-    # (q_scale=None). SAIL's wrapper accepts both and emits BF16 logits only,
-    # so the producer weights must be BF16 too.
+    # (q_scale=None). MXFP4 requires BF16 producer weights and emits BF16
+    # logits; the FP8 kernel keeps FP32 weights and emits FP32 logits.
+    q_values = q[0] if isinstance(q, tuple) else q
+    if q_values.dtype != torch.int8:
+        return _ppu_deep_gemm.fp8_mqa_logits(
+            q_values,
+            kv,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            clean_logits=False,
+            max_seqlen_k=max_seqlen_k if max_seqlen_k else 0,
+        )
     if weights.dtype != torch.bfloat16:
         weights = weights.to(torch.bfloat16)
     return _ppu_deep_gemm.fp8_fp4_mqa_logits(
@@ -311,6 +324,21 @@ def fp8_fp4_paged_mqa_logits_ppu(
             max_model_len,
             logits_dtype=logits_dtype,
             indices=indices,
+        )
+    q_values = q[0] if isinstance(q, tuple) else q
+    if q_values.dtype != torch.int8:
+        # Legacy FP8 Q: SAIL's FP8 paged kernel keeps FP32 weights, ignores
+        # request indices (the metadata builder already drops them), and
+        # emits FP32 logits.
+        return _ppu_deep_gemm.fp8_paged_mqa_logits(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+            clean_logits=False,
         )
     if weights.dtype != torch.bfloat16:
         weights = weights.to(torch.bfloat16)

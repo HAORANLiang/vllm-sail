@@ -152,6 +152,18 @@ def test_device_predicate_calls_bind_all_required_arguments(name):
             "models/kimi_k3/nvidia/kda",
             "is_fused_kda_decode_supported",
         ),
+        (
+            "attention/kda",
+            "_recoverssm_verify",
+            "models/kimi_k3/nvidia/kda",
+            "KimiK3DeltaAttention._recoverssm_verify",
+        ),
+        (
+            "attention/kda",
+            "_create_recoverssm_context",
+            "models/kimi_k3/nvidia/ops/recoverssm",
+            "KDARecoverSSMCommitContext.create",
+        ),
     ],
 )
 def test_replacements_accept_upstream_keywords(
