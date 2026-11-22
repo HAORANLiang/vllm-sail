@@ -5,9 +5,10 @@
 # Every entry points at a test file in the PINNED upstream checkout (resolved
 # from .github/vllm-main-verified.commit at CI time, or $VLLM_SOURCE_ROOT
 # locally). Paths are relative to the upstream repo root (the directory that
-# contains vllm/__init__.py). The whitelist is seeded from
-# outputs/02_可复用测试分析.html -- high-confidence L1 (直接可用) entries first,
-# plus a few L2 (少量适配) entries whose CPU-runnable core is worth gating.
+# contains vllm/__init__.py). The whitelist is seeded from the reusable
+# upstream-test analysis report -- high-confidence L1 (directly reusable)
+# entries first, plus a few L2 (minor adaptation) entries whose CPU-runnable
+# core is worth gating.
 #
 # vllm-sail disguises its PPU platform as CUDA (PPUPlatform._enum =
 # PlatformEnum.CUDA, current_platform.is_cuda() is True), so upstream tests
@@ -47,7 +48,7 @@ upstream_pin_file = ".github/vllm-main-verified.commit"
 description = "Whitelist of upstream vLLM tests reused inside the vllm-sail runtime."
 
 # ---------------------------------------------------------------------------
-# L1 直接可用 -- pure data-structure / parameter / config logic. No hardware
+# L1 directly reusable -- pure data-structure / parameter / config logic. No hardware
 # SDK, no kernel numerics. Zero edits; run verbatim on CPU and on PPU.
 # ---------------------------------------------------------------------------
 
@@ -84,7 +85,7 @@ path = "tests/test_sampling_params.py"
 mode = "direct"
 chips = ["cpu", "810e", "890p"]
 category = "params"
-reason = "SamplingParams validation/defaults; pure CPU. Fast切分 of sampling-vs-logits regressions."
+reason = "SamplingParams validation/defaults; pure CPU. Fast isolation of sampling-vs-logits regressions."
 min_tests = 1
 
 [[entry]]
@@ -183,7 +184,7 @@ min_tests = 1
 # their coverage moved to device-only files with no direct CPU replacement.
 
 # ---------------------------------------------------------------------------
-# L2 少量适配 -- skeleton reusable, but the file mixes CPU logic with
+# L2 minor adaptation -- skeleton reusable, but the file mixes CPU logic with
 # device / distributed / network nodes. test_reuse_adapted.py narrows the run
 # (markers / -k / deselect / env) and records known xfails. Upstream source is
 # NEVER edited; all adaptation lives in the harness + adapted test module.

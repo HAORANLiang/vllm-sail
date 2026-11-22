@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
+from copy import deepcopy
 
 import pytest
 
@@ -14,6 +16,7 @@ from tests.support.patch_inventory import (
     scan_patch_file,
     scan_patches,
 )
+from tests.support.source import function
 from tests.support.upstream import (
     FUNC_NODES,
     PATCH_ROOT,
@@ -240,6 +243,30 @@ def target_problems(root, hooks):
                 # The generated dataclass API has its own source dependency
                 # checks and real constructor/replace/merge behavior tests.
                 continue
+            if hook.target == "vllm.models.step5.nvidia.mega_moe.Step5MegaMoE":
+                constructor = next(
+                    (
+                        node
+                        for node in getattr(resolved.node, "body", [])
+                        if isinstance(node, FUNC_NODES) and node.name == "__init__"
+                    ),
+                    None,
+                )
+                if constructor is None:
+                    failures.append(f"{hook.target}: missing explicit constructor")
+                    continue
+                constructor = deepcopy(constructor)
+                if not constructor.args.args or constructor.args.args[0].arg != "self":
+                    failures.append(f"{hook.target}: unresolved constructor receiver")
+                    continue
+                constructor.args.args.pop(0)
+                # The full constructor contract covers **expert_kwargs;
+                # forwarding behavior is verified by the MegaMoE UT.
+                failures.extend(
+                    f"{hook.target}: {problem}"
+                    for problem in compatibility_problems(hook.node, constructor)
+                )
+                continue
             if consumers is None:
                 consumers = imported_consumer_calls(root)
             failures.extend(
@@ -293,6 +320,87 @@ def test_discovery_to_source_gate_rejects_real_contract_faults(tmp_path, fault):
         assert name in " ".join(problems)
 
 
+@pytest.mark.parametrize(
+    "declaration,call",
+    [
+        ("from vllm_sail.factories import wrap as factory", "factory"),
+        ("from vllm_sail import factories as wrappers", "wrappers.wrap"),
+        ("import vllm_sail.factories as wrappers", "wrappers.wrap"),
+    ],
+)
+@pytest.mark.parametrize("valid", [False, True])
+def test_imported_wrapper_factory_keeps_the_returned_callable_contract(
+    tmp_path, monkeypatch, declaration, call, valid
+):
+    """Resolve a literal-loop replacement without importing its factory module."""
+    monkeypatch.setattr("tests.support.patch_inventory.ROOT", tmp_path)
+    upstream = tmp_path / "vllm/provider.py"
+    upstream.parent.mkdir()
+    upstream.write_text("def run(a, *, used=None): pass\n")
+    factory = tmp_path / "vllm_sail/factories.py"
+    factory.parent.mkdir()
+    parameters = "a, *, used=None" if valid else "a"
+    factory.write_text(
+        'raise AssertionError("Factory modules must not be imported")\n'
+        "def wrap(original):\n"
+        '    """Return a source-visible wrapper."""\n'
+        f"    def replacement({parameters}): pass\n"
+        "    return replacement\n"
+    )
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text(
+        declaration + "\n"
+        f'for name, replacement in (("run", {call}(original)),):\n'
+        '    patch("vllm.provider", name)(replacement)\n'
+    )
+    hooks, unresolved = scan_patch_file(plugin)
+    assert not unresolved and len(hooks) == 1
+    assert isinstance(hooks[0].node, ast.FunctionDef)
+    problems = target_problems(tmp_path, hooks)
+    assert bool(problems) is (not valid), problems
+    if not valid:
+        assert any("used" in problem for problem in problems)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "external-module",
+        "conditional-return",
+        "rebound-return",
+        "opaque-return",
+        "shadowed-factory",
+    ],
+)
+def test_imported_wrapper_factory_unknowns_still_fail_closed(
+    tmp_path, monkeypatch, fault
+):
+    monkeypatch.setattr("tests.support.patch_inventory.ROOT", tmp_path)
+    upstream = tmp_path / "vllm/provider.py"
+    upstream.parent.mkdir()
+    upstream.write_text("def run(a): pass\n")
+    package = "external_library" if fault == "external-module" else "vllm_sail"
+    factory = tmp_path / package / "factories.py"
+    factory.parent.mkdir()
+    ending = {
+        "conditional-return": "    if enabled:\n        return other\n    return replacement\n",
+        "rebound-return": "    replacement = other\n    return replacement\n",
+        "opaque-return": "    return choose(replacement)\n",
+    }.get(fault, "    return replacement\n")
+    factory.write_text("def wrap(original):\n    def replacement(a): pass\n" + ending)
+    body = 'patch("vllm.provider", "run")(wrappers.wrap(original))\n'
+    if fault == "shadowed-factory":
+        body = "def install(wrappers):\n    " + body
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text(f"from {package} import factories as wrappers\n" + body)
+    hooks, unresolved = scan_patch_file(plugin)
+    assert not unresolved and len(hooks) == 1
+    assert any(
+        "unresolved callable replacement" in problem
+        for problem in target_problems(tmp_path, hooks)
+    )
+
+
 def test_discovery_covers_supported_forms_and_reports_unknowns(tmp_path):
     plugin = tmp_path / "plugin.py"
     plugin.write_text("""
@@ -321,6 +429,44 @@ patch(dynamic_module(), "unsupported")(method)
         "vllm.example.two",
     }
     assert len(unresolved) == 1 and "dynamic_module()" in unresolved[0].expression
+
+
+@pytest.mark.parametrize("import_style", ["direct", "module"])
+@pytest.mark.parametrize("fault", [None, "missing-keyword", "dynamic-return"])
+def test_imported_factory_checks_returned_callable_without_importing(
+    tmp_path, monkeypatch, import_style, fault
+):
+    from tests.support import patch_inventory
+
+    monkeypatch.setattr(patch_inventory, "ROOT", tmp_path)
+    package = tmp_path / "vllm_sail"
+    package.mkdir()
+    parameters = "a" if fault == "missing-keyword" else "a, *, used=None"
+    returned = "choose(wrapper)" if fault == "dynamic-return" else "wrapper"
+    (package / "factory.py").write_text(
+        'raise RuntimeError("must not import")\n'
+        "def wrap(original):\n"
+        f"    def wrapper({parameters}): pass\n"
+        f"    return {returned}\n"
+    )
+    upstream = tmp_path / "vllm"
+    upstream.mkdir()
+    (upstream / "example.py").write_text("def run(a, *, used=None): pass\n")
+    imported, invoke = (
+        ("from vllm_sail.factory import wrap as factory", "factory")
+        if import_style == "direct"
+        else ("from vllm_sail import factory", "factory.wrap")
+    )
+    plugin = tmp_path / "plugin.py"
+    plugin.write_text(f'{imported}\npatch("vllm.example", "run")({invoke}(original))\n')
+    hooks, unresolved = scan_patch_file(plugin)
+    assert not unresolved and len(hooks) == 1
+    problems = target_problems(tmp_path, hooks)
+    assert bool(problems) is (fault is not None), problems
+    if fault == "dynamic-return":
+        assert "unresolved callable replacement" in " ".join(problems)
+    elif fault == "missing-keyword":
+        assert "used" in " ".join(problems)
 
 
 def test_discovery_reports_dictionary_unpack_instead_of_partial_success(tmp_path):
@@ -597,6 +743,57 @@ def test_flashmla_signature_fault_is_rejected_with_optional_source_missing(
     assert problems and any(target in problem for problem in problems)
 
 
+@pytest.mark.upstream_source
+@pytest.mark.parametrize(
+    "signature", ["", "vllm_config", "vllm_config, *, required, **kwargs"]
+)
+def test_step5_factory_contract_rejects_broken_bindings(
+    upstream_source_root, signature
+):
+    """Missing or new required params must fail even with **expert_kwargs calls."""
+    hooks, unresolved = scan_patch_file(PATCH_ROOT / "enhancement/mega_moe.py")
+    assert not unresolved
+    target = "vllm.models.step5.nvidia.mega_moe.Step5MegaMoE"
+    hook = next(hook for hook in hooks if hook.target == target)
+    assert not target_problems(upstream_source_root, [hook])
+    broken = hook._replace(node=_function(f"def replacement({signature}): pass"))
+    assert target_problems(upstream_source_root, [broken])
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_step5_pack_wrapper_accepts_upstream_keyword_arguments(active):
+    """functools.wraps must not hide incompatible runtime keyword binding."""
+    calls = []
+    values = tuple(object() for _ in range(4))
+
+    def original(self, mean, block_table, regions):
+        calls.append("original")
+        assert (self, mean, block_table, regions) == values
+        return "packed"
+
+    class Context:
+        def get(self):
+            return self if active else None
+
+        def pack(self, callback, *args):
+            calls.append("context")
+            return callback(*args)
+
+    factory = function(
+        "vllm_sail/models/step5/ops/score_pipeline.py",
+        "wrap_layer_pack",
+        {"functools": functools, "_LAYER_CONTEXT": Context()},
+    )
+    wrapped = factory(original)
+    assert (
+        wrapped(
+            self=values[0], mean=values[1], block_table=values[2], regions=values[3]
+        )
+        == "packed"
+    )
+    assert calls == (["context", "original"] if active else ["original"])
+
+
 def test_unconditional_dangling_import_cannot_be_repaired_by_later_assignment(tmp_path):
     package = tmp_path / "vllm"
     package.mkdir()
@@ -687,6 +884,35 @@ def test_every_unresolved_installation_has_a_feature_contract():
                 f"f'{{cls.__name__}}.{method}'",
             )
             for method in ("__init__", "__eq__", "__hash__")
+        ),
+        # Step5 kernel/launcher rebinding through one metadata helper; the
+        # targets and fallbacks are exercised in test_model_patches.py and
+        # test_step5_score_pipeline.py.
+        (
+            "patch/enhancement/models/step5_indexer_fp16.py",
+            "_install",
+            "module",
+            "name",
+        ),
+        ("patch/enhancement/models/step5_soft_fp8.py", "_install", "module", "name"),
+        # Loaded consumer aliases of sparse_decode_attention; covered by
+        # test_step5_dsa_native.py::test_decode_bound_aliases.
+        (
+            "patch/performance/step5_dsa_prefill.py",
+            "_install_native_decode",
+            "name",
+            "attr",
+        ),
+        # Sparse providers, consumer aliases, owned targets and idempotency
+        # are covered by test_nvtx_profiling.py, including pinned JIT signatures.
+        ("profiling/step5_sparse.py", "_install_one", "module_name", "attribute"),
+        # V1/V2 runner module paths come from the caller's literal loop;
+        # covered by test_layerwise_nvtx.py.
+        (
+            "profiling/layerwise.py",
+            "_install_v2_dummy_run",
+            "module_path",
+            "'GPUModelRunner._dummy_run'",
         ),
     }
     for site in unresolved:

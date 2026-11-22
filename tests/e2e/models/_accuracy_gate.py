@@ -198,9 +198,9 @@ def check_golden_identity(
     if golden_tail is not None and golden_tail != checkpoint_tail:
         return (
             False,
-            f"golden checkpoint mismatch: golden 来自 "
-            f"{golden_tail!r}，本次运行 {checkpoint_tail!r}；"
-            "基准与 checkpoint 不匹配",
+            f"golden checkpoint mismatch: golden was recorded from "
+            f"{golden_tail!r} but this run uses {checkpoint_tail!r}; "
+            "golden and checkpoint identities do not match",
         )
     golden_bench = golden.get("benchmark")
     if golden_bench is not None and golden_bench != benchmark:

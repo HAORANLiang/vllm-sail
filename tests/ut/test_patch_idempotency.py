@@ -37,7 +37,9 @@ from uuid import uuid4
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from vllm_sail import envs
+
+REPO_ROOT = Path(envs.__file__).resolve().parents[1]
 PATCH_INIT = REPO_ROOT / "vllm_sail" / "patch" / "__init__.py"
 PACKAGE_INIT = REPO_ROOT / "vllm_sail" / "__init__.py"
 
@@ -231,11 +233,17 @@ def _register_stubs(monkeypatch: pytest.MonkeyPatch, counter: Counter[str]) -> N
         "vllm_sail.ops": _stub("vllm_sail.ops"),
         "vllm_sail.registry": _stub("vllm_sail.registry", register=bump("registry")),
         "vllm_sail.profiling": _stub("vllm_sail.profiling", install=bump("profiling")),
+        "vllm_sail.profiling.layerwise": _stub(
+            "vllm_sail.profiling.layerwise", install=bump("layerwise")
+        ),
         "vllm_sail.models": _stub("vllm_sail.models", register_model=bump("models")),
     }
     for name, module in stubs.items():
         monkeypatch.setitem(sys.modules, name, module)
-        monkeypatch.setattr(vllm_sail, name.rpartition(".")[2], module, raising=False)
+        parent, _, child = name.rpartition(".")
+        monkeypatch.setattr(
+            sys.modules.get(parent, vllm_sail), child, module, raising=False
+        )
 
 
 def test_register_out_of_tree_runs_each_phase_once(
@@ -261,6 +269,7 @@ def test_register_out_of_tree_runs_each_phase_once(
         assert counter["patch"] == 1
         assert counter["registry"] == 1
         assert counter["profiling"] == 1
+        assert counter["layerwise"] == 1
         assert counter["models"] == 1
         assert counter["compat"] == 3
 

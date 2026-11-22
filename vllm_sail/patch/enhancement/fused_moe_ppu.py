@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """PPU hunks in the generic fused-MoE plumbing.
 
-Four small fork deltas that no other patch covers:
+Five small fork deltas that no other patch covers:
 
 * ``fused_moe/config.py``: ``_get_config_dtype_str`` gains ``use_int8_w8a8``
   (tuned-config name ``"int8_w8a8"``) and ``int8_w8a8_moe_quant_config``
@@ -14,6 +14,9 @@ Four small fork deltas that no other patch covers:
 * ``fused_moe/experts/triton_moe.py``: ``TritonExperts.moe_sum`` uses the
   PPU Triton reduction above 1024 tokens. Per-direction tuning lives in
   ``enhancement/triton_moe.py``.
+* ``fused_moe/prepare_finalize/naive_dp_ep.py``: the PPU MXFP4 packed scale
+  crosses the DP/EP gather as token-contiguous uint8 bytes and is restored to
+  its column-major uint16 layout afterwards.
 
 All patches delegate to upstream; only the PPU-specific case is intercepted.
 Leaf-style module (like ``patch/enhancement/residual/``): importable on a bare
@@ -33,6 +36,7 @@ _CONFIG_MODULE = "vllm.model_executor.layers.fused_moe.config"
 _INT8_ORACLE_MODULE = "vllm.model_executor.layers.fused_moe.oracle.int8"
 _UTILS_MODULE = "vllm.model_executor.layers.fused_moe.utils"
 _TRITON_MODULE = "vllm.model_executor.layers.fused_moe.experts.triton_moe"
+_NAIVE_DP_EP_MODULE = "vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep"
 # By-value imports present in vLLM 0.30. Keep this inventory checked against
 # upstream source; importing optional EP backends here would load their SDKs.
 _QUANTIZE_INPUT_CONSUMERS = tuple(
@@ -73,6 +77,15 @@ REASON_MXFP4_QUANTIZE = (
 REASON_MOE_SUM = (
     "The fork switches TritonExperts.moe_sum to a Triton reduction for more "
     "than 1024 tokens on PPU; upstream's C++ moe_sum is the slow path there."
+)
+REASON_MXFP4_DISPATCH = (
+    "The PPU MXFP4 packed scale is a column-major uint16 tensor that PyNCCL "
+    "cannot gather as-is; it must be sent as token-contiguous uint8 bytes and "
+    "restored to column-major after the gather."
+)
+REMOVE_WHEN_MXFP4_DISPATCH = (
+    "upstream NaiveDPEP gathers the PPU MXFP4 packed scale losslessly and "
+    "restores its layout itself."
 )
 REMOVE_WHEN_DTYPE_STR = "upstream adds use_int8_w8a8 to _get_config_dtype_str itself."
 REMOVE_WHEN_INT8_CONFIG = (
@@ -118,6 +131,18 @@ METADATA = (
         REASON_MOE_SUM,
         AFFECTED_VERSIONS,
         REMOVE_WHEN_MOE_SUM,
+    ),
+    (
+        f"{_NAIVE_DP_EP_MODULE}._quantize_and_setup_dispatch",
+        REASON_MXFP4_DISPATCH,
+        AFFECTED_VERSIONS,
+        REMOVE_WHEN_MXFP4_DISPATCH,
+    ),
+    (
+        f"{_NAIVE_DP_EP_MODULE}._unwrap_scale_and_prepare_for_moe",
+        REASON_MXFP4_DISPATCH,
+        AFFECTED_VERSIONS,
+        REMOVE_WHEN_MXFP4_DISPATCH,
     ),
 )
 
@@ -285,6 +310,73 @@ def install() -> None:
     _rebind_loaded_quantize_input_aliases(
         _upstream_quantize_input, _moe_kernel_quantize_input
     )
+
+    # Import only after the quantizer provider is patched, so this consumer
+    # never binds the upstream quantize function.
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+    _upstream_setup_dispatch = naive_dp_ep._quantize_and_setup_dispatch
+    _upstream_unwrap_scale = naive_dp_ep._unwrap_scale_and_prepare_for_moe
+
+    @patch(
+        _NAIVE_DP_EP_MODULE,
+        "_quantize_and_setup_dispatch",
+        reason=REASON_MXFP4_DISPATCH,
+        affected_versions=AFFECTED_VERSIONS,
+        remove_when=REMOVE_WHEN_MXFP4_DISPATCH,
+    )
+    def _quantize_and_setup_dispatch(a1, quant_config, defer_input_quant=False):
+        import torch
+
+        from vllm.platforms import current_platform
+
+        a1q, scales, original_scale = _upstream_setup_dispatch(
+            a1, quant_config, defer_input_quant
+        )
+        if (
+            current_platform.is_ppu()
+            and quant_config.quant_dtype == "mxfp4"
+            and scales is not None
+            and len(scales) == 1
+            and scales[0].dtype == torch.uint16
+            and scales[0].ndim == 2
+        ):
+            scale = scales[0]
+            # Each token's packed bytes are contiguous; the trailing dim of 2
+            # tags the wire format, and all_gatherv keeps trailing shapes, so
+            # no global state or extra collective is needed. contiguous() on
+            # an empty slice may keep the last-dim stride: flatten, then view.
+            wire_scale = scale.contiguous().reshape(-1).view(torch.uint8)
+            scales = [wire_scale.reshape(scale.shape[0], scale.shape[1], 2)]
+        return a1q, scales, original_scale
+
+    @patch(
+        _NAIVE_DP_EP_MODULE,
+        "_unwrap_scale_and_prepare_for_moe",
+        reason=REASON_MXFP4_DISPATCH,
+        affected_versions=AFFECTED_VERSIONS,
+        remove_when=REMOVE_WHEN_MXFP4_DISPATCH,
+    )
+    def _unwrap_scale_and_prepare_for_moe(scales, quant_config):
+        import torch
+
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_ppu()
+            and quant_config.quant_dtype == "mxfp4"
+            and scales is not None
+            and len(scales) == 1
+            and scales[0].dtype == torch.uint8
+            and scales[0].ndim == 3
+            and scales[0].shape[-1] == 2
+        ):
+            # A plain 2-D UINT8_ROW_MAJOR scale never takes this branch.
+            wire_scale = scales[0]
+            packed = wire_scale.contiguous().reshape(-1).view(torch.uint16)
+            packed = packed.reshape(wire_scale.shape[0], wire_scale.shape[1])
+            return packed.t().contiguous().t()
+        return _upstream_unwrap_scale(scales, quant_config)
 
     @patch(
         _TRITON_MODULE,

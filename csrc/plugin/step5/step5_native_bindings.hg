@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "step5_native_checks.h"
+#include "step5_native_decode.cuh"
+
+#define DECLARE_PREFILL(NS) \
+namespace NS { \
+void run(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, \
+         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, \
+         const at::Tensor&, int64_t, double, int64_t); \
+}
+DECLARE_PREFILL(step5_native_prefill_h8)
+DECLARE_PREFILL(step5_native_prefill_h16)
+#undef DECLARE_PREFILL
+
+namespace step5_native_bindings {
+void prefill(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions,
+    const at::Tensor& table, const at::Tensor& owners, const at::Tensor& pos,
+    const at::Tensor& tiles, const at::Tensor& out, int64_t logical_regions,
+    double scale, int64_t query_tile) {
+  step5_native_checks::prefill(q, cache, regions, table, owners, pos, tiles, out,
+                              logical_regions, scale, query_tile);
+  const auto starts = tiles.select(0, 0), ends = tiles.select(0, 1);
+  auto run = q.size(1) == 8 ? step5_native_prefill_h8::run : step5_native_prefill_h16::run;
+  run(q, cache, regions, table, owners, pos, starts, ends, out, logical_regions, scale, query_tile);
+}
+void decode(const at::Tensor& q, const at::Tensor& cache, const at::Tensor& regions,
+    const at::Tensor& table, const at::Tensor& pos, const at::Tensor& active,
+    const at::Tensor& out, double scale, int64_t query_len, bool clear_inactive,
+    const std::optional<at::Tensor>& gate) {
+  step5_native_checks::decode(q, cache, regions, table, pos, active, out, gate, query_len, scale);
+  step5_native_decode::run(q, cache, regions, table, pos, active, out, gate, query_len, clear_inactive, scale);
+}
+}
+TORCH_LIBRARY_FRAGMENT(_ppu_C, m) {
+  m.def("step5_dsa_native_prefill(Tensor query, Tensor cache, Tensor regions, Tensor table, "
+        "Tensor owners, Tensor positions, Tensor tiles, Tensor(a!) output, int logical_regions, "
+        "float scale, int query_tile=0) -> ()");
+  m.def("step5_dsa_native_decode(Tensor query, Tensor cache, Tensor regions, Tensor table, "
+        "Tensor positions, Tensor active, Tensor(a!) output, float scale, int query_len=1, "
+        "bool clear_inactive=True, Tensor? gate=None) -> ()");
+}
+TORCH_LIBRARY_IMPL(_ppu_C, CUDA, m) {
+  m.impl("step5_dsa_native_prefill", &step5_native_bindings::prefill);
+  m.impl("step5_dsa_native_decode", &step5_native_bindings::decode);
+}

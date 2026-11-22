@@ -6,6 +6,238 @@ import pytest
 pytestmark = [pytest.mark.ppu, pytest.mark.cap89]
 
 
+@pytest.mark.parametrize("mode", ["fp4xfp4", "fp8xfp4"])
+@pytest.mark.parametrize("tokens", [0, 3, 17])
+def test_step5_mxfp4_swiglu_step_kernel_and_padding(
+    monkeypatch, tmp_path, mode, tokens
+):
+    """Raw MXFP4 weights, Step activations and routing weights keep kernel semantics."""
+    from types import SimpleNamespace
+
+    import torch
+    import torch.distributed as dist
+
+    import vllm_sail
+
+    vllm_sail.register_out_of_tree()
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+
+    from vllm_sail.models.step5 import mega_moe
+
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", mode)
+    torch.cuda.set_device(0)
+    dist.init_process_group(
+        "nccl",
+        init_method=(tmp_path / "step5-rendezvous").as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    group = dist.group.WORLD
+    monkeypatch.setattr(
+        mega_moe, "get_ep_group", lambda: SimpleNamespace(device_group=group)
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+            enable_dbo=False,
+            tensor_parallel_size=4,
+            pipeline_parallel_size=2,
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    try:
+        e, h, i = 2, 2048, 128
+        with torch.device("cuda"):
+            layer = mega_moe.PPUStep5MegaMoEExperts(
+                config,
+                num_experts=e,
+                top_k=2,
+                hidden_size=h,
+                intermediate_size=i,
+                quant_config=Mxfp4Config(),
+                activation="swiglustep",
+                activation_clamp=7.0,
+                prefix="model.layers.3.moe.experts.routed_experts",
+            )
+            hidden = torch.full((tokens, h), 0.5, dtype=torch.bfloat16)
+            ids = torch.tensor([0, 1], dtype=torch.int64).expand(tokens, 2).contiguous()
+            weights = torch.full((tokens, 2), 0.25, dtype=torch.float32)
+            padding = torch.arange(tokens) == tokens - 1
+            for name, param in layer.named_parameters():
+                width = h if name.startswith("w13") else i
+                rows = 2 * i if name.startswith("w13") else h
+                scale = name.endswith("scale")
+                raw = torch.full(
+                    (e, rows, width // (32 if scale else 2)),
+                    0x78 if scale else 0x22,
+                    dtype=torch.uint8,
+                )
+                assert layer.weight_loader(param, raw, return_success=True)
+        monkeypatch.setattr(
+            layer, "_synchronize_first_launch", lambda: dist.barrier(group=group)
+        )
+        layer.prepare_weights()
+        if mode == "fp8xfp4":
+            assert all(len(bank) == 3 for bank in (layer.l1_weights, layer.l2_weights))
+        output = layer(hidden, weights, ids, padding)
+        torch.cuda.synchronize()
+        gate = torch.tensor(8.0)
+        reference = (torch.nn.functional.silu(gate).clamp(max=7) * 7 * 0.5).item()
+        expected = torch.full_like(output, reference)
+        expected.masked_fill_(padding[:, None], 0)
+        torch.testing.assert_close(output, expected, rtol=0.06, atol=0.02)
+        second = layer(hidden, weights * 0.5, ids, padding)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(second, output * 0.5, rtol=0.02, atol=0.02)
+    finally:
+        torch.cuda.synchronize()
+        cache = mega_moe.PPUStep5MegaMoEExperts._symm_buffers
+        for key, buffer in list(cache.items()):
+            if key[0] == id(group):
+                buffer.destroy()
+                del cache[key]
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_step5_bf16_runner_accepts_local_padding(
+    monkeypatch, sequence_parallel, raises
+):
+    """SP routing uses post-gather padding; the original context is always restored."""
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.forward_context import get_forward_context, override_forward_context
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_sail.models.step5 import mega_moe
+
+    calls = []
+
+    def gather(x):
+        calls.append("gather")
+        return torch.cat((x, x), dim=0)
+
+    def shard(x):
+        calls.append("shard")
+        return x[: x.shape[0] // 2]
+
+    monkeypatch.setattr(mega_moe, "sp_all_gather", gather)
+    monkeypatch.setattr(mega_moe, "sp_shard", shard)
+
+    def forward(self, x, logits):
+        expected = torch.cat((mask, mask)) if sequence_parallel else original.is_padding
+        torch.testing.assert_close(get_forward_context().is_padding, expected)
+        if sequence_parallel:
+            assert get_forward_context().is_padding.shape[0] == x.shape[0]
+        if raises:
+            raise RuntimeError("tail-layer compute failed")
+        return x + 1
+
+    monkeypatch.setattr(MoERunner, "forward", forward)
+    runner = mega_moe.PPUStep5BF16MoERunner.__new__(mega_moe.PPUStep5BF16MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.sequence_parallel = sequence_parallel
+    x = torch.ones(3, 16, device="cuda", dtype=torch.bfloat16)
+    mask = torch.tensor([False, False, True], device="cuda")
+    original = SimpleNamespace(
+        is_padding=torch.zeros(5, device="cuda", dtype=torch.bool), dp_metadata=None
+    )
+    with override_forward_context(original):
+        if raises:
+            with pytest.raises(RuntimeError, match="tail-layer compute failed"):
+                runner(x, x, padding=mask)
+        else:
+            result = runner(x, x, padding=mask)
+            torch.testing.assert_close(result[:2], x[:2] + 1)
+            torch.testing.assert_close(result[2], torch.zeros_like(result[2]))
+        assert get_forward_context() is original
+        assert original.is_padding.shape == (5,)
+    expected = ["gather"] * 3 + ([] if raises else ["shard"])
+    assert calls == (expected if sequence_parallel else [])
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("counts", [(1, 1), (2, 2), (6, 6), (1, 6), (0, 3), (4, 8)])
+@pytest.mark.parametrize("dp_rank", [0, 1])
+@pytest.mark.parametrize("with_padding", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_step5_bf16_runner_aligns_dp_dispatch_sizes(
+    monkeypatch, tp_size, counts, dp_rank, with_padding, raises
+):
+    """BF16 fallback dispatch/combine uses TP-aligned sizes, keeping later DP metadata clean."""
+    from types import SimpleNamespace
+
+    import torch
+    from vllm.forward_context import (
+        DPMetadata,
+        get_forward_context,
+        override_forward_context,
+    )
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_sail.models.step5 import mega_moe
+
+    aligned = [((count + tp_size - 1) // tp_size) * tp_size for count in counts]
+    rows = aligned[dp_rank] // tp_size
+    hidden = torch.ones(rows, 16, dtype=torch.bfloat16)
+    mask = torch.arange(rows) >= min(counts[dp_rank], rows)
+    metadata = DPMetadata(torch.tensor(counts, dtype=torch.int32))
+    original = SimpleNamespace(is_padding=None, dp_metadata=metadata)
+    monkeypatch.setattr(
+        mega_moe, "get_tensor_model_parallel_world_size", lambda: tp_size, raising=False
+    )
+    monkeypatch.setattr(
+        mega_moe, "sp_all_gather", lambda x: torch.cat([x] * tp_size, dim=0)
+    )
+    monkeypatch.setattr(mega_moe, "sp_shard", lambda x: x[:rows])
+
+    def forward(self, x, logits):
+        current = get_forward_context()
+        with self._sequence_parallel_context():
+            sizes = current.dp_metadata.get_chunk_sizes_across_dp_rank()
+            assert sizes[dp_rank] == x.shape[0] == logits.shape[0]
+            assert sizes == aligned
+            assert current.dp_metadata is not metadata
+            if with_padding:
+                torch.testing.assert_close(
+                    current.is_padding, torch.cat([mask] * tp_size)
+                )
+            else:
+                assert current.is_padding is None
+            if raises:
+                raise RuntimeError("tail-layer compute failed")
+            output = x + 1
+            # combine must stay in the same size context as dispatch.
+            assert current.dp_metadata.get_chunk_sizes_across_dp_rank() == sizes
+        assert current.dp_metadata.local_sizes is None
+        return output
+
+    monkeypatch.setattr(MoERunner, "forward", forward)
+    runner = mega_moe.PPUStep5BF16MoERunner.__new__(mega_moe.PPUStep5BF16MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.sequence_parallel = True
+    runner.moe_config = SimpleNamespace(sp_size=1, pcp_size=1, use_ep=True)
+    with override_forward_context(original):
+        if raises:
+            with pytest.raises(RuntimeError, match="tail-layer compute failed"):
+                runner(hidden, hidden, padding=mask if with_padding else None)
+        else:
+            output = runner(hidden, hidden, padding=mask if with_padding else None)
+            expected = hidden + 1
+            if with_padding:
+                expected = expected.masked_fill(mask[:, None], 0)
+            torch.testing.assert_close(output, expected)
+        assert get_forward_context() is original
+        assert original.dp_metadata is metadata
+        assert metadata.local_sizes is None
+        assert metadata.num_tokens_across_dp_cpu.tolist() == list(counts)
+
+
 def test_mega_moe_checkpoint_loader_matches_library_transform(monkeypatch):
     from types import SimpleNamespace
 

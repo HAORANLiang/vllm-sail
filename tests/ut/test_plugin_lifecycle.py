@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by Python 3.10 CI
 
 import vllm_sail
 import vllm_sail.registry as registry_pkg
+from vllm_sail import envs
 
 
 def _module(name: str, **attrs: object) -> types.ModuleType:
@@ -56,10 +57,10 @@ def test_platform_hook_bootstraps_empty_vllm_before_flash_attention(
     assert events == ["native", "flash"]
 
 
-def test_general_hook_runs_the_complete_lifecycle_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A cached registry import must not suppress backend registration."""
+@pytest.fixture
+def general_hook(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    for name in dir(envs):
+        monkeypatch.delenv(name, raising=False)
     events: list[str] = []
 
     compat = _module(
@@ -72,6 +73,10 @@ def test_general_hook_runs_the_complete_lifecycle_once(
     profiling = _module(
         "vllm_sail.profiling", install=lambda: events.append("profiling")
     )
+    layerwise = _module(
+        "vllm_sail.profiling.layerwise", install=lambda: events.append("layerwise")
+    )
+    monkeypatch.setitem(sys.modules, layerwise.__name__, layerwise)
     ops = _module("vllm_sail.ops")
 
     for module in (compat, patch, registry, models, profiling, ops):
@@ -82,23 +87,62 @@ def test_general_hook_runs_the_complete_lifecycle_once(
     monkeypatch.setattr(vllm_sail, "_PATCHES_APPLIED", False)
     monkeypatch.setattr(vllm_sail, "_REGISTRIES_APPLIED", False)
     monkeypatch.setattr(vllm_sail, "_MODELS_REGISTERED", False)
+    return events
 
+
+def test_general_hook_runs_the_complete_lifecycle_once(general_hook) -> None:
+    """A cached registry import must not suppress backend registration."""
     # The module is deliberately present in sys.modules before the hook. The
     # hook must call its public register() function rather than relying on a
     # package-import side effect.
-    assert sys.modules["vllm_sail.registry"] is registry
+    assert sys.modules["vllm_sail.registry"] is vllm_sail.registry
 
     vllm_sail.register_out_of_tree()
     vllm_sail.register_out_of_tree()
 
-    assert events == [
+    assert general_hook == [
         "compat",
         "patch",
         "registry",
+        "layerwise",
         "profiling",
         "models",
         "compat",
     ]
+
+
+def test_general_hook_keeps_step5_reads_lazy(monkeypatch, general_hook):
+    name = "VLLM_SAIL_STEP5_DSA_SCORES"
+    monkeypatch.setenv(name, "v3")
+
+    def install():
+        assert envs.VLLM_SAIL_STEP5_DSA_SCORES == "v3"
+        monkeypatch.setenv(name, "v0")
+        general_hook.append("patch")
+
+    monkeypatch.setattr(vllm_sail.patch, "install", install)
+    vllm_sail.register_out_of_tree()
+    assert envs.VLLM_PPU_STEP5_DSA_SCORES == "v0"
+    assert envs.snapshot()[name] == "v0"
+    monkeypatch.setenv(name, "v1")
+    vllm_sail.register_out_of_tree()
+    assert envs.VLLM_PPU_STEP5_DSA_SCORES == "v1"
+    assert envs.snapshot()[name] == "v1"
+    assert general_hook.count("patch") == 1
+
+
+def test_general_hook_does_not_eagerly_validate_unused_step5_settings(
+    monkeypatch, general_hook
+):
+    name = "VLLM_SAIL_STEP5_DSA_SCORE_DECODE"
+    monkeypatch.setenv(name, "v3")
+    vllm_sail.register_out_of_tree()
+    assert general_hook.count("patch") == 1
+    assert vllm_sail._PATCHES_APPLIED
+    with pytest.raises(ValueError, match=name):
+        getattr(envs, name)
+    monkeypatch.setenv(name, "v2")
+    assert getattr(envs, name) == "v2"
 
 
 def test_registry_registration_fails_terminally_after_partial_failure(

@@ -121,12 +121,23 @@ def _value(node: ast.AST, env: dict[str, Any]) -> Any:
             and node.func.attr == "eager_break_during_capture"
         ):
             return _value(node.args[0], env)
-        if isinstance(node.func, ast.Name) and isinstance(
-            env.get(node.func.id), ast.FunctionDef
-        ):
-            factory = env[node.func.id]
-            if isinstance(factory.body[-1], ast.Return) and isinstance(
-                factory.body[-1].value, ast.Name
+        if isinstance(node.func, ast.Name | ast.Attribute):
+            factory = _maybe_value(node.func, env)
+            if isinstance(factory, str) and factory.startswith("vllm_sail."):
+                candidate = resolve_symbol(ROOT, factory).node
+                if isinstance(candidate, ast.FunctionDef):
+                    # Imported factories must directly return one nested function.
+                    body = (
+                        candidate.body[1:]
+                        if ast.get_docstring(candidate)
+                        else candidate.body
+                    )
+                    if len(body) == 2 and isinstance(body[0], ast.FunctionDef):
+                        factory = candidate
+            if (
+                isinstance(factory, ast.FunctionDef)
+                and isinstance(factory.body[-1], ast.Return)
+                and isinstance(factory.body[-1].value, ast.Name)
             ):
                 name = factory.body[-1].value.id
                 nested = [
@@ -404,11 +415,7 @@ def dispatcher_hooks(path: Path) -> list[Hook]:
         module = _value(call.args[0], env)
         name, body = (_value(arg, env) for arg in call.args[1:])
         attribute = next(
-            (
-                _value(kw.value, env)
-                for kw in call.keywords
-                if kw.arg == "target_name"
-            ),
+            (_value(kw.value, env) for kw in call.keywords if kw.arg == "target_name"),
             name,
         )
         if not isinstance(body, ast.FunctionDef):

@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
+#define STEP4_DSA_SELECTOR_THREADS 1024
+#define STEP5_DSA_EXACT_FP32 1
+#include "step5_dsa/step4_dsa_radix_selector.cuh"

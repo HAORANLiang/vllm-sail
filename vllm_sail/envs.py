@@ -5,10 +5,10 @@ Rules (enforced in review):
 
 1. Every SAIL-specific runtime environment variable is declared here. Do **not**
    read ``VLLM_SAIL_*`` or legacy ``VLLM_PPU_*`` runtime names elsewhere.
-2. Access is lazy, via module ``__getattr__``, so a variable changed after
-   import is still observed. Use :func:`is_set` to distinguish "explicitly set
-   by the user" from "left at the default" — several PPU backend-selection paths
-   depend on that difference.
+2. Access is lazy: each attribute read resolves the current environment.
+   Use :func:`is_set` to distinguish "explicitly set by the user" from "left
+   at the default" — several PPU backend-selection paths depend on that
+   difference.
 3. ``VLLM_SAIL_*`` names take precedence over their ``VLLM_PPU_*`` aliases,
    including explicit false or empty values. Legacy Python attributes use the
    same resolution. Defaults are unchanged from the in-tree PPU fork.
@@ -51,10 +51,20 @@ if TYPE_CHECKING:
     VLLM_SAIL_ENABLE_FP8_TO_INT8: bool = False
     VLLM_SAIL_KPOOL_DECODE_LOGITS: str = "non_paged"
     VLLM_SAIL_KPOOL_MAX_DENSE_POOLS: int = 1 << 21
+    VLLM_SAIL_STEP5_DSA_SCORES: str = "v0"
+    VLLM_SAIL_STEP5_DSA_SCORE_MAX_BYTES: int = 1 << 30
+    VLLM_SAIL_STEP5_DSA_SCORE_DECODE: str = "v0"
+    VLLM_SAIL_STEP5_JOINT_PREPARE: bool = False
+    VLLM_SAIL_STEP5_DSA_SELECTOR_PPU: bool = False
+    VLLM_SAIL_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
+    VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
+    VLLM_STEP5_INDEXER_FP8_AS_FP16: bool = False
     VLLM_SAIL_MINIMAX_M3_MSA: bool = True
     VLLM_SAIL_MINIMAX_M3_MSA_INDEXER_TRITON: bool = False
     VLLM_SAIL_MINIMAX_M3_MSA_ATTEND_TRITON: bool = False
     VLLM_SAIL_NVTX_PROFILE: bool = False
+    VLLM_SAIL_NVTX_DUMP_DICT: bool = False
     VLLM_SAIL_NVTX_DUMP_TOPK: bool = False
     VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN: bool = False
     VLLM_SAIL_FUSED_NORM_ROPE_ATTN: bool = False
@@ -80,7 +90,16 @@ if TYPE_CHECKING:
     VLLM_PPU_USE_TRITON_INT8_QUANT: bool = True
     VLLM_PPU_FP8_LOAD_POLICY: str | None = None
     VLLM_PPU_ENABLE_FP8_TO_INT8: bool = False
+    VLLM_PPU_STEP5_DSA_SCORES: str = "v0"
+    VLLM_PPU_STEP5_DSA_SCORE_MAX_BYTES: int = 1 << 30
+    VLLM_PPU_STEP5_DSA_SCORE_DECODE: str = "v0"
+    VLLM_PPU_STEP5_JOINT_PREPARE: bool = False
+    VLLM_PPU_STEP5_DSA_SELECTOR_PPU: bool = False
+    VLLM_PPU_STEP5_DSA_PREFILL_PPU: bool = False
+    VLLM_PPU_STEP5_DSA_PREFILL_BACKEND: str = "flashinfer"
+    VLLM_PPU_STEP5_DSA_PREFILL_BATCH_ATTENTION: bool = True
     VLLM_PPU_NVTX_PROFILE: bool = False
+    VLLM_PPU_NVTX_DUMP_DICT: bool = False
     VLLM_PPU_NVTX_DUMP_TOPK: bool = False
     VLLM_PPU_NVTX_VFA_DUMP_SEQLEN: bool = False
     VLLM_PPU_FUSED_NORM_ROPE_ATTN: bool = False
@@ -94,6 +113,9 @@ GEMM_BACKENDS = ("deepgemm", "acext", "triton")
 GDN_DECODE_KERNELS = ("auto", "cuda", "pla", "triton")
 KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged",)
 MEGA_MOE_MMA_TYPES = ("fp4xfp4", "fp8xfp4", "bf16xfp4")
+STEP5_PREFILL_BACKENDS = ("flashinfer", "native")
+STEP5_DSA_SCORE_MODES = ("v0", "v1", "v2", "v3")
+STEP5_DSA_SCORE_DECODE_MODES = ("v0", "v1", "v2")
 
 
 def _env_names(name: str) -> tuple[str, ...]:
@@ -122,6 +144,23 @@ def _bool(name: str, default: bool) -> Callable[[], bool]:
     return _get
 
 
+def _int(name: str, default: int) -> Callable[[], int]:
+    """Read an integer env var, falling back to aliases only when unset."""
+
+    def _get() -> int:
+        source, raw = _read_env(name)
+        if raw is None or raw.strip() == "":
+            return default
+        try:
+            return int(raw.strip())
+        except ValueError:
+            raise ValueError(
+                f"Invalid value {raw!r} for {source}. Expected an integer."
+            ) from None
+
+    return _get
+
+
 def _choice(
     name: str, default: str | None, choices: tuple[str, ...]
 ) -> Callable[[], str | None]:
@@ -137,6 +176,20 @@ def _choice(
                 f"Invalid value {raw!r} for {source}. Expected one of "
                 f"{', '.join(choices)}."
             )
+        return value
+
+    return _get
+
+
+def _nonnegative_int(name: str, default: int) -> Callable[[], int]:
+    """Read a lazy score-output budget; zero explicitly disables consolidation."""
+    getter = _int(name, default)
+
+    def _get() -> int:
+        value = getter()
+        if value < 0:
+            source, _ = _read_env(name)
+            raise ValueError(f"{source} must be nonnegative, got {value}.")
         return value
 
     return _get
@@ -230,6 +283,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS": _positive_int(
         "VLLM_SAIL_KPOOL_MAX_DENSE_POOLS", 1 << 21
     ),
+    # -- Step5 DSA ----------------------------------------------------------
+    # Prefill: v0 keeps upstream, v1 uses resident, v2 prefers compact, and
+    # v3 forces chunks with grouped H4 enabled.
+    "VLLM_SAIL_STEP5_DSA_SCORES": _choice(
+        "VLLM_SAIL_STEP5_DSA_SCORES", "v0", STEP5_DSA_SCORE_MODES
+    ),
+    # Only scores are bounded, not total temporary memory. Zero keeps chunks.
+    "VLLM_SAIL_STEP5_DSA_SCORE_MAX_BYTES": _nonnegative_int(
+        "VLLM_SAIL_STEP5_DSA_SCORE_MAX_BYTES", 1 << 30
+    ),
+    # Decode is independent of prefill: original, resident, or guarded MTP.
+    "VLLM_SAIL_STEP5_DSA_SCORE_DECODE": _choice(
+        "VLLM_SAIL_STEP5_DSA_SCORE_DECODE", "v0", STEP5_DSA_SCORE_DECODE_MODES
+    ),
+    "VLLM_SAIL_STEP5_JOINT_PREPARE": _bool("VLLM_SAIL_STEP5_JOINT_PREPARE", False),
+    # per_row stays the default; the new selector is opt-in only.
+    "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU": _bool(
+        "VLLM_SAIL_STEP5_DSA_SELECTOR_PPU", False
+    ),
+    # Selects native paged attention during prefill metadata planning.
+    "VLLM_SAIL_STEP5_DSA_PREFILL_PPU": _bool("VLLM_SAIL_STEP5_DSA_PREFILL_PPU", False),
+    # Defaults to FlashInfer; native opts into the new prefill/decode and the old
+    # v023 values raise.
+    "VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND": _choice(
+        "VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND", "flashinfer", STEP5_PREFILL_BACKENDS
+    ),
+    # The indexer still runs in chunks; only the explicit native route may batch
+    # attention at finish.
+    "VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION": _bool(
+        "VLLM_SAIL_STEP5_DSA_PREFILL_BATCH_ATTENTION", True
+    ),
+    # 0: E4M3 bytes; 1: E4M3-quantized values stored as FP16, using FP16 MMA.
+    # The FP16 summary cache takes twice the memory; keeps the Step5 fork's name.
+    "VLLM_STEP5_INDEXER_FP8_AS_FP16": _bool("VLLM_STEP5_INDEXER_FP8_AS_FP16", False),
     # -- MiniMax M3 SAIL MSA sparse attention -------------------------------
     # Enabled by default: the SAIL path is selected whenever the platform, the
     # model shape and the installed `msa_for_sail` allow it; the dtypes follow
@@ -284,6 +371,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_SAIL_NVTX_PROFILE",
         False,
     ),
+    # Step5 forward dict arguments expand only tensor shape/dtype; no device reads.
+    "VLLM_SAIL_NVTX_DUMP_DICT": _bool("VLLM_SAIL_NVTX_DUMP_DICT", False),
     "VLLM_SAIL_NVTX_DUMP_TOPK": _bool("VLLM_SAIL_NVTX_DUMP_TOPK", False),
     "VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN": _bool(
         "VLLM_SAIL_NVTX_VFA_DUMP_SEQLEN",
@@ -292,8 +381,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
 }
 
 # All plugin variables retain the corresponding PPU spelling. The shared
-# upstream VLLM_DEEPEPLL_RECV_HOOK and VLLM_GDN_DECODE_KERNEL keep their names
-# and have no plugin aliases.
+# upstream VLLM_DEEPEPLL_RECV_HOOK and VLLM_GDN_DECODE_KERNEL, and the Step5
+# fork's VLLM_STEP5_INDEXER_FP8_AS_FP16, keep their names and have no plugin
+# aliases.
 _aliases: dict[str, tuple[str, ...]] = {
     name: (name.replace("VLLM_SAIL_", "VLLM_PPU_", 1),)
     for name in environment_variables
@@ -323,7 +413,10 @@ def is_set(name: str) -> bool:
     Backend selection distinguishes "user asked for X" from "user did not
     choose", so this is not the same as comparing against the default.
     """
-    return any(candidate in os.environ for candidate in _env_names(name))
+    canonical = _canonical_names.get(name, name)
+    return canonical in environment_variables and any(
+        candidate in os.environ for candidate in _env_names(canonical)
+    )
 
 
 def snapshot() -> dict[str, Any]:

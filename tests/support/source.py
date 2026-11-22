@@ -14,7 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from vllm_sail import envs
+
 ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_ROOT = Path(envs.__file__).resolve().parents[1]
 
 
 def source_root(source: str | None, *, required: bool = False) -> Path:
@@ -46,7 +49,7 @@ def definition(path: Path, name: str):
 
 
 def function(relative, name, namespace):
-    path = ROOT / relative
+    path = (PACKAGE_ROOT if str(relative).startswith("vllm_sail/") else ROOT) / relative
     node = definition(path, name)
     node.decorator_list = []
     module = ast.Module(
@@ -67,7 +70,7 @@ def assert_accepts_upstream_keywords(
 ):
     """Check keyword names and variadics; this is not full call compatibility."""
     replacement = definition(
-        ROOT / f"vllm_sail/patch/enhancement/{local}.py", local_name
+        PACKAGE_ROOT / f"vllm_sail/patch/enhancement/{local}.py", local_name
     )
     original = definition(upstream_root / f"vllm/{upstream}.py", upstream_name)
     accepted = {a.arg for a in replacement.args.args + replacement.args.kwonlyargs}

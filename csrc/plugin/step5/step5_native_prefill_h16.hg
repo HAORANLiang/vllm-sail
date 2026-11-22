@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
+#define STEP5_PREFILL_HEADS 16
+#define STEP5_NATIVE_PREFILL_NAMESPACE step5_native_prefill_h16
+#include "step5_native_prefill.cuh"

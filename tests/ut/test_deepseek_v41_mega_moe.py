@@ -4,6 +4,7 @@
 import ast
 import importlib
 import inspect
+import json
 import sys
 from types import SimpleNamespace
 
@@ -66,7 +67,47 @@ def megamoe_patch(modules):
         bf16_mega_gate=native_gate,
     )
     modules(_MEGAMOE_IMPL_MODULE, PPUDeepGemmMegaMoEExperts=PPUExperts)
+    from contextlib import nullcontext
+
+    class Mxfp4Config:
+        ignored_layers = []
+        packed_modules_mapping = {}
+
+    class Step5MoE:
+        def __init__(self, config, **kwargs):
+            self.config, self.kwargs = config, kwargs
+
+    def fused_factory(**kwargs):
+        return SimpleNamespace(fallback=True, kwargs=kwargs)
+
+    modules("vllm.config", set_current_vllm_config=nullcontext)
+    modules("vllm.model_executor.layers.fused_moe", FusedMoEFactory=fused_factory)
+    modules("vllm.model_executor.layers.quantization.mxfp4", Mxfp4Config=Mxfp4Config)
+    modules(
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+        is_layer_skipped=lambda prefix, ignored_layers, fused_mapping: any(
+            name.startswith(prefix + ".") for name in ignored_layers
+        ),
+    )
+    step5 = modules(
+        "vllm.models.step5.nvidia.mega_moe",
+        Step5MegaMoE=Step5MoE,
+        Step5MegaMoEExperts=NativeExperts,
+    )
+    step5_model = modules(
+        "vllm.models.step5.nvidia.model",
+        _step5_use_sequence_parallel=lambda config: False,
+    )
+    modules("torch", float32="fp32")
+    modules(
+        "vllm_sail.models.step5.mega_moe",
+        PPUStep5MegaMoEExperts=PPUExperts,
+        PPUStep5BF16MoERunner=Step5MoE,
+    )
     return SimpleNamespace(
+        step5=step5,
+        step5_model=step5_model,
+        quant_cls=Mxfp4Config,
         platform=platform,
         model=model,
         native=NativeExperts,
@@ -95,6 +136,200 @@ def test_megamoe_redirects_provider_and_preloaded_models(megamoe_patch, modules)
     moe._init_mega_moe_experts()
     assert type(moe.experts) is harness.ppu
     assert moe.forward() == "native forward"
+
+
+@pytest.mark.parametrize("mode", ["fp4xfp4", "fp8xfp4"])
+def test_step5_megamoe_uses_v034_weight_layout_and_dispatch_api(mode):
+    events = []
+
+    class Tensor:
+        shape = (3, 256)
+        dtype = "bf16"
+
+        def __init__(self):
+            self.data = object()
+
+        def contiguous(self):
+            return self
+
+        def to(self, dtype):
+            events.append(dtype)
+            return self
+
+    transform = "convert" if mode == "fp8xfp4" else None
+    transformed = tuple((object(), object(), object()) for _ in range(2))
+    buffer = SimpleNamespace(
+        x=object(), x_sf=object(), topk_idx=object(), topk_weights=object()
+    )
+
+    def convert(*args):
+        events.append("transform")
+        return transformed
+
+    def allocate(*args, **kwargs):
+        assert kwargs == {"mma_type": mode, "activation": "swiglu_step"}
+        events.append("allocate")
+        return buffer
+
+    def dispatch(x, ids, weights, **kwargs):
+        assert kwargs["mma_type"] == mode
+        events.append("dispatch")
+
+    def kernel(output, l1, l2, actual_buffer, **kwargs):
+        assert actual_buffer is buffer
+        assert len(l1) == len(l2) == (3 if transform else 2)
+        if transform:
+            assert l1[0].data is transformed[0][0]
+            assert l2[0].data is transformed[1][0]
+            assert l1[2] is transformed[0][2]
+            assert l2[2] is transformed[1][2]
+        assert kwargs["activation"] == "swiglu_step"
+        events.append("kernel")
+
+    api = SimpleNamespace(
+        convert=convert,
+        kernel=kernel,
+        get_symm_buffer_for_mega_moe=allocate,
+        mega_moe_pre_dispatch=dispatch,
+    )
+    base = type(
+        "Base",
+        (),
+        {
+            "_symm_buffers": {},
+            "_transform_weights": function(
+                _MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._transform_weights", {}
+            ),
+            "_kernel_weights": function(
+                _MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}._kernel_weights", {}
+            ),
+            "l1_weights": property(
+                function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.l1_weights", {})
+            ),
+            "l2_weights": property(
+                function(_MEGAMOE_IMPL, f"{_MEGAMOE_CLASS}.l2_weights", {})
+            ),
+            "_synchronize_first_launch": lambda self: None,
+        },
+    )
+    namespace = {
+        "PPUDeepGemmMegaMoEExperts": base,
+        "mega_moe_api": lambda selected: api if selected == mode else None,
+        "get_ep_group": lambda: SimpleNamespace(device_group=base),
+        "torch": SimpleNamespace(
+            bfloat16="bf16",
+            int32="i32",
+            float32="fp32",
+            empty_like=lambda x: Tensor(),
+            cuda=SimpleNamespace(
+                current_device=lambda: 0, is_current_stream_capturing=lambda: False
+            ),
+        ),
+    }
+    node = definition(
+        ROOT / "vllm_sail/models/step5/mega_moe.py", "PPUStep5MegaMoEExperts"
+    )
+    exec(
+        compile(ast.Module(body=[node], type_ignores=[]), "<step5-experts>", "exec"),
+        namespace,
+    )
+    expert_cls = namespace["PPUStep5MegaMoEExperts"]
+    expert = expert_cls.__new__(expert_cls)
+    expert.ready, expert.pool, expert._transformed = False, None, False
+    expert.eplb_state = SimpleNamespace(logical_to_physical_map=None)
+    expert.mma_type = mode
+    expert.mma_format = SimpleNamespace(transform=transform, kernel="kernel")
+    expert.activation = SimpleNamespace(name="swiglu_step", clamp=7.0)
+    expert.fast_math = True
+    expert.num_experts = expert.top_k = 2
+    expert.max_num_tokens = 4
+    expert.hidden_size = expert.intermediate_size = 256
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        setattr(expert, name, Tensor())
+    expert._l1_inv_scale = expert._l2_inv_scale = None
+    expert.prepare_weights()
+    expert.prepare_weights()
+    assert expert.ready
+    for _ in range(2):
+        assert isinstance(expert.forward(Tensor(), Tensor(), Tensor()), Tensor)
+    assert events == (["transform"] if transform else []) + [
+        "allocate",
+        "i32",
+        "fp32",
+        "dispatch",
+        "kernel",
+        "i32",
+        "fp32",
+        "dispatch",
+        "kernel",
+    ]
+
+
+@pytest.mark.parametrize("pp", [1, 2])
+def test_step5_megamoe_enables_stage_local_sp_with_pp(megamoe_patch, pp):
+    """PP boundaries pass full tensors; SP runs per stage, PP=1 no longer required."""
+    h = megamoe_patch
+    h.patch.install()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp,
+            tensor_parallel_size=4,
+            enable_expert_parallel=True,
+        ),
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe"),
+    )
+    target = "vllm.models.step5.nvidia.mega_moe.Step5MegaMoEExperts"
+    assert h.step5.Step5MegaMoEExperts is h.ppu
+    assert h.ppu.__vllm_sail_patch__[target] is h.native
+    h.patch.install()
+    with pytest.raises(RuntimeError, match="already patched"):
+        h.patch._install_step5()
+    assert h.step5_model._step5_use_sequence_parallel(config)
+    config.kernel_config.moe_backend = "auto"
+    assert not h.step5_model._step5_use_sequence_parallel(config)
+
+
+def test_step5_megamoe_preserves_bf16_tail_and_parameter_prefix(megamoe_patch):
+    """Excluded tail layers stay BF16 with explicit SP and unchanged param names."""
+    h = megamoe_patch
+    h.patch.install()
+    quant = h.quant_cls()
+    quant.ignored_layers = ["model.layers.88.moe.experts.w13_weight"]
+    config = SimpleNamespace(
+        kernel_config=SimpleNamespace(moe_backend="deep_gemm_mega_moe")
+    )
+    kwargs = dict(
+        num_experts=256,
+        top_k=8,
+        hidden_size=5120,
+        intermediate_size=2048,
+        quant_config=quant,
+        prefix="model.layers.88.moe.experts",
+        sequence_parallel=True,
+        activation="swiglustep",
+        activation_clamp=7.0,
+        renormalize=True,
+        scoring_func="sigmoid",
+        e_score_correction_bias=object(),
+        routed_scaling_factor=2.5,
+    )
+    result = h.step5.Step5MegaMoE(config, **kwargs)
+    assert result.fallback
+    assert result.kwargs["prefix"] == kwargs["prefix"]
+    assert result.kwargs["quant_config"] is None
+    assert result.kwargs["is_sequence_parallel"] is False
+    assert result.kwargs["runner_args"] == {"sequence_parallel": True}
+    assert result.kwargs["reduce_results"]
+    assert result.kwargs["router_logits_dtype"] == "fp32"
+    assert result.kwargs["skip_padding"] is False
+    assert result.kwargs["runner_cls"] is not None
+    for name, value in kwargs.items():
+        if name not in {"quant_config", "activation_clamp", "sequence_parallel"}:
+            assert result.kwargs[name] is value
+    assert config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    kwargs["prefix"] = "model.layers.3.moe.experts"
+    result = h.step5.Step5MegaMoE(config, **kwargs)
+    assert result.kwargs == kwargs
 
 
 def test_megamoe_redirects_late_imports_and_preserves_other_bindings(
@@ -687,3 +922,244 @@ def test_expert_rejects_reload_after_in_place_transform():
     expert = SimpleNamespace(_transformed=True)
     with pytest.raises(RuntimeError, match="cannot be reloaded"):
         load_weight(expert, None, None, "w2", False)
+
+
+@pytest.mark.parametrize(
+    "left,right,index",
+    [
+        ([1, 2], [1, 2], None),
+        ([1, 2], [1, 3], 1),
+        ([1], [1, 2], 1),
+        ([1, 2], [1], 1),
+        ([], [1], 0),
+    ],
+)
+def test_step5_validation_locates_first_divergence_including_truncation(
+    left, right, index
+):
+    compare = function(
+        "scripts/ci/validate_step5_megamoe_pp.py", "first_difference", {}
+    )
+    assert compare(left, right) == index
+
+
+@pytest.mark.parametrize("same_tokens", [False, True])
+def test_step5_validation_reports_numeric_drift_before_token_divergence(
+    tmp_path, capsys, same_tokens
+):
+    """Report score drift on the common prefix even while argmax stays unchanged."""
+    path = "scripts/ci/validate_step5_megamoe_pp.py"
+    namespace = {"json": json}
+    function(path, "first_difference", namespace)
+    summarize = function(path, "summarize_log", namespace)
+    log = tmp_path / "outputs.log"
+    records = [
+        {
+            "round": round_id,
+            "prompt": "input",
+            "prompt_token_ids": [9],
+            "token_ids": [1, 2 if same_tokens or round_id == 1 else 3],
+            "logprobs": [
+                {"1": {"logprob": -round_id / 2}},
+                {"2": {"logprob": -0.5}, "3": {"logprob": -0.6}},
+            ],
+        }
+        for round_id in (1, 2)
+    ]
+    log.write_text("startup log\n" + "\n".join(json.dumps(row) for row in records))
+    summarize(log)
+    summary = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert summary["same_prompt_tokens"]
+    assert summary["token_index"] == (None if same_tokens else 1)
+    assert summary["first_logprob_drift"] == {
+        "token_index": 0,
+        "max_common_logprob_delta": 0.5,
+    }
+
+
+@pytest.mark.parametrize("diverges", [False, True])
+@pytest.mark.parametrize("scheduling", ["async", "sync"])
+@pytest.mark.parametrize("admission", ["live", "paused"])
+def test_step5_validation_keeps_strict_greedy_check_and_logs_candidates(
+    modules, monkeypatch, capsys, diverges, scheduling, admission
+):
+    """Keep two-round evidence; differing tokens fail even when scores are close."""
+    import argparse
+    import os
+    from pathlib import Path
+
+    path = "scripts/ci/validate_step5_megamoe_pp.py"
+    namespace = dict(
+        argparse=argparse,
+        json=json,
+        os=os,
+        sys=sys,
+        Path=Path,
+        NATIVE=Path("/native"),
+        vllm_sail=SimpleNamespace(__file__="/source"),
+    )
+    # main() seeds device switches through os.environ.setdefault on the real os
+    # module; run against a copy so the process environment is left untouched.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    for name in (
+        "serialize_logprobs",
+        "first_difference",
+        "report_difference",
+        "generate_fixed_batch",
+        "main",
+    ):
+        function(path, name, namespace)
+    calls = []
+
+    class LLM:
+        def __init__(self, **kwargs):
+            assert kwargs["async_scheduling"] == (scheduling == "async")
+            self.llm_engine = SimpleNamespace(
+                engine_core=SimpleNamespace(call_utility=lambda *args: None),
+                vllm_config=SimpleNamespace(
+                    scheduler_config=SimpleNamespace(
+                        async_scheduling=kwargs["async_scheduling"]
+                    ),
+                    kernel_config=SimpleNamespace(moe_backend=kwargs["moe_backend"]),
+                ),
+            )
+
+        def enqueue(self, prompts, params, use_tqdm):
+            assert not use_tqdm
+            self.results = self.generate(prompts, params)
+            return [result.request_id for result in self.results]
+
+        def wait_for_completion(self):
+            return self.results
+
+        def generate(self, prompts, params):
+            assert prompts == ["input"]
+            assert params.temperature == 0 and params.logprobs == 5
+            token = 3374 if diverges and calls else 10756
+            calls.append(token)
+            return [
+                SimpleNamespace(
+                    request_id=str(len(calls)),
+                    prompt_token_ids=[9],
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[1, token],
+                            text="output",
+                            finish_reason="length",
+                            logprobs=[
+                                {},
+                                {
+                                    token: SimpleNamespace(
+                                        logprob=-0.5,
+                                        rank=1,
+                                        decoded_token="candidate",
+                                    )
+                                },
+                            ],
+                        )
+                    ],
+                )
+            ]
+
+    modules("vllm", LLM=LLM, SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "validate",
+            "--model",
+            "/model",
+            "--prompt",
+            "input",
+            "--scheduling",
+            scheduling,
+            "--admission",
+            admission,
+            "--logprobs",
+            "5",
+        ],
+    )
+    if diverges:
+        with pytest.raises(
+            AssertionError, match="repeated greedy generations disagree"
+        ):
+            namespace["main"]()
+    else:
+        namespace["main"]()
+    output = capsys.readouterr().out
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert [record["round"] for record in records if "round" in record] == [1, 2]
+    assert ("STEP5_MEGAMOE_PP2_PASS" in output) is not diverges
+    differences = [
+        record for record in records if record.get("event") == "first_difference"
+    ]
+    if diverges:
+        assert differences[0]["token_index"] == 1
+        assert differences[0]["common_prefix_token_ids"] == [1]
+        assert differences[0]["token_ids"] == [10756, 3374]
+        assert differences[0]["logprobs"][0]["10756"]["logprob"] == -0.5
+    else:
+        assert not differences
+
+
+@pytest.mark.parametrize("enqueue_fails", [False, True])
+def test_step5_fixed_admission_resumes_before_wait_and_on_enqueue_error(enqueue_fails):
+    generate = function(
+        "scripts/ci/validate_step5_megamoe_pp.py", "generate_fixed_batch", {}
+    )
+    events = []
+    results = [SimpleNamespace(request_id="0"), SimpleNamespace(request_id="1")]
+
+    def utility(*args):
+        events.append(args)
+
+    def enqueue(prompts, params, use_tqdm):
+        assert events == [("pause_generation", "keep", False)]
+        assert prompts == ["first", "second"] and params == "greedy"
+        assert use_tqdm is False
+        if enqueue_fails:
+            raise ValueError("enqueue failed")
+        events.append("enqueue")
+        return ["0-internal", "1-internal"]
+
+    def wait():
+        assert events[-1] == ("resume_scheduler",)
+        return results
+
+    llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(engine_core=SimpleNamespace(call_utility=utility)),
+        enqueue=enqueue,
+        wait_for_completion=wait,
+    )
+    if enqueue_fails:
+        with pytest.raises(ValueError, match="enqueue failed"):
+            generate(llm, ["first", "second"], "greedy")
+    else:
+        assert generate(llm, ["first", "second"], "greedy") is results
+    assert events[-1] == ("resume_scheduler",)
+
+
+def test_step5_trace_summary_counts_all_replays_not_only_first_changes(
+    tmp_path, capsys
+):
+    summarize = function(
+        "scripts/ci/validate_step5_megamoe_pp.py", "summarize_log", {"json": json}
+    )
+    records = [
+        {
+            "rank": 0,
+            "round": 1,
+            "step": 0,
+            "module": f"layer-{index}",
+            "replay": {"": {"equal": index == 0}},
+            "input_mutation": {"x": {"equal": True}},
+        }
+        for index in range(2)
+    ]
+    (tmp_path / "rank-0.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in records)
+    )
+    summarize(tmp_path)
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert result["replay"] == {"checked": 2, "changed": 1}
+    assert result["input_mutation"] == {"checked": 2, "changed": 0}

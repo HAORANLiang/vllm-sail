@@ -55,4 +55,75 @@ def install() -> None:
                 affected_versions=_AFFECTED,
                 remove_when=_REMOVE_WHEN,
             )(PPUDeepGemmMegaMoEExperts)
+    _install_step5()
     _installed = True
+
+
+def _install_step5():
+    from copy import copy
+
+    import torch
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import FusedMoEFactory
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config
+    from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+    from vllm.models.step5.nvidia import mega_moe, model
+    from vllm.platforms import current_platform
+
+    from vllm_sail.models.step5.mega_moe import (
+        PPUStep5BF16MoERunner,
+        PPUStep5MegaMoEExperts,
+    )
+
+    original = mega_moe.Step5MegaMoE
+    original_sp = model._step5_use_sequence_parallel
+    metadata = dict(
+        reason="Step5 needs SAIL MXFP4 MegaMoE and stage-local sequence parallelism for PP.",
+        affected_versions=_AFFECTED,
+        remove_when="Step5 exposes out-of-tree MegaMoE experts and enables stage-local SP with PP.",
+    )
+    patch(mega_moe.__name__, "Step5MegaMoEExperts", **metadata)(PPUStep5MegaMoEExperts)
+
+    @patch(model.__name__, "_step5_use_sequence_parallel", **metadata)
+    def _step5_use_sequence_parallel(vllm_config):
+        if not current_platform.is_ppu():
+            return original_sp(vllm_config)
+        parallel = vllm_config.parallel_config
+        return (
+            parallel.enable_expert_parallel
+            and parallel.tensor_parallel_size > 1
+            and vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+        )
+
+    @patch(mega_moe.__name__, "Step5MegaMoE", **metadata)
+    def _step5_mega_moe(vllm_config, **kwargs):
+        quant = kwargs["quant_config"]
+        prefix = kwargs["prefix"]
+        ignored = isinstance(quant, Mxfp4Config) and any(
+            is_layer_skipped(
+                prefix=candidate,
+                ignored_layers=quant.ignored_layers,
+                fused_mapping=quant.packed_modules_mapping,
+            )
+            for candidate in (prefix, f"{prefix}.routed_experts")
+        )
+        if not ignored:
+            return original(vllm_config, **kwargs)
+        # BF16 tail layers from the checkpoint are not requantized, and no
+        # extra parameter-name hierarchy is added.
+        fallback = copy(vllm_config)
+        fallback.kernel_config = copy(vllm_config.kernel_config)
+        fallback.kernel_config.moe_backend = "auto"
+        kwargs.pop("activation_clamp")
+        sequence_parallel = kwargs.pop("sequence_parallel", False)
+        kwargs["is_sequence_parallel"] = False
+        kwargs["quant_config"] = None
+        with set_current_vllm_config(fallback):
+            return FusedMoEFactory(
+                **kwargs,
+                reduce_results=True,
+                router_logits_dtype=torch.float32,
+                runner_cls=PPUStep5BF16MoERunner,
+                runner_args={"sequence_parallel": sequence_parallel},
+                skip_padding=False,
+            )

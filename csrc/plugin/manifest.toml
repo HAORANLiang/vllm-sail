@@ -4,8 +4,8 @@ schema = 2
 
 [[extension]]
 name = "_C"
-device_sources = ["csrc/plugin/sampler_bf16.hg"]
-bindings = ["csrc/plugin/ppu_bindings.cpp"]
+device_sources = ["csrc/plugin/sampler_bf16.hg", "csrc/plugin/step5/step5_native_prefill_h8.hg", "csrc/plugin/step5/step5_native_prefill_h16.hg", "csrc/plugin/step5/step5_native_bindings.hg", "csrc/plugin/step5/step5_dsa_selector_v2_256.hg", "csrc/plugin/step5/step5_dsa_selector_v2_1024.hg"]
+bindings = ["csrc/plugin/ppu_bindings.cpp", "csrc/plugin/step5/step5_dsa_selector_v2_bindings.cpp"]
 
 [[extension]]
 name = "_moe_C"

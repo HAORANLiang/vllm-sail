@@ -87,6 +87,133 @@ def ep_scatter_2_cuda(
     )
 
 
+def step5_dsa_native_prefill(
+    query,
+    cache,
+    regions,
+    table,
+    owners,
+    positions,
+    tiles,
+    output,
+    logical_regions,
+    scale,
+    query_tile=0,
+) -> None:
+    """Explicit API: bad metadata or a missing op raises; no implicit JIT/fallback."""
+    from vllm_sail.models.step5.ops import dsa_native
+
+    reason = dsa_native.prefill_reason(
+        query,
+        cache,
+        regions,
+        table,
+        owners,
+        positions,
+        tiles,
+        output,
+        logical_regions,
+        scale,
+        query_tile,
+    )
+    if reason is not None:
+        raise ValueError("native prefill unsupported: " + reason)
+    op = dsa_native.compiled_op("prefill")
+    if op is None:
+        raise RuntimeError("native prefill precompiled op is unavailable")
+    op(
+        query,
+        cache,
+        regions,
+        table,
+        owners,
+        positions,
+        tiles,
+        output,
+        logical_regions,
+        scale,
+        query_tile,
+    )
+
+
+def step5_dsa_native_decode(
+    query,
+    cache,
+    regions,
+    table,
+    positions,
+    active,
+    output,
+    scale,
+    query_len=1,
+    clear_inactive=True,
+    gate=None,
+) -> None:
+    """Explicit decode API; the gate keeps the BF16 double-rounding semantics."""
+    from vllm_sail.models.step5.ops import dsa_native
+
+    reason = dsa_native.decode_reason(
+        query, cache, regions, table, positions, active, output, scale, query_len, gate
+    )
+    if reason is not None:
+        raise ValueError("native decode unsupported: " + reason)
+    op = dsa_native.compiled_op("decode")
+    if op is None:
+        raise RuntimeError("native decode precompiled op is unavailable")
+    op(
+        query,
+        cache,
+        regions,
+        table,
+        positions,
+        active,
+        output,
+        scale,
+        query_len,
+        clear_inactive,
+        gate,
+    )
+
+
+def step5_dsa_native_op(kind: str):
+    """Prebuilt step5_dsa_native_<kind> op, or None if not loadable or registered."""
+    name = "step5_dsa_native_" + kind
+    op = getattr(torch.ops._ppu_C, name, None)
+    if op is None and _ext_loaded("_C"):
+        op = getattr(torch.ops._ppu_C, name, None)
+    return op
+
+
+def step5_dsa_selector_v2(
+    scores,
+    positions,
+    table,
+    workspace,
+    regions,
+    starts,
+    region_block,
+    page_size,
+    topk,
+    packed,
+    threads,
+) -> None:
+    """Step5 selector v2 raw candidate selection (prebuilt op)."""
+    _require("_C", "step5_dsa_selector_v2")
+    torch.ops._ppu_C.step5_dsa_selector_v2(
+        scores,
+        positions,
+        table,
+        workspace,
+        regions,
+        starts,
+        region_block,
+        page_size,
+        topk,
+        packed,
+        threads,
+    )
+
+
 def top_k_per_row_prefill_bf16(
     logits: torch.Tensor,
     row_starts: torch.Tensor,

@@ -248,10 +248,17 @@ def install() -> None:
         from vllm.platforms import current_platform
 
         if isinstance(layer, RoutedExperts):
-            if self.ignored_layers and is_layer_skipped(
-                prefix=prefix,
-                ignored_layers=self.ignored_layers,
-                fused_mapping=self.packed_modules_mapping,
+            # Checkpoints list ``<moe>.experts.w*_weight`` while the factory
+            # registers the layer one level deeper at ``.routed_experts``;
+            # keep matching ignore entries that name the runtime path too.
+            expert_prefixes = (prefix, prefix.removesuffix(".routed_experts"))
+            if self.ignored_layers and any(
+                is_layer_skipped(
+                    prefix=expert_prefix,
+                    ignored_layers=self.ignored_layers,
+                    fused_mapping=self.packed_modules_mapping,
+                )
+                for expert_prefix in expert_prefixes
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
         elif (
@@ -302,6 +309,10 @@ def install() -> None:
         _upstream_apply_mapper(self, hf_to_vllm_mapper)
         from vllm.platforms import current_platform
 
+        # Upstream's inherited mapper is a no-op; the VL/MTP renames must reach
+        # the ignore list too, or BF16 layers are allocated as packed FP4.
+        if self.ignored_layers:
+            self.ignored_layers = hf_to_vllm_mapper.apply_list(self.ignored_layers)
         if current_platform.is_ppu() and self.fp8_channelwise_layers:
             self.fp8_channelwise_layers = hf_to_vllm_mapper.apply_list(
                 self.fp8_channelwise_layers
