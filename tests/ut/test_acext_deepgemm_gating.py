@@ -17,8 +17,10 @@ Three gating branches, each asserted hard (fail on mismatch):
 * **w8a8-fp8 / mxfp4 DeepGEMM** -- gated to ZW-890P ``(8, 9)``; never
   constructed on ZW-810E ``(8, 0)``.
 * **bf16 / w8a8-int8 DeepGEMM** -- hardware-supported (constructible) on *both*
-  chips, but BF16 *dense* auto-enable additionally requires
-  ``VLLM_SAIL_DENSE_BF16_DEEPGEMM`` and PPU 1.5, so it fires only on ZW-890P.
+  chips. BF16 *dense* auto-enable follows ``VLLM_SAIL_DENSE_BF16_DEEPGEMM``:
+  an explicit ``=1`` opts in on both chips, while the unset default comes
+  from the *host* platform (``_default_on_m890_plus``: on, and only on, an
+  M890+ PPU host; environments without ``vllm`` fail closed to off).
   This is the "capability support != default auto-enable" distinction.
 """
 
@@ -89,12 +91,18 @@ def platform_double(chip: str) -> types.SimpleNamespace:
             return capability == tuple(value)
         return capability[0] * 10 + capability[1] >= value
 
+    def has_device_capability(value) -> bool:
+        if isinstance(value, tuple):
+            return capability >= tuple(value)
+        return capability[0] * 10 + capability[1] >= value
+
     return types.SimpleNamespace(
         is_ppu=lambda: True,
         is_cuda=lambda: True,
         get_device_capability=lambda device_id=0: capability,
         get_device_name=lambda device_id=0: CHIP_PROFILES[chip].name,
         is_device_capability=is_device_capability,
+        has_device_capability=has_device_capability,
     )
 
 
@@ -193,6 +201,8 @@ def _should_use_bf16_linear(
     bf16_env: bool,
     bias: bool,
     n: int = 64,
+    k: int = 16,
+    misaligned: bool = False,
 ) -> bool:
     if bf16_env:
         monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "1")
@@ -200,9 +210,19 @@ def _should_use_bf16_linear(
         monkeypatch.delenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", raising=False)
         monkeypatch.delenv("VLLM_PPU_DENSE_BF16_DEEPGEMM", raising=False)
     platform = platform_double(chip)
-    x = types.SimpleNamespace(dtype="bf16", is_contiguous=lambda: True)
+    x_ptr = 0x1008 if misaligned else 0x1000  # 0x1008 % 16 != 0
+    weight_ptr = 0x2008 if misaligned else 0x2000
+    x = types.SimpleNamespace(
+        dtype="bf16",
+        is_contiguous=lambda: True,
+        data_ptr=lambda: x_ptr,
+    )
     weight = types.SimpleNamespace(
-        dtype="bf16", dim=lambda: 2, shape=(n, 16), is_contiguous=lambda: True
+        dtype="bf16",
+        dim=lambda: 2,
+        shape=(n, k),
+        is_contiguous=lambda: True,
+        data_ptr=lambda: weight_ptr,
     )
     fn = extract(
         DEEP_GEMM_PATH,
@@ -212,10 +232,26 @@ def _should_use_bf16_linear(
             "torch": _TORCH,
             "current_platform": platform,
             "has_deep_gemm": lambda: True,
-            "is_ppu_15": lambda: platform.is_device_capability((8, 9)),
         },
     )
     return bool(fn(x, weight, object() if bias else None))
+
+
+def _host_deepgemm_hw_default() -> bool:
+    """The real ``_default_on_m890_plus()`` verdict on this host.
+
+    Mirrors the production fail-closed probe: hosts without an importable
+    ``vllm`` (bare CPU CI) or a non-PPU platform default to off.
+    """
+    try:
+        from vllm.platforms import current_platform
+
+        return bool(
+            current_platform.is_ppu()
+            and current_platform.has_device_capability((8, 9))
+        )
+    except Exception:
+        return False
 
 
 # ===========================================================================
@@ -298,41 +334,66 @@ def test_bf16_and_int8_deepgemm_constructible_on_both_chips(
 
 
 @pytest.mark.parametrize("chip", CHIPS)
-def test_bf16_dense_autoenable_only_on_890p_with_env(monkeypatch, chip) -> None:
-    """BF16 dense DeepGEMM auto-enable needs the env *and* PPU 1.5 (890P)."""
-    # Env unset: never auto-enabled, on either chip.
+def test_bf16_dense_env_opts_in_on_both_chips(monkeypatch, chip) -> None:
+    """The dense switch is a pure env gate; the host decides the default.
+
+    With the env unset the lazy default comes from the *host* platform
+    (``_default_on_m890_plus``): on an M890+ host it defaults on, elsewhere
+    off. An explicit ``=1`` opts in on both chips -- the per-chip N support
+    then applies (the N-rule tests below).
+    """
+    # Env unset: the result is whatever the host's hardware default is.
     assert (
-        _should_use_bf16_linear(monkeypatch, chip, bf16_env=False, bias=False) is False
+        _should_use_bf16_linear(monkeypatch, chip, bf16_env=False, bias=False)
+        is _host_deepgemm_hw_default()
     )
-    # Env set: auto-enabled only on ZW-890P; ZW-810E default dense stays ACEXT.
-    assert _should_use_bf16_linear(monkeypatch, chip, bf16_env=True, bias=False) is (
-        chip == "890p"
-    )
+    # An explicit ``=1`` opts in on both chips (N=64 is even, accepted
+    # everywhere).
+    assert _should_use_bf16_linear(monkeypatch, chip, bf16_env=True, bias=False) is True
     # A present bias always forces the acblas/F.linear fallback.
     assert _should_use_bf16_linear(monkeypatch, chip, bf16_env=True, bias=True) is False
 
 
-@pytest.mark.parametrize(
-    ("n", "expected"),
-    [
-        (1, False),  # odd N, scalar projection included: kernel asserts even N
-        (2, True),
-        (64, True),
-        (4096, True),
-        (3, False),
-        (5, False),
-        (129, False),
-    ],
-)
-def test_bf16_dense_accepts_only_even_n(monkeypatch, n, expected) -> None:
-    """DeepGEMM BF16 dense NT tiling accepts an even N only.
+@pytest.mark.parametrize("n", [1, 2, 3, 5, 64, 129, 4096])
+def test_bf16_dense_accepts_any_n_on_890p(monkeypatch, n) -> None:
+    """DeepGEMM-for-sail bf16_gemm_nt runs any N on 890P+.
 
-    Every odd N -- N == 1 (Kimi-K3 AttnRes scalar projections) included --
-    is rejected at dispatch so it falls back to acblas instead of failing
-    inside the kernel (the PPU "BF16 dense GEMM requires even N" JIT
-    assertion).
+    Odd N (Kimi-K3 AttnRes scalar projections included) and the optimized
+    N=1 GEMV path are all accepted without alignment preconditions.
     """
     assert (
         _should_use_bf16_linear(monkeypatch, "890p", bf16_env=True, bias=False, n=n)
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "misaligned", "expected"),
+    [
+        (64, 16, False, True),  # even N: no constraints
+        (1, 16, False, True),  # N=1 GEMV: K%8==0, aligned operands
+        (1, 16, True, False),  # N=1 GEMV: unaligned x/weight rejected
+        (1, 12, False, False),  # N=1 GEMV: K%8!=0 rejected
+        (3, 16, False, False),  # odd N>1: rejected, falls back to acblas
+        (129, 16, False, False),
+    ],
+)
+def test_bf16_dense_810e_n_rule(monkeypatch, n, k, misaligned, expected) -> None:
+    """On pre-890P (810E) dense accepts even N, or the N=1 GEMV path.
+
+    The GEMV exception additionally requires K % 8 == 0 and 16-byte-aligned
+    operands; anything else falls back to acblas instead of failing inside
+    the JIT kernel (the PPU "BF16 dense GEMM requires even N" assertion).
+    """
+    assert (
+        _should_use_bf16_linear(
+            monkeypatch,
+            "810e",
+            bf16_env=True,
+            bias=False,
+            n=n,
+            k=k,
+            misaligned=misaligned,
+        )
         is expected
     )
