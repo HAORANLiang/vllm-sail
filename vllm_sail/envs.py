@@ -33,10 +33,13 @@ if TYPE_CHECKING:
     PPU_SDK: str = "/usr/local/PPU_SDK"
     VLLM_SAIL_FUSED_RMSNORM_QUANT: bool = False
     VLLM_SAIL_USE_OPT_TOKEN_GROUP_QUANT: bool = False
+    # VLLM_SAIL_DENSE_BF16_DEEPGEMM defaults ON on M890 and later
+    # (capability >= 8.9); ZW-810E keeps the legacy opt-in default False.
+    # The two MoE DeepGEMM switches below default ON unconditionally.
     VLLM_SAIL_DENSE_BF16_DEEPGEMM: bool = False
     VLLM_SAIL_USE_PLA: bool = True
-    VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: bool = False
-    VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT: bool = False
+    VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED: bool = True
+    VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT: bool = True
     VLLM_SAIL_USE_DEEPSELECT: bool = True
     VLLM_SAIL_MOE_BACKEND: str | None = None
     VLLM_SAIL_DENSE_BACKEND: str | None = None
@@ -138,14 +141,43 @@ def _read_env(name: str) -> tuple[str, str | None]:
     return name, None
 
 
-def _bool(name: str, default: bool) -> Callable[[], bool]:
-    """Read a boolean env var, falling back to aliases only when unset."""
+def _bool(
+    name: str, default: bool | Callable[[], bool]
+) -> Callable[[], bool]:
+    """Read a boolean env var, falling back to aliases only when unset.
+
+    ``default`` may be a zero-argument callable for hardware-dependent
+    defaults (e.g. "on for M890 and later"); it is resolved lazily on each
+    read, mirroring the lazy environment resolution.
+    """
 
     def _get() -> bool:
         _, raw = _read_env(name)
         if raw is None:
-            return default
+            return default() if callable(default) else default
         return raw.strip().lower() in _TRUTHY
+
+    return _get
+
+
+def _default_on_m890_plus() -> Callable[[], bool]:
+    """Lazily resolve ``True`` on PPU M890 and later (capability >= 8.9).
+
+    The probe imports ``vllm.platforms`` on first read to avoid an import
+    cycle at module import time, and fails closed (``False``) when the
+    platform is unavailable or not a PPU — e.g. ZW-810E (capability 8.0)
+    keeps the previous opt-in behaviour.
+    """
+
+    def _get() -> bool:
+        try:
+            from vllm.platforms import current_platform
+
+            return current_platform.is_ppu() and current_platform.has_device_capability(
+                (8, 9)
+            )
+        except Exception:
+            return False
 
     return _get
 
@@ -229,9 +261,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SAIL_USE_OPT_TOKEN_GROUP_QUANT": _bool(
         "VLLM_SAIL_USE_OPT_TOKEN_GROUP_QUANT", False
     ),
-    "VLLM_SAIL_DENSE_BF16_DEEPGEMM": _bool("VLLM_SAIL_DENSE_BF16_DEEPGEMM", False),
+    # Default ON for M890 and later (capability >= 8.9); 810E stays opt-in.
+    "VLLM_SAIL_DENSE_BF16_DEEPGEMM": _bool(
+        "VLLM_SAIL_DENSE_BF16_DEEPGEMM", _default_on_m890_plus()
+    ),
     "VLLM_SAIL_USE_PLA": _bool("VLLM_SAIL_USE_PLA", True),
-    "VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED": _bool("VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED", False),
+    "VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED": _bool(
+        "VLLM_SAIL_DEEPGEMM_MOE_TP_FUSED", True
+    ),
     "VLLM_SAIL_USE_DEEPSELECT": _bool("VLLM_SAIL_USE_DEEPSELECT", True),
     # Fuse the second GEMM's input quantization into DeepGEMM's activation
     # kernel (`silu_and_mul` / `situ_and_mul`) instead of running the activation
@@ -241,7 +278,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # `vllm::situ_and_mul` that unquantized BF16 dense MLPs and shared experts
     # run on, through SiluAndMul / SituAndMul.
     "VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT": _bool(
-        "VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT", False
+        "VLLM_SAIL_DEEPGEMM_MOE_FUSED_ACT_QUANT", True
     ),
     # -- MoE ---------------------------------------------------------------
     # PPU MoE group-GEMM backend. Unset means "pick the best available",

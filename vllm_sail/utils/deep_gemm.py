@@ -1315,18 +1315,19 @@ def should_use_deepgemm_for_bf16_linear(
 ) -> bool:
     """Decide whether an unquantized BF16 dense GEMM should run on DeepGEMM.
 
-    Requires `VLLM_SAIL_DENSE_BF16_DEEPGEMM` and PPU 1.5; DeepGEMM dense
+    Requires `VLLM_SAIL_DENSE_BF16_DEEPGEMM` (explicit opt-in on 810E;
+    default-on on M890+); DeepGEMM dense
     GEMM only supports K-major (nt) operands, so both A `[..., K]` and
     B `[N, K]` must be contiguous BF16.  When *bias* is present the caller
     must fall back to acblas (``F.linear``) to avoid the extra elementwise
     add overhead.  Otherwise (no bias) callers can use DeepGEMM when all
     conditions are satisfied.
 
-    The BF16 dense NT kernel tiles ``N`` in pairs and rejects an odd ``N``
-    at JIT time (``BF16 dense GEMM requires even N``).  Every odd ``N`` --
-    including ``N == 1``, which the kernel does not specialise (e.g. the 1-D
-    Kimi-K3 AttnRes projections) -- is rejected here so it falls back to
-    acblas instead of failing inside the kernel.
+    N constraints follow DeepGEMM-for-sail `bf16_gemm_nt`: 890P+ runs any
+    N (odd N and an optimized N=1 path); otherwise -- and on 810E -- N must
+    be even, with the sole exception of the N=1 GEMV path (K % 8 == 0,
+    16-byte-aligned operands). Anything else falls back to acblas instead of
+    failing inside the JIT kernel.
     """
     if bias is not None:
         return False
@@ -1337,16 +1338,22 @@ def should_use_deepgemm_for_bf16_linear(
     if not (current_platform.is_ppu() and has_deep_gemm()):
         return False
 
-    # BF16 dense GEMM is only optimized on PPU 1.5 for now; PPU 1.0 will be
-    # enabled once the kernel-side optimization lands.
-    if not is_ppu_15():
+    if weight.dim() != 2:
         return False
+
+    # 890P+ runs any N; everything else needs even N, or the N=1 GEMV path
+    # (K % 8 == 0, 16-byte-aligned x/w).
+    n, k = weight.shape
+    odd_n_ok = current_platform.has_device_capability((8, 9))
+    if n % 2 != 0 and not odd_n_ok:
+        if n != 1 or k % 8 != 0:
+            return False
+        if x.data_ptr() % 16 != 0 or weight.data_ptr() % 16 != 0:
+            return False
 
     return (
         x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
-        and weight.dim() == 2
-        and weight.shape[0] % 2 == 0
         and x.is_contiguous()
         and weight.is_contiguous()
     )

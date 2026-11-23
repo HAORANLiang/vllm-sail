@@ -126,9 +126,9 @@ def test_ppu_deep_gemm_warmup_gate(monkeypatch: pytest.MonkeyPatch, installed) -
 
     # The gate reads the canonical VLLM_SAIL_* names, which take precedence
     # over their VLLM_PPU_* aliases — a host that exports the canonical names
-    # (e.g. a serving env) must not leak into these assertions.
-    monkeypatch.delenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", raising=False)
-    monkeypatch.delenv("VLLM_PPU_DENSE_BF16_DEEPGEMM", raising=False)
+    # (e.g. a serving env) must not leak into these assertions. The BF16 flag
+    # now defaults ON on M890+ hosts, so pin it off for the backend branches.
+    monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "0")
 
     monkeypatch.setenv("VLLM_SAIL_MOE_BACKEND", "deepgemm")
     assert kw_patch._ppu_deep_gemm_warmup_enabled() is True

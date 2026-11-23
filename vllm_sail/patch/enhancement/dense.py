@@ -27,9 +27,9 @@ def ppu_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    # PPU NOTE: when VLLM_PPU_DENSE_BF16_DEEPGEMM is enabled, route K-major
-    # BF16 dense GEMMs on PPU 1.5 to DeepGEMM; everything else keeps the
-    # default acblas path (F.linear).
+    # PPU NOTE: when VLLM_SAIL_DENSE_BF16_DEEPGEMM is enabled (default on M890+,
+    # opt-in on 810E), route K-major BF16 dense GEMMs to DeepGEMM; everything
+    # else keeps the default acblas path (F.linear).
     from vllm_sail.utils.deep_gemm import should_use_deepgemm_for_bf16_linear
 
     if should_use_deepgemm_for_bf16_linear(x, weight, bias):

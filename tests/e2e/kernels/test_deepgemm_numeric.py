@@ -161,26 +161,40 @@ def test_m_grouped_bf16_gemm_nt_nopad(tokens, experts, n, k):
 
 @pytest.mark.parametrize(("tokens", "experts", "n", "k"), GROUPED_SHAPES)
 def test_bf16_dense_linear_dispatch_gating(tokens, experts, n, k, monkeypatch):
-    """BF16 dense DeepGEMM support is chip- *and* env-gated (capability != default).
+    """BF16 dense DeepGEMM support is env-gated on top of kernel N support.
 
-    Both PPU chips can build bf16 DeepGEMM candidates, but auto-enablement
-    additionally requires PPU 1.5 (890P) plus ``VLLM_SAIL_DENSE_BF16_DEEPGEMM``.
+    Both PPU chips can run bf16 dense DeepGEMM once the env is set; 810E
+    additionally needs even N (or the N=1 GEMV path with K % 8 == 0).
     """
     from vllm_sail import envs as ppu_envs
 
     x = _randn(tokens, k, seed=13)
     w = _randn(n, k, seed=14) * 0.05
-    is_890p = current_platform.is_device_capability((8, 9))
+    odd_n_ok = current_platform.has_device_capability((8, 9))
+    n_ok = n % 2 == 0 or odd_n_ok or (n == 1 and k % 8 == 0)
 
     monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "0")
     assert ppu_envs.VLLM_SAIL_DENSE_BF16_DEEPGEMM is False
     assert should_use_deepgemm_for_bf16_linear(x, w) is False
 
     monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "1")
-    assert should_use_deepgemm_for_bf16_linear(x, w) is is_890p
+    assert should_use_deepgemm_for_bf16_linear(x, w) is n_ok
     # A bias forces the acblas fallback on every chip.
     bias = _randn(n, seed=15)
     assert should_use_deepgemm_for_bf16_linear(x, w, bias) is False
+
+
+def test_bf16_dense_linear_rejects_non_2d_weight(monkeypatch):
+    """A 1-D / 3-D weight falls back to acblas instead of raising."""
+    monkeypatch.setenv("VLLM_SAIL_DENSE_BF16_DEEPGEMM", "1")
+
+    k = 64
+    x = _randn(4, k, seed=21)
+    w1d = _randn(k, seed=22) * 0.05
+    w3d = _randn(2, 8, k, seed=23) * 0.05
+
+    assert should_use_deepgemm_for_bf16_linear(x, w1d) is False
+    assert should_use_deepgemm_for_bf16_linear(x, w3d) is False
 
 
 # ---------------------------------------------------------------------------

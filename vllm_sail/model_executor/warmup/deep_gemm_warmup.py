@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsLinearMethod,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.platforms import current_platform
 from vllm.tracing import instrument
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
@@ -478,20 +479,27 @@ def _bf16_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     if getattr(module, "bias", None) is not None:
         return False
 
-    # DeepGEMM dense GEMM only supports K-major operands, and the BF16
-    # kernel is only optimized on PPU 1.5 for now.  Its BF16 dense NT
-    # kernel tiles N in pairs and rejects any odd N at JIT time ("BF16 dense
-    # GEMM requires even N"), N == 1 included, so only even N is eligible.
+    # DeepGEMM dense GEMM only supports K-major operands. N support follows
+    # DeepGEMM-for-sail `bf16_gemm_nt`: 890P+ runs any N; otherwise (and on
+    # 810E) N must be even, or take the N=1 GEMV path with K % 8 == 0 and
+    # 16-byte-aligned operands.
     # Keep this in sync with `should_use_deepgemm_for_bf16_linear`, which is
-    # what actually decides the runtime path; skipping an odd N here avoids
-    # warming up (and crashing on) a shape the hot path never sends to
-    # DeepGEMM.
-    if w.ndim != 2 or w.shape[0] % 2 != 0:
+    # what actually decides the runtime path; skipping an unsupported N here
+    # avoids warming up (and crashing on) a shape the hot path never sends
+    # to DeepGEMM.
+    if w.ndim != 2:
         return False
+
+    n, k = w.shape
+    odd_n_ok = current_platform.has_device_capability((8, 9))
+    if n % 2 != 0 and not odd_n_ok:
+        if n != 1 or k % 8 != 0:
+            return False
+        if w.data_ptr() % 16 != 0:
+            return False
 
     return (
         has_deep_gemm()
-        and is_ppu_15()
         and w.dtype == torch.bfloat16
         and w.is_contiguous()
     )

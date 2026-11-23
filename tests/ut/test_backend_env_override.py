@@ -97,12 +97,18 @@ def platform_double(chip: str) -> types.SimpleNamespace:
             return capability == tuple(value)
         return capability[0] * 10 + capability[1] >= value
 
+    def has_device_capability(value) -> bool:
+        if isinstance(value, tuple):
+            return capability >= tuple(value)
+        return capability[0] * 10 + capability[1] >= value
+
     return types.SimpleNamespace(
         is_ppu=lambda: True,
         is_cuda=lambda: True,
         get_device_capability=lambda device_id=0: capability,
         get_device_name=lambda device_id=0: CHIP_PROFILES[chip].name,
         is_device_capability=is_device_capability,
+        has_device_capability=has_device_capability,
     )
 
 
@@ -117,6 +123,22 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """Unset a variable and its alias so a default path is truly default."""
     monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv(_ENV_ALIASES.get(name, name), raising=False)
+
+
+def _host_deepgemm_hw_default() -> bool:
+    """Host-side M890-and-later default for the DeepGEMM switches.
+
+    The env defaults are hardware-dependent (ON for capability >= 8.9),
+    so the "unset" branch of a test must not assume the legacy False.
+    """
+    try:
+        from vllm.platforms import current_platform
+
+        return current_platform.is_ppu() and current_platform.has_device_capability(
+            (8, 9)
+        )
+    except Exception:
+        return False
 
 
 class _ActivationFormat(enum.Enum):
@@ -344,20 +366,26 @@ def test_dense_fp8_linear_still_respects_shape_gate(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("chip", CHIPS)
-def test_dense_bf16_deepgemm_env_autonables_only_on_890p(monkeypatch, chip) -> None:
-    """BF16 dense DeepGEMM auto-enable needs the env *and* PPU 1.5 (890P).
+def test_dense_bf16_deepgemm_env_opts_in_on_both_chips(monkeypatch, chip) -> None:
+    """BF16 dense DeepGEMM default is host-hardware; opt-in works on both.
 
-    ZW-810E hardware supports BF16 DeepGEMM, but its default dense backend is
-    ACEXT, so ``VLLM_SAIL_DENSE_BF16_DEEPGEMM=1`` must not flip BF16 dense onto
-    DeepGEMM there -- capability support is not default auto-selection.
+    The unset default is resolved from the host platform (ON for capability
+    >= 8.9, off on an 810E host -- capability support is not default
+    auto-selection). The function itself is chip-agnostic apart from N:
+    DeepGEMM-for-sail supports BF16 dense on both chips (810E: even N, or
+    N=1 GEMV with K % 8 == 0; the simulated weight has N=64), so with the
+    env set both simulated chips dispatch to DeepGEMM.
     """
     name = "VLLM_SAIL_DENSE_BF16_DEEPGEMM"
+    host_default = _host_deepgemm_hw_default()
 
     _clear_env(monkeypatch, name)
-    assert _should_use_bf16_linear(chip, bias=False) is False
+    # No in-function chip gate remains: the unset result follows the host
+    # hardware default on either simulated chip.
+    assert _should_use_bf16_linear(chip, bias=False) is host_default
 
     monkeypatch.setenv(name, "1")
-    assert _should_use_bf16_linear(chip, bias=False) is (chip == "890p")
+    assert _should_use_bf16_linear(chip, bias=False) is True
 
     # A present bias always forces the acblas/F.linear fallback.
     assert _should_use_bf16_linear(chip, bias=True) is False

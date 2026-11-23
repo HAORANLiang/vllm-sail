@@ -14,13 +14,25 @@ import pytest
 
 from vllm_sail import envs
 
+
+def _deepgemm_hw_default() -> bool:
+    """M890-and-later hardware default for the DeepGEMM switches."""
+    try:
+        from vllm.platforms import current_platform
+
+        return current_platform.is_ppu() and current_platform.has_device_capability(
+            (8, 9)
+        )
+    except Exception:
+        return False
+
+
 BOOL_DEFAULTS = {
     "FUSED_RMSNORM_QUANT": False,
     "USE_OPT_TOKEN_GROUP_QUANT": False,
-    "DENSE_BF16_DEEPGEMM": False,
     "USE_PLA": True,
-    "DEEPGEMM_MOE_TP_FUSED": False,
-    "DEEPGEMM_MOE_FUSED_ACT_QUANT": False,
+    "DEEPGEMM_MOE_TP_FUSED": True,
+    "DEEPGEMM_MOE_FUSED_ACT_QUANT": True,
     "USE_DEEPSELECT": True,
     "FUSED_GDN_DECODE": True,
     "DISABLE_MOE_WNA16_CUDA": False,
@@ -153,6 +165,8 @@ def test_defaults_and_canonical_snapshot() -> None:
     expected["VLLM_GDN_DECODE_KERNEL"] = "auto"
     expected["VLLM_SAIL_FP8_LOAD_POLICY"] = None
     expected["VLLM_SAIL_STEP5_DSA_PREFILL_BACKEND"] = "flashinfer"
+    # Hardware-dependent default: ON for M890 and later, opt-in on 810E.
+    expected["VLLM_SAIL_DENSE_BF16_DEEPGEMM"] = _deepgemm_hw_default()
     assert envs.snapshot() == expected
     assert set(envs.environment_variables) == set(expected)
     for suffix in (*BOOL_DEFAULTS, *INT_DEFAULTS, *BACKENDS, *STRING_DEFAULTS):
