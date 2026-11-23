@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     VLLM_SAIL_USE_TRITON_INT8_QUANT: bool = True
     VLLM_SAIL_FP8_LOAD_POLICY: str | None = None
     VLLM_SAIL_ENABLE_FP8_TO_INT8: bool = False
-    VLLM_SAIL_KPOOL_DECODE_LOGITS: str = "non_paged"
+    VLLM_SAIL_KPOOL_DECODE_LOGITS: str = "paged"
     VLLM_SAIL_KPOOL_MAX_DENSE_POOLS: int = 1 << 21
     VLLM_SAIL_STEP5_DSA_SCORES: str = "v0"
     VLLM_SAIL_STEP5_DSA_SCORE_MAX_BYTES: int = 1 << 30
@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     VLLM_SAIL_FUSED_NORM_ROPE_ATTN: bool = False
     VLLM_SAIL_PPU_KV_MXFP8: bool = False
     VLLM_SAIL_PPU_KV_NVFP4: bool = False
+    VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE: bool = False
     VLLM_DEEPEPLL_RECV_HOOK: bool = True
     VLLM_GDN_DECODE_KERNEL: str = "auto"
 
@@ -106,13 +107,14 @@ if TYPE_CHECKING:
     VLLM_PPU_FUSED_NORM_ROPE_ATTN: bool = False
     VLLM_PPU_PPU_KV_MXFP8: bool = False
     VLLM_PPU_PPU_KV_NVFP4: bool = False
+    VLLM_PPU_FUSED_ATTN_PER_TOKEN_SCALE: bool = False
 
 _TRUTHY = ("true", "1", "yes", "on")
 
 #: Backend names accepted by both MoE and dense GEMM selection.
 GEMM_BACKENDS = ("deepgemm", "acext", "triton")
 GDN_DECODE_KERNELS = ("auto", "cuda", "pla", "triton")
-KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged",)
+KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged", "paged")
 #: Qwen4Exp QSA sparse-attention kernels. ``cuda`` is FA3's QSA path, which only
 #: exists on PPU builds carrying the ``qsa_allow_aiu`` argument.
 QSA_KERNELS = ("auto", "cuda", "triton")
@@ -275,11 +277,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SAIL_ENABLE_FP8_TO_INT8": _bool("VLLM_SAIL_ENABLE_FP8_TO_INT8", False),
     # Decode-time logits backend for the glm5_next kpool indexer.
-    # ``non_paged`` (default) gathers the pool K cache and uses the non-paged
-    # int8 kernel (same one as prefill). The paged INT8 kernel writes only
-    # part of the logits on PPU, so selecting it is rejected until fixed.
+    # ``paged`` (default) calls the paged INT8 logits kernel directly. The
+    # earlier ``non_paged`` default gathered the whole pool K cache per step,
+    # which costs O(batch * context) and is bounded by
+    # VLLM_SAIL_KPOOL_MAX_DENSE_POOLS. ``non_paged`` stays available as an
+    # explicit opt-in for A/B work.
+    # NOTE: the original reason for the ``non_paged`` default was a probe
+    # claiming the paged INT8 kernel wrote only 2 of every 64 logits. That
+    # probe was wrong: it initialised the paged cache with a per-token
+    # ``[K, scale]`` interleaved layout, while the kernel expects each page to
+    # hold all K rows first and then the float32 scale plane. With the correct
+    # layout the kernel writes every column (verified over contexts 64 and
+    # 32768, three runs each), so there is no accuracy reason to avoid paged.
     "VLLM_SAIL_KPOOL_DECODE_LOGITS": _choice(
-        "VLLM_SAIL_KPOOL_DECODE_LOGITS", "non_paged", KPOOL_DECODE_LOGITS_BACKENDS
+        "VLLM_SAIL_KPOOL_DECODE_LOGITS", "paged", KPOOL_DECODE_LOGITS_BACKENDS
     ),
     # Dense decode fallback bound: batch * ceil(max_seq_len / kpool) pools.
     # Above it the fallback would materialise an O(batch * context) logits
@@ -370,6 +381,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is unavailable on 8.0) and sliding_window % 8 == 0; the fused gate closes
     # with a named reason otherwise. Lossy: accuracy must be re-measured.
     "VLLM_SAIL_PPU_KV_NVFP4": _bool("VLLM_SAIL_PPU_KV_NVFP4", False),
+    # Output FP8 scale format of the fused V4.1 norm-rope attention kernel
+    # (FlashMLA-for-sail PR#59, "channel-wise output and runtime format
+    # selection"). False (default) -> the PR#54 contract: num_per_channels=32
+    # with TMA-aligned, rounded, packed UE8M0 scales, i.e. an int32
+    # [tokens, n_wv_group, D/128] buffer. True -> one exact FP32 dequantization
+    # scale per token and WV group: num_per_channels=4096 with all three format
+    # flags cleared, i.e. a contiguous float32 [tokens, n_wv_group, 1] buffer.
+    # Both formats live in the same PR#59 wheel; the kernel hard-requires
+    # capability 8.9 (ZW-M890P) for the per-token format and rejects any mixed
+    # flag combination, so the fused gate closes with a named reason on 8.0.
+    # Opt-in and lossless-relative-to-block32: the FP32 scale avoids the UE8M0
+    # power-of-two rounding, so accuracy must be re-measured against the
+    # default arm rather than assumed. Requires a PR#59 (or newer) flash_mla
+    # wheel; older wheels reject num_per_channels=4096.
+    "VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE": _bool(
+        "VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", False
+    ),
     # -- Distributed MoE ---------------------------------------------------
     # DeepEP low-latency deferred recv hook. The hook only pays off on backends
     # that can overlap the deferred receive with other compute; setting this to

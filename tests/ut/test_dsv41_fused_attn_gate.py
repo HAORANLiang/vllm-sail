@@ -10,7 +10,13 @@ PR#229 that are decidable without a kernel:
   aliases and SAIL precedence;
 * ``fused_gate`` in ``vllm_sail/models/deepseek_v41/flash_mla_mega_attn.py``:
   every gate branch (env, kv-record, platform, capability, the opt-in NVFP4
-  capability/top-k checks, wheel probe, topology) and the fully-open report;
+  capability/top-k checks, the PR#59 per-token-scale capability check, wheel
+  probe, topology) and the fully-open report;
+* the PR#59 output scale arms: ``VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE`` parsing
+  and alias precedence, ``_output_scale_args`` for both arms (read live, so an
+  A/B run flips only the environment), the ``_call_fused`` wheel-requirement
+  error, and static wiring of ``_alloc_attn_out`` / ``_o_proj`` / both kernel
+  call sites;
 * the ``dsv41_kv_record`` patch module: non-PPU delegation, once-per-process
   env caching, the forensic log line, and the patch metadata (target,
   affected_versions against the repo's SUPPORTED_RANGE);
@@ -19,12 +25,20 @@ PR#229 that are decidable without a kernel:
 
 Torch-dependent bodies (``_o_proj``, ``_dequant_fused_output``,
 ``_forward_{decode,prefill}_mega``) are intentionally out of scope here;
-they are covered by the FlashMLA PR#54 kernel UTs plus on-device smoke.
+they are covered by the FlashMLA kernel UTs (PR#54, plus PR#59's
+``--output-scale {block32,per-token}`` cases) and on-device smoke.
+
+The one exception is the optional numerical tier at the bottom of this file:
+``_wo_a_scale_mode`` and ``_dequant_fp8_per_channel`` are pure tensor helpers
+with no kernel and no vLLM dependency, so they are executed against real torch
+when it is installed and skipped explicitly when it is not. The CPU-only merge
+gate therefore still passes without torch, vLLM or a device.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +56,8 @@ _SWITCH_NAMES = (
     "VLLM_PPU_PPU_KV_MXFP8",
     "VLLM_SAIL_PPU_KV_NVFP4",
     "VLLM_PPU_PPU_KV_NVFP4",
+    "VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE",
+    "VLLM_PPU_FUSED_ATTN_PER_TOKEN_SCALE",
 )
 
 
@@ -92,6 +108,10 @@ def test_new_switches_default_off() -> None:
         ("VLLM_SAIL_FUSED_NORM_ROPE_ATTN", "VLLM_PPU_FUSED_NORM_ROPE_ATTN"),
         ("VLLM_SAIL_PPU_KV_MXFP8", "VLLM_PPU_PPU_KV_MXFP8"),
         ("VLLM_SAIL_PPU_KV_NVFP4", "VLLM_PPU_PPU_KV_NVFP4"),
+        (
+            "VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE",
+            "VLLM_PPU_FUSED_ATTN_PER_TOKEN_SCALE",
+        ),
     ],
 )
 def test_switches_turn_on_via_either_name(
@@ -111,6 +131,10 @@ def test_switches_turn_on_via_either_name(
         ("VLLM_SAIL_FUSED_NORM_ROPE_ATTN", "VLLM_PPU_FUSED_NORM_ROPE_ATTN"),
         ("VLLM_SAIL_PPU_KV_MXFP8", "VLLM_PPU_PPU_KV_MXFP8"),
         ("VLLM_SAIL_PPU_KV_NVFP4", "VLLM_PPU_PPU_KV_NVFP4"),
+        (
+            "VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE",
+            "VLLM_PPU_FUSED_ATTN_PER_TOKEN_SCALE",
+        ),
     ],
 )
 def test_sail_name_takes_precedence_over_ppu_alias(
@@ -148,6 +172,10 @@ def gate(modules, monkeypatch):
         dequant_mxfp8_to_bf16=lambda weight, scale: weight,
     )
     modules(
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+        kFp8DynamicTokenSym="kFp8DynamicTokenSym",
+    )
+    modules(
         "vllm.models.deepseek_v41.common.ops",
         combine_topk_swa_indices=lambda *a, **k: None,
         dequantize_and_gather_k_cache=lambda *a, **k: None,
@@ -159,6 +187,9 @@ def gate(modules, monkeypatch):
         _QUANT_GROUP=32,
         _ROPE_DIM=64,
         _token_slice=lambda out, start, end: out,
+        alloc_mega_attn_output=lambda num_tokens, n_wv_group, device: SimpleNamespace(
+            num_tokens=num_tokens, n_wv_group=n_wv_group, device=device
+        ),
         DeepseekV4MegaAttnAttention=type("DeepseekV4MegaAttnAttention", (), {}),
     )
     modules(
@@ -777,3 +808,602 @@ def test_forward_mega_methods_cast_positions_to_int32() -> None:
             f"{name} lost the defensive int32 cast for token_positions; the "
             "PPU fused kernel rejects int64 positions (seen on lingjun-08)."
         )
+
+
+# ---------------------------------------------------------------------------
+# PR#59 per-token FP32 output scale arm (FlashMLA-for-sail 7bce34f)
+# ---------------------------------------------------------------------------
+
+
+def _method_source(name: str) -> str:
+    """Source of a PPU mega-attention method, for torch-free wiring checks."""
+    import ast
+
+    from tests.support.source import ROOT
+
+    source = (ROOT / "vllm_sail/models/deepseek_v41/flash_mla_mega_attn.py").read_text()
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "PPUDeepseekV4MegaAttnAttention"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    return ast.get_source_segment(source, method) or ""
+
+
+def test_per_token_scale_switch_defaults_off() -> None:
+    """Opt-in contract: the default arm stays byte-identical to PR#54."""
+    assert envs.VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE is False
+    assert envs.snapshot()["VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE"] is False
+
+
+def test_per_token_scale_group_is_the_wv_row_width(gate) -> None:
+    """PR#59 selects the per-token format with num_per_channels == 8 * 512."""
+    assert gate.module._PER_TOKEN_SCALE_GROUP == 8 * 512 == 4096
+
+
+def test_output_scale_args_default_arm_is_the_pr54_contract(gate) -> None:
+    assert gate.module._output_scale_args() == {
+        "num_per_channels": 32,
+        "use_tma_aligned_col_major_sf": True,
+        "round_sf": True,
+        "use_packed_ue8m0": True,
+    }
+
+
+def test_output_scale_args_per_token_arm_clears_every_flag(gate) -> None:
+    """The kernel rejects mixed combinations, so all three flags must flip."""
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+    assert gate.module._output_scale_args() == {
+        "num_per_channels": 4096,
+        "use_tma_aligned_col_major_sf": False,
+        "round_sf": False,
+        "use_packed_ue8m0": False,
+    }
+
+
+def test_output_scale_args_are_read_live_not_cached(gate) -> None:
+    """A/B flips only the env var: one code tree, one wheel, both arms."""
+    assert gate.module._output_scale_args()["num_per_channels"] == 32
+    gate.monkeypatch.setenv("VLLM_PPU_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+    assert gate.module._output_scale_args()["num_per_channels"] == 4096
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "0")
+    assert gate.module._output_scale_args()["num_per_channels"] == 32
+
+
+def test_gate_closes_per_token_arm_on_sm80(gate) -> None:
+    gate.set_wheel("api")
+    gate.set_capability(SimpleNamespace(major=8, minor=0))
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+    ok, report = gate.module.fused_gate(_config())
+    assert ok is False
+    assert report.startswith("gate-per-token-cap:")
+    assert "8.9" in report
+
+
+def test_gate_keeps_per_token_arm_open_on_sm89(gate) -> None:
+    gate.set_wheel("api")
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+    ok, report = gate.module.fused_gate(_config())
+    assert ok is True
+    assert report.startswith("all gates open: cap=8.9 ")
+    assert "output_scale=per_token_fp32" in report
+
+
+def test_gate_open_report_names_the_default_arm(gate) -> None:
+    gate.set_wheel("api")
+    ok, report = gate.module.fused_gate(_config())
+    assert ok is True
+    assert "output_scale=per32_ue8m0" in report
+
+
+def test_per_token_switch_alone_does_not_enable_the_fused_path(gate) -> None:
+    """The master switch still governs; the scale switch only picks the arm."""
+    gate.set_wheel("api")
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_NORM_ROPE_ATTN", "0")
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+    ok, report = gate.module.fused_gate(_config())
+    assert ok is False
+    assert report.startswith("gate-env:")
+
+
+def test_alloc_attn_out_is_arm_aware() -> None:
+    """The per-token arm needs its own float32 buffer, not upstream's int32."""
+    body = _method_source("_alloc_attn_out")
+    for needle in (
+        "alloc_mega_attn_output",
+        "_per_token_scale()",
+        "torch.float32",
+        "kFp8DynamicTokenSym",
+        "replace(",
+    ):
+        assert needle in body, f"_alloc_attn_out lost {needle!r}"
+
+
+def test_o_proj_asserts_the_selected_scale_format() -> None:
+    body = _method_source("_o_proj")
+    for needle in ("_per_token_scale()", "torch.float32", "torch.int32"):
+        assert needle in body, f"_o_proj lost the arm-aware check {needle!r}"
+
+
+def test_both_call_sites_share_the_output_scale_args() -> None:
+    """No call site may hardcode one arm's flags independently."""
+    for name in ("_forward_decode_mega", "_forward_prefill_mega"):
+        body = _method_source(name)
+        assert "**_output_scale_args()" in body, (
+            f"{name} no longer takes the shared PR#59 output-format arguments"
+        )
+        assert "num_per_channels=" not in body, (
+            f"{name} hardcodes num_per_channels; the two arms must stay "
+            "selectable from one place"
+        )
+        assert "_call_fused(" in body, f"{name} bypasses the wheel-error wrapper"
+
+
+def test_call_fused_names_the_wheel_requirement_on_format_rejection(gate) -> None:
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+
+    def reject(**kwargs):
+        raise RuntimeError("num_per_channels == 32")
+
+    gate.monkeypatch.setattr(gate.module, "_API", SimpleNamespace(decode=reject))
+    with pytest.raises(RuntimeError, match="PR#59"):
+        gate.module._call_fused("decode", num_per_channels=4096)
+
+
+def test_call_fused_does_not_relabel_default_arm_errors(gate) -> None:
+    def reject(**kwargs):
+        raise RuntimeError("num_per_channels == 32")
+
+    gate.monkeypatch.setattr(gate.module, "_API", SimpleNamespace(decode=reject))
+    with pytest.raises(RuntimeError) as exc:
+        gate.module._call_fused("decode", num_per_channels=32)
+    assert "PR#59" not in str(exc.value)
+
+
+def test_call_fused_reraises_unrelated_errors_unchanged(gate) -> None:
+    gate.monkeypatch.setenv("VLLM_SAIL_FUSED_ATTN_PER_TOKEN_SCALE", "1")
+
+    def boom(**kwargs):
+        raise RuntimeError("token_positions must have dtype torch::kInt32")
+
+    gate.monkeypatch.setattr(gate.module, "_API", SimpleNamespace(decode=boom))
+    with pytest.raises(RuntimeError, match="token_positions"):
+        gate.module._call_fused("decode")
+
+
+# ---------------------------------------------------------------------------
+# per-channel wo_a scales: shape-aware load permutation + per-channel dequant
+# ---------------------------------------------------------------------------
+#
+# An FP8 weight-per-channel checkpoint (``fp8_channelwise_layers``) stores one
+# scale per output row, so ``wo_a.weight_scale`` has a size-1 K axis while
+# upstream unconditionally registers the 128-entry per-32 chunk permutation on
+# it; loading aborted with ``output with shape [rows, 1] doesn't match the
+# broadcast shape [rows, 128]``. The patch makes ``permute_on_load`` skip the
+# permutation for that geometry and keeps every other geometry delegated.
+#
+# The dequantization recipe itself needs torch, so it is pinned statically
+# here (same pattern as the int32-cast regression above) and verified on device.
+
+
+@pytest.fixture
+def permute_patch(modules, patch_utils_module):
+    """Load the shape-aware ``permute_on_load`` patch against a stub target."""
+    logs = []
+    logger = SimpleNamespace(info_once=lambda msg, *a: logs.append((msg, a)))
+    modules("vllm.logger", init_logger=lambda name: logger)
+    calls = []
+
+    def permute_on_load(param, perm, dim):
+        calls.append((param, perm, dim))
+
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn",
+        permute_on_load=permute_on_load,
+    )
+    module = load_patch("vllm_sail/patch/enhancement/deepseek_v41_fused_layout.py")
+    return SimpleNamespace(
+        module=module,
+        patched=module.permute_on_load,
+        original=permute_on_load,
+        calls=calls,
+        logs=logs,
+        registry=patch_utils_module.PATCH_REGISTRY,
+        marker=patch_utils_module.PATCH_MARKER,
+    )
+
+
+@pytest.mark.parametrize(("axis", "perm_length"), [(4096, 4096), (128, 128), (1, 1)])
+def test_scale_permute_action_applies_to_one_entry_per_element(
+    permute_patch, axis, perm_length
+) -> None:
+    """Canonical geometry is what the permutation was written for."""
+    assert permute_patch.module.scale_permute_action(axis, perm_length) == "apply"
+
+
+@pytest.mark.parametrize(("axis", "perm_length"), [(1, 128), (1, 4096)])
+def test_scale_permute_action_skips_per_channel_scale(
+    permute_patch, axis, perm_length
+) -> None:
+    """A per-row scale is constant along K, so the K-chunk move is identity."""
+    assert permute_patch.module.scale_permute_action(axis, perm_length) == "skip"
+
+
+@pytest.mark.parametrize(("axis", "perm_length"), [(128, 4096), (4096, 128), (0, 128)])
+def test_scale_permute_action_rejects_unknown_geometry(
+    permute_patch, axis, perm_length
+) -> None:
+    """Anything else means caller and permutation disagree: never guess."""
+    with pytest.raises(AssertionError, match="geometry mismatch"):
+        permute_patch.module.scale_permute_action(axis, perm_length)
+
+
+def test_permute_on_load_skips_per_channel_scale(permute_patch) -> None:
+    param = SimpleNamespace(shape=(1024, 1))
+    perm = SimpleNamespace(numel=lambda: 128)
+    permute_patch.patched(param, perm, 1)
+    assert permute_patch.calls == []
+    assert permute_patch.logs, "the skip must leave one forensic line"
+    assert "skipping the 32-chunk K permutation" in permute_patch.logs[-1][0]
+
+
+def test_permute_on_load_delegates_canonical_geometry(permute_patch) -> None:
+    param = SimpleNamespace(shape=(1024, 4096))
+    perm = SimpleNamespace(numel=lambda: 4096)
+    permute_patch.patched(param, perm, 1)
+    assert permute_patch.calls == [(param, perm, 1)]
+    assert permute_patch.logs == []
+
+
+def test_permute_on_load_rejects_geometry_mismatch(permute_patch) -> None:
+    param = SimpleNamespace(shape=(1024, 64))
+    perm = SimpleNamespace(numel=lambda: 128)
+    with pytest.raises(AssertionError, match="geometry mismatch"):
+        permute_patch.patched(param, perm, 1)
+    assert permute_patch.calls == []
+
+
+def test_fused_layout_patch_metadata(permute_patch) -> None:
+    import sys
+
+    target = "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn.permute_on_load"
+    stub = sys.modules["vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn"]
+    # The replacement is installed on the module upstream reads at call time.
+    assert stub.permute_on_load is permute_patch.patched
+    originals = getattr(permute_patch.patched, permute_patch.marker, None)
+    assert originals is not None and target in originals
+    assert originals[target] is permute_patch.original
+    records = [r for r in permute_patch.registry if r.target == target]
+    assert records, "the loader patch did not register a PatchRecord"
+    record = records[-1]
+    assert record.kind == "module"
+    assert record.affected_versions == SUPPORTED_RANGE
+    assert record.remove_when.strip() and record.reason.strip()
+
+
+def test_perchannel_loader_fix_source_is_pinned() -> None:
+    """Source-level guards for the pieces the offline tier cannot execute."""
+    from tests.support.source import ROOT
+
+    patch_source = (
+        ROOT / "vllm_sail/patch/enhancement/deepseek_v41_fused_layout.py"
+    ).read_text()
+    # Patch the *consumer* module: upstream holds a by-value alias.
+    assert "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn" in patch_source
+    assert '"permute_on_load"' in patch_source
+    assert 'return "skip"' in patch_source
+    # The new module is installed with the rest of the enhancement category.
+    init_source = (ROOT / "vllm_sail/patch/enhancement/__init__.py").read_text()
+    assert "deepseek_v41_fused_layout" in init_source
+
+    model_source = (
+        ROOT / "vllm_sail/models/deepseek_v41/flash_mla_mega_attn.py"
+    ).read_text()
+    # Definition + the single call site in the 1-byte branch.
+    assert model_source.count("_dequant_fp8_per_channel(") == 2
+    assert "_SCALE_PER_CHANNEL" in model_source
+    assert "_SCALE_MXFP8_BLOCK" in model_source
+    assert "wo_a_scale_mode=%s scale_permute=%s" in model_source
+    # The block recipe stays reachable and is still the delegated default.
+    assert "dequant_mxfp8_to_bf16(weight, weight_scale)" in model_source
+
+
+def test_o_proj_selects_the_dequant_recipe_by_scale_layout() -> None:
+    """The 1-byte wo_a branch must dispatch on scale_mode, not on dtype alone.
+
+    Broadcasting the MXFP8 block helper over a per-channel ``[rows, 1]`` FP32
+    scale produces finite-looking garbage instead of failing, so the dispatch
+    and its loud else-branch are pinned statically.
+    """
+    import ast
+
+    from tests.support.source import ROOT
+
+    source = (ROOT / "vllm_sail/models/deepseek_v41/flash_mla_mega_attn.py").read_text()
+    tree = ast.parse(source)
+    cls = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        and node.name == "PPUDeepseekV4MegaAttnAttention"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_o_proj"
+    )
+    body = ast.get_source_segment(source, method) or ""
+    assert "scale_mode = (" in body, "_o_proj must classify the scale layout"
+    assert "_wo_a_scale_mode(weight, weight_scale)" in body
+    assert "if scale_mode == _SCALE_PER_CHANNEL:" in body
+    assert "elif scale_mode == _SCALE_MXFP8_BLOCK:" in body
+    assert "needs a quantized scale layout" in body, (
+        "an unrecognised scale layout must raise, not fall through to a "
+        "broadcasting helper"
+    )
+    # The classifier itself must reject unknown layouts rather than guess.
+    classifier = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_wo_a_scale_mode"
+    )
+    classifier_body = ast.get_source_segment(source, classifier) or ""
+    assert "unrecognised wo_a weight_scale layout" in classifier_body
+    assert "scale.numel() == rows" in classifier_body
+
+
+# ---------------------------------------------------------------------------
+# Optional numerical tier: real torch, still no vLLM and no device.
+# ---------------------------------------------------------------------------
+#
+# Everything above pins wiring statically. The two helpers that actually
+# compute numbers are executed here against real torch when it is installed,
+# and skipped explicitly when it is not -- same contract as
+# tests/ut/test_portable_weight_packing.py, so the CPU-only merge gate keeps
+# passing without torch.
+#
+# Exactness note: e4m3 carries 3 mantissa bits, so the integers 1..16 are
+# exact in it, and bf16 carries 8, so those integers times a power of two are
+# exact in bf16. Every expected value below is therefore representable and the
+# comparisons use torch.equal rather than a tolerance.
+
+
+@pytest.fixture
+def numerics(modules, monkeypatch):
+    """Load the real model module with real torch and stubbed vLLM imports."""
+    torch = pytest.importorskip("torch", reason="numerical tier requires torch")
+    logs: list = []
+    logger = SimpleNamespace(
+        info_once=lambda msg, *a: logs.append((msg, a)),
+        warning_once=lambda msg, *a: logs.append((msg, a)),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    modules("vllm.logger", init_logger=lambda name: logger)
+    modules(
+        "vllm.model_executor.layers.fusion.quant_activation",
+        QuantizedActivation=type("QuantizedActivation", (), {}),
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.mxfp8_utils",
+        dequant_mxfp8_to_bf16=lambda weight, scale: weight,
+    )
+    modules(
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+        kFp8DynamicTokenSym="kFp8DynamicTokenSym",
+    )
+    modules(
+        "vllm.models.deepseek_v41.common.ops",
+        combine_topk_swa_indices=lambda *a, **k: None,
+        dequantize_and_gather_k_cache=lambda *a, **k: None,
+    )
+    modules("vllm.models.deepseek_v41.common.ops.fused_layout", WV_GROUP_SIZE=8)
+    modules(
+        "vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn",
+        _HEAD_DIM_V=512,
+        _QUANT_GROUP=32,
+        _ROPE_DIM=64,
+        _token_slice=lambda out, start, end: out,
+        alloc_mega_attn_output=lambda num_tokens, n_wv_group, device: SimpleNamespace(
+            num_tokens=num_tokens, n_wv_group=n_wv_group, device=device
+        ),
+        DeepseekV4MegaAttnAttention=type("DeepseekV4MegaAttnAttention", (), {}),
+    )
+    modules(
+        "vllm.models.deepseek_v41.sparse_mla",
+        DeepseekV4FlashMLABackend=type("DeepseekV4FlashMLABackend", (), {}),
+    )
+    modules("vllm.utils.math_utils", round_up=lambda x, y: -(-x // y) * y)
+    modules("vllm.v1.worker.workspace", current_workspace_manager=lambda: None)
+    modules(
+        "vllm.platforms",
+        current_platform=SimpleNamespace(
+            is_ppu=lambda: True,
+            get_device_capability=lambda device_id=0: SimpleNamespace(major=8, minor=9),
+        ),
+    )
+    module = load_patch("vllm_sail/models/deepseek_v41/flash_mla_mega_attn.py")
+    return SimpleNamespace(module=module, torch=torch, logs=logs)
+
+
+def _fp8_weight(torch, rows: int, cols: int):
+    """Integers 1..16 in e4m3: every value is exactly representable."""
+    values = torch.arange(rows * cols, dtype=torch.float32).reshape(rows, cols)
+    return (values % 16 + 1).to(torch.float8_e4m3fn)
+
+
+def _row_scale(torch, rows: int, spell: str):
+    """Distinct powers of two per row, as ``[rows]`` or ``[rows, 1]``."""
+    scale = torch.tensor(
+        [2.0 ** ((i % 5) - 2) for i in range(rows)], dtype=torch.float32
+    )
+    return scale if spell == "flat" else scale.reshape(rows, 1)
+
+
+def _row_loop_reference(torch, weight, scale):
+    """Independent reference: one Python-level row at a time, no broadcasting."""
+    flat = scale.reshape(-1)
+    return torch.stack(
+        [
+            (weight[i].to(torch.float32) * float(flat[i])).to(torch.bfloat16)
+            for i in range(weight.shape[0])
+        ]
+    )
+
+
+@pytest.mark.requires_runtime
+def test_per_channel_dequant_scales_each_row_by_its_own_multiplier(numerics) -> None:
+    torch = numerics.torch
+    weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]], dtype=torch.float32)
+    out = numerics.module._dequant_fp8_per_channel(weight, scale)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == weight.shape
+    expected = torch.tensor([[0.5, 1.0], [6.0, 8.0]], dtype=torch.bfloat16)
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("spell", ["flat", "column"])
+@pytest.mark.parametrize(("rows", "cols"), [(4, 128), (256, 512), (64, 4096)])
+def test_per_channel_dequant_matches_an_independent_row_loop(
+    numerics, spell, rows, cols
+) -> None:
+    """The reshape-and-broadcast recipe must equal a per-row Python loop."""
+    torch = numerics.torch
+    weight = _fp8_weight(torch, rows, cols)
+    scale = _row_scale(torch, rows, spell)
+    out = numerics.module._dequant_fp8_per_channel(weight, scale)
+    assert out.dtype == torch.bfloat16
+    assert out.shape == (rows, cols)
+    assert torch.equal(out, _row_loop_reference(torch, weight, scale))
+
+
+@pytest.mark.requires_runtime
+def test_flat_and_column_scale_spellings_dequantize_identically(numerics) -> None:
+    torch = numerics.torch
+    weight = _fp8_weight(torch, 8, 128)
+    flat = numerics.module._dequant_fp8_per_channel(
+        weight, _row_scale(torch, 8, "flat")
+    )
+    column = numerics.module._dequant_fp8_per_channel(
+        weight, _row_scale(torch, 8, "column")
+    )
+    assert torch.equal(flat, column)
+
+
+@pytest.mark.requires_runtime
+def test_per_channel_dequant_does_not_reuse_the_first_row_scale(numerics) -> None:
+    """Guards the exact broadcasting bug the block helper would have produced."""
+    torch = numerics.torch
+    weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]], dtype=torch.float32)
+    out = numerics.module._dequant_fp8_per_channel(weight, scale)
+    first_row_only = (weight.to(torch.float32) * scale[0]).to(torch.bfloat16)
+    assert not torch.equal(out, first_row_only)
+
+
+@pytest.mark.requires_runtime
+def test_per_channel_dequant_handles_zero_and_negative_scales(numerics) -> None:
+    torch = numerics.torch
+    weight = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.0], [-1.0], [2.0]], dtype=torch.float32)
+    out = numerics.module._dequant_fp8_per_channel(weight, scale)
+    expected = torch.tensor(
+        [[0.0, 0.0], [-3.0, -4.0], [10.0, 12.0]], dtype=torch.bfloat16
+    )
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.requires_runtime
+def test_per_channel_dequant_fails_loudly_on_a_row_count_mismatch(numerics) -> None:
+    """A scale that cannot be one-per-row must raise, not silently broadcast."""
+    torch = numerics.torch
+    weight = _fp8_weight(torch, 4, 128)
+    with pytest.raises(RuntimeError):
+        numerics.module._dequant_fp8_per_channel(
+            weight, torch.ones(8, dtype=torch.float32)
+        )
+
+
+@pytest.mark.requires_runtime
+def test_scale_mode_is_none_without_a_scale(numerics) -> None:
+    torch = numerics.torch
+    weight = torch.ones((4, 128), dtype=torch.float8_e4m3fn)
+    assert numerics.module._wo_a_scale_mode(weight, None) == (
+        numerics.module._SCALE_NONE
+    )
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize("spell", ["flat", "column"])
+def test_scale_mode_recognises_per_channel_scales(numerics, spell) -> None:
+    torch = numerics.torch
+    weight = torch.ones((4, 128), dtype=torch.float8_e4m3fn)
+    scale = _row_scale(torch, 4, spell)
+    assert numerics.module._wo_a_scale_mode(weight, scale) == (
+        numerics.module._SCALE_PER_CHANNEL
+    )
+
+
+@pytest.mark.requires_runtime
+def test_scale_mode_recognises_the_mxfp8_block_layout(numerics) -> None:
+    torch = numerics.torch
+    weight = torch.ones((4, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((4, 4), dtype=torch.uint8)
+    assert numerics.module._wo_a_scale_mode(weight, scale) == (
+        numerics.module._SCALE_MXFP8_BLOCK
+    )
+
+
+@pytest.mark.requires_runtime
+@pytest.mark.parametrize(
+    ("dtype", "shape"),
+    [
+        ("float32", (4, 2)),
+        ("float32", (8,)),
+        ("float32", (4, 4)),
+        ("int32", (4, 1)),
+        ("uint8", (4, 5)),
+        ("bfloat16", (4, 1)),
+    ],
+)
+def test_scale_mode_rejects_unknown_layouts(numerics, dtype, shape) -> None:
+    torch = numerics.torch
+    weight = torch.ones((4, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones(shape, dtype=getattr(torch, dtype))
+    with pytest.raises(AssertionError, match="unrecognised wo_a weight_scale layout"):
+        numerics.module._wo_a_scale_mode(weight, scale)
+
+
+@pytest.mark.requires_runtime
+def test_unknown_layout_error_carries_the_forensic_fields(numerics) -> None:
+    """The acceptance runbook asks for these three fields verbatim on failure."""
+    torch = numerics.torch
+    weight = torch.ones((4, 128), dtype=torch.float8_e4m3fn)
+    scale = torch.ones((4, 2), dtype=torch.float32)
+    with pytest.raises(AssertionError) as excinfo:
+        numerics.module._wo_a_scale_mode(weight, scale)
+    message = str(excinfo.value)
+    assert "shape=(4, 2)" in message
+    assert "dtype=torch.float32" in message
+    assert "weight.shape=(4, 128)" in message
+
+
+@pytest.mark.requires_runtime
+def test_classifier_and_recipe_compose_on_a_per_channel_shard(numerics) -> None:
+    """End to end for the two helpers: classify, then dequantize by row."""
+    torch = numerics.torch
+    weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]]).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.5], [2.0]], dtype=torch.float32)
+    module = numerics.module
+    assert module._wo_a_scale_mode(weight, scale) == module._SCALE_PER_CHANNEL
+    out = module._dequant_fp8_per_channel(weight, scale)
+    expected = torch.tensor([[0.5, 1.0], [6.0, 8.0]], dtype=torch.bfloat16)
+    assert torch.equal(out, expected)

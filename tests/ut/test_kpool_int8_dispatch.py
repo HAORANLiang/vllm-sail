@@ -75,16 +75,15 @@ def test_registered_op_annotations_survive_breakable_cudagraph_wrapper(kpool):
     assert "k_cache_prefix" in schema
 
 
-def test_decode_defaults_to_non_paged_backend(monkeypatch):
+def test_decode_defaults_to_paged_backend(monkeypatch):
     from vllm_sail import envs as ppu_envs
 
     monkeypatch.delenv("VLLM_SAIL_KPOOL_DECODE_LOGITS", raising=False)
     monkeypatch.delenv("VLLM_PPU_KPOOL_DECODE_LOGITS", raising=False)
-    assert ppu_envs.VLLM_SAIL_KPOOL_DECODE_LOGITS == "non_paged"
+    assert ppu_envs.VLLM_SAIL_KPOOL_DECODE_LOGITS == "paged"
 
-    monkeypatch.setenv("VLLM_SAIL_KPOOL_DECODE_LOGITS", "paged")
-    with pytest.raises(ValueError, match="Expected one of non_paged"):
-        _ = ppu_envs.VLLM_SAIL_KPOOL_DECODE_LOGITS
+    monkeypatch.setenv("VLLM_SAIL_KPOOL_DECODE_LOGITS", "non_paged")
+    assert ppu_envs.VLLM_SAIL_KPOOL_DECODE_LOGITS == "non_paged"
 
     monkeypatch.setenv("VLLM_SAIL_KPOOL_DECODE_LOGITS", "bogus")
     with pytest.raises(ValueError, match="Expected one of"):

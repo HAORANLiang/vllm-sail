@@ -18,11 +18,16 @@ on the INT8 stack already used by the DSA indexer
 * prefill pool compression and the paged tail update are plain PyTorch
   replicas of the CUDA Triton kernels' semantics (correctness first; see the
   ``TRITON-FAST-PATH`` markers for the later optimisation);
-* decode logits default to a gathered-K + non-paged ``int8_mqa_logits`` path
-  (``VLLM_SAIL_KPOOL_DECODE_LOGITS``, default ``non_paged``): PPU's
-  ``int8_paged_mqa_logits`` writes only 2 of every 64 logits (measured on
-  PPU). The paged call is kept behind the env switch for when that kernel is
-  fixed;
+* decode logits default to the paged ``int8_paged_mqa_logits`` path
+  (``VLLM_SAIL_KPOOL_DECODE_LOGITS``, default ``paged``). The earlier
+  ``non_paged`` default was justified by a probe that reported PPU's
+  ``int8_paged_mqa_logits`` writing only 2 of every 64 logits; that probe
+  initialised the paged cache with a per-token ``[K, scale]`` interleaved
+  layout instead of the kernel's page layout (all K rows of a page, then the
+  float32 scale plane), so it read back zeros rather than a kernel defect.
+  With the correct layout every column is written (contexts 64 and 32768,
+  three runs each). The gathered-K non-paged path stays selectable for A/B
+  work and remains guarded by ``VLLM_SAIL_KPOOL_MAX_DENSE_POOLS``;
 * Q is rotated with the same Hadamard-128 matrix as the pooled K and
   quantized with ``per_token_group_quant_int8``; the model folds its scale into
   ``weights`` before calling the op;
@@ -607,19 +612,16 @@ def _decode_logits_non_paged(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Decode logits via K gather + the non-paged int8 logits kernel.
 
-    PPU's ``int8_paged_mqa_logits`` writes only 2 of every 64 logits (measured
-    on PPU), so decode gathers each request's pool cache and reuses the prefill
-    kernel.
+    Opt-in path only (``VLLM_SAIL_KPOOL_DECODE_LOGITS=non_paged``); the default
+    is the paged kernel. This variant gathers each request's pool cache and
+    reuses the prefill kernel, so it costs O(sum(seq_len) * head_dim) per layer
+    per step and needs the dense-pool guard below.
 
     The gather workspace must hold every request's context pools. Its size is
     bounded without a device sync by ``batch_size * ceil(max_seq_len / kpool)``
     where ``max_seq_len`` is the token-granular batch maximum already carried by
     the metadata. Sizing it by the *new-token* count (the pre-fix bug) is far
     too small: the gather then runs past the buffer and the logits are garbage.
-
-    Cost is O(sum(seq_len) * head_dim) per layer per step; recorded in the e2e
-    report. ``VLLM_SAIL_KPOOL_DECODE_LOGITS=paged`` switches back once the PPU
-    paged kernel is fixed.
     """
     cu, ks, ke = _decode_logits_layout(seq_lens, decode_lens, batch_size, next_n)
     max_pools = batch_size * ((max_seq_len + kpool - 1) // kpool)
@@ -629,10 +631,11 @@ def _decode_logits_non_paged(
             "PPU kpool decode fallback would materialise "
             f"{max_pools} pool logits (batch={batch_size}, "
             f"max_seq_len={max_seq_len}, kpool={kpool}) above "
-            f"VLLM_SAIL_KPOOL_MAX_DENSE_POOLS={limit}. Lower "
-            "--max-model-len / batch size, raise the limit, or switch to "
-            "VLLM_SAIL_KPOOL_DECODE_LOGITS=paged once the PPU int8 paged "
-            "kernel is fixed."
+            f"VLLM_SAIL_KPOOL_MAX_DENSE_POOLS={limit}. This guard only applies "
+            "to the opt-in non-paged fallback: lower --max-model-len / batch "
+            "size, raise the limit, or drop the "
+            "VLLM_SAIL_KPOOL_DECODE_LOGITS=non_paged override to use the "
+            "default paged kernel."
         )
     values_spec, scales_spec = _gather_workspace_shapes(max_pools, head_dim)
     k_quant, k_scale = current_workspace_manager().get_simultaneous(
@@ -957,11 +960,11 @@ def ppu_sparse_attn_indexer_kpool(
         seq_lens = decode_metadata.seq_lens[:batch_size]
         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
 
-        # PPU's int8_paged_mqa_logits writes only 2 of every 64 logits
-        # (measured on PPU), so the default decode path gathers the pool cache
-        # and reuses the non-paged kernel.
-        # ``VLLM_SAIL_KPOOL_DECODE_LOGITS=paged`` selects the original kernel;
-        # remove the switch once the paged kernel is fixed.
+        # Default: the paged int8 logits kernel. The gathered-K non-paged
+        # fallback stays behind ``VLLM_SAIL_KPOOL_DECODE_LOGITS=non_paged`` for
+        # A/B work; it is what the dense-pool guard applies to. The old comment
+        # here claimed the paged kernel wrote only 2 of every 64 logits - that
+        # came from a probe using a wrong cache layout, see the module docstring.
         decode_backend = ppu_envs.VLLM_SAIL_KPOOL_DECODE_LOGITS
         if decode_backend == "non_paged":
             logits, row_ks, row_ke = _decode_logits_non_paged(

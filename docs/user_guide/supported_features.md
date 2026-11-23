@@ -107,6 +107,6 @@ The GLM-5.3-Flash INT8 kpool path on Zhenwu 810E requires decode context
 parallel size 1. It rejects larger sizes until distributed cache mapping and
 global top-k merging are implemented. Zhenwu M890 keeps the upstream FP8 path.
 
-The INT8 kpool path rejects `VLLM_SAIL_KPOOL_DECODE_LOGITS=paged` because the
-paged kernel does not produce complete logits on PPU. Use the default
-`non_paged` backend.
+The INT8 kpool path defaults to paged decode logits. Set
+`VLLM_SAIL_KPOOL_DECODE_LOGITS=non_paged` to use the gathered-cache fallback.
+The fallback is bounded by `VLLM_SAIL_KPOOL_MAX_DENSE_POOLS`.

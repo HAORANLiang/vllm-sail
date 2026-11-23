@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Keep V4.1 cache sharing and override only the PPU projection contract."""
+"""Preserve V4.1 cache sharing, projection precision and initialized PPU padding."""
 
 from types import SimpleNamespace
 
@@ -29,7 +29,7 @@ class PPUDeepseekV41FlashMLABackend(DeepseekV4FlashMLABackend):
 
 
 class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
-    """Upstream V4.1 metadata/forward, PPU head count and dense fallback."""
+    """Upstream V4.1 attention with PPU heads, projection and output padding."""
 
     backend_cls = PPUDeepseekV41FlashMLABackend
 
@@ -44,6 +44,24 @@ class DeepseekV41FlashMLAAttention(UpstreamFlashMLAAttention):
         if current_platform.is_ppu():
             return PPUV4FlashMLAAttention.get_padded_num_q_heads(num_heads)
         return super().get_padded_num_q_heads(num_heads)
+
+    def forward_mqa(self, q, kv, positions, output) -> None:
+        super().forward_mqa(q, kv, positions, output)
+        if not current_platform.is_ppu():
+            return
+
+        from vllm.forward_context import get_forward_context
+
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            swa = metadata.get(self.swa_cache_layer.prefix)
+            if swa is not None:
+                # DP synchronization can pad a rank beyond its actual queries,
+                # including mixed prefill/decode and idle ranks. Upstream only
+                # clears this tail for PCP. Neither attention kernel writes it,
+                # but the output projection and MegaGate consume all rows.
+                num_tokens = swa.num_decode_tokens + swa.num_prefill_tokens
+                output[num_tokens:].zero_()
 
     def _o_proj(self, o, positions):
         if not current_platform.is_ppu():

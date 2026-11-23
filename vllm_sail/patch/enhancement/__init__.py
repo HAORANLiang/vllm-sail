@@ -31,6 +31,10 @@ from vllm_sail.patch.enhancement import online_quantization_dtype  # noqa: F401
 from vllm_sail.patch.enhancement import quant_keys  # noqa: F401
 from vllm_sail.patch.enhancement import tuned_config_lookup  # noqa: F401
 from vllm_sail.patch.enhancement import models  # noqa: F401
+
+# Shapes the fused attention's load-time permutation for per-channel scales;
+# must follow `models` (which imports the same upstream module).
+from vllm_sail.patch.enhancement import deepseek_v41_fused_layout  # noqa: F401
 from vllm_sail.patch.enhancement import mxfp4
 from vllm_sail.patch.enhancement import residual  # noqa: F401
 
