@@ -312,11 +312,15 @@ def test_install_skips_when_upstream_modules_are_missing(
 ) -> None:
     state = _StubState()
     _stub_logger(monkeypatch, state)
-    # No ngram stub chain: install() probes via importlib.import_module, which
-    # consults sys.modules directly, where a None entry raises.
+    # No ngram stub chain: the parent package must lack the attribute so the
+    # from-import goes through importlib, where a None entry raises. An earlier
+    # test may have imported the real module, so drop the cached attribute too.
     monkeypatch.setitem(
         sys.modules, "vllm.models.qwen4_exp.common.ngram_embedding", None
     )
+    parent = sys.modules.get("vllm.models.qwen4_exp.common")
+    if parent is not None and hasattr(parent, "ngram_embedding"):
+        monkeypatch.delattr(parent, "ngram_embedding")
     registry_before = len(PATCH_REGISTRY)
     ple_module.install()
     assert ple_module._unavailable is True

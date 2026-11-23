@@ -32,7 +32,12 @@ def installed_indexer(modules, patch_utils_module):
         platform = NS(
             is_ppu=lambda: ppu, is_device_capability=lambda cap: capability == cap
         )
-        modules("torch", float32="fp32")
+        modules(
+            "torch",
+            float32="fp32",
+            int8="int8",
+            float8_e4m3fn="float8_e4m3fn",
+        )
         modules("vllm.platforms", current_platform=platform)
         modules(
             "vllm.v1.attention.backend",
