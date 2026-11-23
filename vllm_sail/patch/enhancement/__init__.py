@@ -21,6 +21,7 @@ from vllm_sail.patch.enhancement import fused_act  # noqa: F401  (needs custom_o
 from vllm_sail.patch.enhancement import compressed_tensors_ppu
 from vllm_sail.patch.enhancement import deepep  # noqa: F401
 from vllm_sail.patch.enhancement import deep_gemm_redirect  # noqa: F401
+from vllm_sail.patch.enhancement import extensible_kv_cache  # noqa: F401
 from vllm_sail.patch.enhancement import fused_moe_ppu
 from vllm_sail.patch.enhancement import int8_quant  # noqa: F401
 from vllm_sail.patch.enhancement import kernel_warmup  # noqa: F401
