@@ -434,6 +434,42 @@ class PPUDeepseekV4MegaAttnAttention(DeepseekV4MegaAttnAttention):
     # authoritative guard for the opt-in NVFP4 compressed record below.
     backend_cls = DeepseekV4FlashMLABackend
 
+    def forward_mqa(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: QuantizedActivation,
+    ) -> None:
+        """Upstream fused forward with PPU zeroing of the DP padding tail.
+
+        PR#355 zeroed the DP-synchronized padding tail on the non-mega
+        FlashMLA path (vllm_sail/models/deepseek_v41/flashmla.py), but this
+        fused mega-attention path writes only the decode rows (0 ..
+        num_decode_tokens) and the prefill rows (num_decode_tokens ..
+        num_decode_tokens + num_prefill_tokens) of the QuantizedActivation
+        output. A DP rank padded beyond that geometry (single-request
+        cluster, idle dummy batches, or mixed prefill/decode) leaves the
+        tail uninitialized, and the downstream output projection and
+        ppu_bf16_mega_gate consume every row: NaN gate scores fail
+        device_check(gate_is_valid) and trap the device
+        (hggcErrorLaunchFailure). Clear both the data and the scale tail
+        here, mirroring PR#355 for the QuantizedActivation layout.
+        """
+        super().forward_mqa(q, kv, positions, output)
+        if not current_platform.is_ppu():
+            return
+
+        from vllm.forward_context import get_forward_context
+
+        metadata = get_forward_context().attn_metadata
+        if isinstance(metadata, dict):
+            swa = metadata.get(self.swa_cache_layer.prefix)
+            if swa is not None:
+                num_tokens = swa.num_decode_tokens + swa.num_prefill_tokens
+                output.data[num_tokens:].zero_()
+                output.scale[num_tokens:].zero_()
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # v1.1: the inherited __init__ computed the recipe from the device
