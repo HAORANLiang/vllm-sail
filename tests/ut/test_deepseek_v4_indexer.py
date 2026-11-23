@@ -28,7 +28,11 @@ def installed(monkeypatch, patch_utils_module):
     def module(name, **attrs):
         if name not in modules:
             result = types.ModuleType(name)
-            result.__path__ = []
+            result.__path__ = (
+                [str(ROOT.joinpath(*name.split(".")))]
+                if name.startswith("vllm_sail")
+                else []
+            )
             modules[name] = result
             monkeypatch.setitem(sys.modules, name, result)
             parent, _, leaf = name.rpartition(".")
@@ -47,7 +51,17 @@ def installed(monkeypatch, patch_utils_module):
     module("vllm.platforms", current_platform=platform)
     attention_cls = type("Attention", (), {})
     module(f"{BASE}.nvidia.flashmla", DeepseekV4FlashMLAAttention=attention_cls)
-    module(f"{BASE}.nvidia.model", _select_dsv4_attn_cls=lambda _: attention_cls)
+
+    # The MoE init patch resolves its target class at import time.
+    class DeepseekV4MoE:
+        def __init__(self, config):
+            self.expert_dtype = config.model_config.hf_config.expert_dtype
+
+    module(
+        f"{BASE}.nvidia.model",
+        _select_dsv4_attn_cls=lambda _: attention_cls,
+        DeepseekV4MoE=DeepseekV4MoE,
+    )
     module("vllm_sail.models.deepseek_v4.flashmla", DeepseekV4FlashMLAAttention=object)
     module(
         "vllm_sail.patch.utils",
@@ -126,6 +140,36 @@ def installed(monkeypatch, patch_utils_module):
     patched = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(patched)
     return platform, modules, calls, patched
+
+
+@pytest.mark.parametrize(
+    "backend,expert_dtype",
+    [
+        ("auto", "fp4"),
+        ("triton", "fp4"),
+        ("triton", "int8"),
+        ("deep_gemm_mega_moe", "int8"),
+    ],
+)
+def test_moe_init_only_applies_mega_moe_settings_for_selected_backend(
+    installed, monkeypatch, backend, expert_dtype
+):
+    _, modules, _, _ = installed
+    monkeypatch.setenv("VLLM_SAIL_MEGA_MOE_MMA_TYPE", "int8xint8")
+    hf_config = types.SimpleNamespace(expert_dtype=expert_dtype)
+    config = types.SimpleNamespace(
+        kernel_config=types.SimpleNamespace(moe_backend=backend),
+        model_config=types.SimpleNamespace(
+            hf_config=hf_config, hf_text_config=hf_config
+        ),
+    )
+
+    moe = modules[f"{BASE}.nvidia.model"].DeepseekV4MoE(config)
+
+    assert moe.expert_dtype == (
+        "fp4" if backend == "deep_gemm_mega_moe" else expert_dtype
+    )
+    assert hf_config.expert_dtype == expert_dtype
 
 
 @pytest.mark.parametrize(

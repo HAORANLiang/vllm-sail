@@ -118,7 +118,7 @@ KPOOL_DECODE_LOGITS_BACKENDS = ("non_paged", "paged")
 #: Qwen4Exp QSA sparse-attention kernels. ``cuda`` is FA3's QSA path, which only
 #: exists on PPU builds carrying the ``qsa_allow_aiu`` argument.
 QSA_KERNELS = ("auto", "cuda", "triton")
-MEGA_MOE_MMA_TYPES = ("fp4xfp4", "fp8xfp4", "bf16xfp4")
+MEGA_MOE_MMA_TYPES = ("fp4xfp4", "fp8xfp4", "bf16xfp4", "int8xint8")
 STEP5_PREFILL_BACKENDS = ("flashinfer", "native")
 STEP5_DSA_SCORE_MODES = ("v0", "v1", "v2", "v3")
 STEP5_DSA_SCORE_DECODE_MODES = ("v0", "v1", "v2")
