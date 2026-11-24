@@ -41,6 +41,7 @@ path: that is a misconfigured wheel, not an unsupported chip.
 from __future__ import annotations
 
 import torch
+from vllm.config import get_current_vllm_config
 from vllm.models.qwen4_exp.common.qsa_indexer import _QSAIndexerCache
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as _qsa_indexer_ops
 from vllm.models.qwen4_exp.nvidia.ops import qsa_prepare as _qsa_prepare_ops
@@ -165,12 +166,20 @@ def get_supported_kernel_block_sizes(
 ) -> list[int | MultipleOf]:
     if not is_ppu_15():
         return [MultipleOf(1)]
-    if not isinstance(kv_cache_spec, MLAAttentionSpec):
+    if kv_cache_spec is not None and not isinstance(kv_cache_spec, MLAAttentionSpec):
         # The raw key ring is bf16 and never reaches an FP4 kernel.
         return [MultipleOf(1)]
-    return [
-        MultipleOf(MXFP4_PAGE_ROWS_GRANULARITY * int(kv_cache_spec.tokens_per_state))
-    ]
+    if kv_cache_spec is not None:
+        tokens_per_state = int(kv_cache_spec.tokens_per_state)
+    else:
+        # The platform's hybrid mamba alignment queries before any spec exists.
+        # Answering MultipleOf(1) there hides the FP4 page contract, so it picks
+        # a block (e.g. 832) that select_common_block_size later rejects.
+        tokens_per_state = int(
+            get_current_vllm_config()
+            .model_config.hf_text_config.indexer_compress_ratio
+        )
+    return [MultipleOf(MXFP4_PAGE_ROWS_GRANULARITY * tokens_per_state)]
 
 
 @patch(

@@ -581,7 +581,19 @@ def test_kernel_block_sizes_follow_the_fp4_page(qsa_fp4_patch):
         assert block_sizes(compressed) == [MultipleOf(64 * 4)]
         # The raw key ring is bf16 and never reaches an FP4 kernel.
         assert block_sizes(raw) == [MultipleOf(1)]
-        assert block_sizes(None) == [MultipleOf(1)]
+        # The platform's hybrid mamba alignment queries before a spec exists;
+        # the contract must still be advertised from the model config, or the
+        # alignment picks a block (832) the worker's common-block selector
+        # later rejects against MultipleOf(256).
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=SimpleNamespace(indexer_compress_ratio=4)
+            )
+        )
+        with mock.patch.object(
+            qsa_fp4_patch, "get_current_vllm_config", lambda: config
+        ):
+            assert block_sizes(None) == [MultipleOf(64 * 4)]
     with _gate(qsa_fp4_patch, False):
         assert block_sizes(compressed) == [MultipleOf(1)]
 
