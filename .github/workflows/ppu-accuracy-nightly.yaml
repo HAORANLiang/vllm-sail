@@ -141,13 +141,12 @@ jobs:
     if: ${{ github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      SELECT_RECIPES: ${{ vars.PPU_RECIPE_PUBLIC_ENABLED == 'true' && (github.event_name == 'schedule' || startsWith(inputs.models, 'recipe:') || (inputs.skip_wheel_build == true && inputs.models == '')) }}
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       recipe_models: ${{ steps.select.outputs.recipe_models }}
       recipe_matrix: ${{ steps.select.outputs.recipe_matrix }}
       run_recipe: ${{ steps.select.outputs.run_recipe }}
+      full_run: ${{ steps.select.outputs.full_run }}
       target_sha: ${{ steps.select.outputs.target_sha }}
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -269,13 +268,34 @@ jobs:
           ref: ${{ steps.verify_target.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Check Recipe selector requirements
+        id: recipe-dependencies
+        if: vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'
+        env:
+          MODELS: ${{ inputs.models }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
+          SKIP_WHEEL_BUILD: ${{ inputs.skip_wheel_build }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+
+          models = os.environ["MODELS"].strip()
+          if (
+              os.environ["SCHEDULED"] == "true"
+              or models.startswith("recipe:")
+              or (os.environ["SKIP_WHEEL_BUILD"] == "true" and not models)
+          ):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("required=true\n")
+          PYTHON
+
       - uses: actions/setup-python@v5
-        if: env.SELECT_RECIPES == 'true'
+        if: steps.recipe-dependencies.outputs.required == 'true'
         with:
           python-version: "3.12"
 
       - name: Install Recipe selector dependency
-        if: env.SELECT_RECIPES == 'true'
+        if: steps.recipe-dependencies.outputs.required == 'true'
         run: python -m pip install --no-cache-dir PyYAML==6.0.3
 
       - name: Select accuracy models
@@ -308,6 +328,7 @@ jobs:
           spec.loader.exec_module(select)
 
           requested = os.environ.get("MODELS", "").strip()
+          full_run = str(requested in ("", "recipe:all")).lower()
           skip_wheel_build = os.environ.get("SKIP_WHEEL_BUILD", "false") == "true"
           target_sha = os.environ["TARGET_SHA"]
           output = Path(os.environ["GITHUB_OUTPUT"])
@@ -320,6 +341,7 @@ jobs:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write("recipe_models=\n")
                   handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
@@ -339,11 +361,15 @@ jobs:
                   sys.exit(str(error))
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write(f"recipe_models={models}\n")
                   handle.write(f"recipe_matrix={json.dumps(recipe_matrix)}\n")
                   handle.write("run_recipe=true\n")
               sys.exit(0)
+
+          if requested and not any(key.strip() for key in requested.split(",")):
+              sys.exit("Specify one or more nonempty legacy model keys")
 
           catalog = json.loads(select.CATALOG.read_text())
           scheduled_recipes = os.environ["SCHEDULED_RECIPE_ENABLED"] == "true"
@@ -373,12 +399,14 @@ jobs:
               print(f"accuracy matrix: {matrix}")
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write(f"matrix={matrix}\n")
                   handle.write("run_recipe=false\n")
           else:
               print("accuracy matrix: skipped (scheduled legacy nightly disabled)")
               with output.open("a", encoding="utf-8") as handle:
                   handle.write(f"target_sha={target_sha}\n")
+                  handle.write(f"full_run={full_run}\n")
                   handle.write("matrix=\n")
                   handle.write("run_recipe=true\n")
           PY
@@ -503,7 +531,9 @@ jobs:
     needs: [select, build, resolve-image, accuracy, recipe-model-sanity]
     if: >-
       always() && !cancelled() &&
-      (github.event_name != 'schedule' || vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true')
+      ((github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true') ||
+       (github.event_name == 'workflow_dispatch' && needs.select.result == 'success' &&
+        needs.select.outputs.full_run == 'true'))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     continue-on-error: true

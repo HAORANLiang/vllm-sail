@@ -1708,6 +1708,19 @@ def test_recipe_model_sanity_has_one_scheduled_entry():
         ("schedule", "", "false", None, None, ""),
         ("schedule", "", "", None, None, ""),
         ("workflow_dispatch", "", "true", None, None, ""),
+        ("workflow_dispatch", " \t", "true", None, None, ""),
+        ("workflow_dispatch", " ,\t, ", "true", [], None, "nonempty legacy model keys"),
+        ("workflow_dispatch", "recipe:all", "true", [], "", ""),
+        ("workflow_dispatch", "recipe:all ", "true", [], "", ""),
+        ("workflow_dispatch", " recipe:all ", "true", [], "", ""),
+        (
+            "workflow_dispatch",
+            " recipe:all ",
+            "false",
+            [],
+            None,
+            "Recipe accuracy is disabled",
+        ),
         (
             "workflow_dispatch",
             "glm-5.3-mxfp4-tp4",
@@ -1794,6 +1807,18 @@ def test_accuracy_nightly_routes_selected_models(
     if error:
         assert result.returncode != 0 and error in result.stderr
         assert not output.exists()
+        assert (
+            expression(
+                jobs["notify-summary"]["if"],
+                {
+                    "github.event_name": event,
+                    "inputs.models": models,
+                    "needs.select.result": "failure",
+                    "needs.select.outputs.full_run": "true",
+                },
+            )
+            is False
+        )
         return
     assert result.returncode == 0, result.stderr
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
@@ -1809,6 +1834,15 @@ def test_accuracy_nightly_routes_selected_models(
         "needs.select.outputs.run_recipe": values.get("run_recipe", "false"),
         "needs.select.outputs.matrix": legacy_matrix,
     }
+    context.update(
+        {
+            "inputs.models": models,
+            "needs.select.outputs.full_run": values.get("full_run", ""),
+        }
+    )
+    full_selection = legacy_cases is None or recipe_slugs == ""
+    assert values["full_run"] == str(full_selection).lower()
+    assert bool(expression(jobs["notify-summary"]["if"], context)) == full_selection
     assert expression(jobs["accuracy"]["if"], context) == (legacy_cases != [])
     if legacy_cases is None:
         catalog = json.loads((ROOT / "scripts/ci/ppu_e2e_models.json").read_text())
@@ -1831,7 +1865,81 @@ def test_accuracy_nightly_routes_selected_models(
     assert values.get("recipe_models", "") == (recipe_slugs or "")
 
 
-def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
+@pytest.mark.parametrize(
+    ("models", "scheduled", "skip_wheel_build", "required"),
+    [
+        (" recipe:all ", False, False, True),
+        (" recipe:glm-5.3 ", False, False, True),
+        (" \t", False, True, True),
+        ("glm-5.3-mxfp4-tp4", False, False, False),
+        (" \t", False, False, False),
+        ("", True, False, True),
+    ],
+)
+def test_accuracy_nightly_recipe_dependencies_follow_normalized_input(
+    tmp_path, models, scheduled, skip_wheel_build, required
+):
+    steps = workflow("ppu-accuracy-nightly.yaml")["jobs"]["select"]["steps"]
+    requirements = next(
+        step for step in steps if step.get("id") == "recipe-dependencies"
+    )
+    assert requirements["if"] == "vars.PPU_RECIPE_PUBLIC_ENABLED == 'true'"
+    output = tmp_path / "github-output"
+    script = requirements["run"].replace("python3 -", f'"{sys.executable}" -', 1)
+    subprocess.run(
+        ["bash", "-e", "-c", script],
+        env={
+            **os.environ,
+            "MODELS": models,
+            "SCHEDULED": str(scheduled).lower(),
+            "SKIP_WHEEL_BUILD": str(skip_wheel_build).lower(),
+            "GITHUB_OUTPUT": str(output),
+        },
+        check=True,
+    )
+    published = (
+        dict(line.split("=", 1) for line in output.read_text().splitlines())
+        if output.exists()
+        else {}
+    )
+    context = {"steps.recipe-dependencies.outputs.required": published.get("required")}
+    setup = next(
+        step
+        for step in steps
+        if step.get("uses", "").startswith("actions/setup-python@")
+    )
+    install = next(
+        step
+        for step in steps
+        if step.get("name") == "Install Recipe selector dependency"
+    )
+    for step in (setup, install):
+        assert bool(expression(step["if"], context)) == required
+
+
+@pytest.mark.parametrize(
+    ("event", "disabled", "selection", "expected"),
+    [
+        ("schedule", "false", "failure", True),
+        ("schedule", "true", "failure", False),
+        ("workflow_dispatch", "false", "skipped", False),
+        ("workflow_dispatch", "false", "success", False),
+    ],
+)
+def test_accuracy_nightly_notification_when_selection_did_not_confirm_full_run(
+    event, disabled, selection, expected
+):
+    notify = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]
+    context = {
+        "github.event_name": event,
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": disabled,
+        "needs.select.result": selection,
+    }
+    assert bool(expression(notify["if"], context)) == expected
+
+
+@pytest.mark.parametrize("models", ["", " \t"])
+def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path, models):
     wf = workflow("ppu-accuracy-nightly.yaml")
     inputs = wf[True]["workflow_dispatch"]["inputs"]
     assert set(inputs) == {
@@ -1949,7 +2057,7 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
         cwd=ROOT,
         env={
             **os.environ,
-            "MODELS": "",
+            "MODELS": models,
             "RECIPE_PUBLIC_ENABLED": "true",
             "SCHEDULED_RECIPE_ENABLED": "false",
             "SKIP_WHEEL_BUILD": "true",
@@ -1963,6 +2071,7 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
     assert values["matrix"] == ""
     assert values["recipe_models"] == ""
     assert values["run_recipe"] == "true"
+    assert values["full_run"] == "true"
     assert len(values["target_sha"]) == 40
     prebuilt_ctx = {
         "github.event_name": "workflow_dispatch",
@@ -1974,10 +2083,13 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path):
         "needs.select.outputs.matrix": values["matrix"],
         "needs.select.outputs.recipe_models": values["recipe_models"],
         "needs.select.outputs.run_recipe": values["run_recipe"],
+        "needs.select.outputs.full_run": values["full_run"],
     }
     assert expression(jobs["build"]["if"], prebuilt_ctx) is False
     assert expression(jobs["accuracy"]["if"], prebuilt_ctx) is False
     assert expression(jobs["recipe-model-sanity"]["if"], prebuilt_ctx) is True
+
+    assert expression(jobs["notify-summary"]["if"], prebuilt_ctx) is True
 
     # Verify GitHub Actions truthiness for skip_wheel_build ternary expressions
     # across caller and leaf workflows ('' is falsy, so `true && '' || x` would break).
