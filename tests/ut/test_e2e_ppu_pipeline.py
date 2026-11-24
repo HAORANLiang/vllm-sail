@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -100,6 +101,141 @@ def test_catalog_keeps_smoke_and_accuracy_subsets_exact() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("board", "OAM-810E"),
+        ("model_id", "other/checkpoint"),
+        ("model_key", "other_golden"),
+        ("ppu_count", 4),
+    ],
+)
+def test_scheduled_recipe_rejects_mismatched_legacy_identity(
+    tmp_path, monkeypatch, field, value
+) -> None:
+    select = _load_select()
+    catalog = _catalog()
+    candidate = next(entry for entry in catalog if entry["key"] == "deepseek-v4-mxfp4")
+    candidate[field] = value
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(catalog))
+    monkeypatch.setattr(select, "CATALOG", path)
+    # Validate every claim even when the selected subset excludes that key.
+    selected = select.build_accuracy_matrix(catalog, "minimax-m3-fp8")["include"]
+    with pytest.raises(ValueError, match="does not match.*deepseek-v4-mxfp4"):
+        select.scheduled_legacy_accuracy_cases(selected)
+
+
+@pytest.mark.parametrize(
+    "claim,error",
+    [
+        ("does-not-exist", "unknown legacy accuracy case"),
+        ("qwen3.8-27b", "unknown legacy accuracy case"),
+        ("deepseek-v4-mxfp4-dp-ep", "does not match"),
+        ("deepseek-v4-mxfp4", "claimed by"),
+    ],
+)
+def test_scheduled_recipe_rejects_invalid_policy_claims(
+    tmp_path, monkeypatch, claim, error
+) -> None:
+    select = _load_select()
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    monkeypatch.syspath_prepend(str(SELECT.parent))
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
+    path = policy_dir / "deepseek-v4-flash.yaml"
+    policy = yaml.safe_load(path.read_text())
+    policy["replaces_legacy_cases"] = [claim]
+    if error == "claimed by":
+        path = policy_dir / "second-deepseek.yaml"
+    path.write_text(yaml.safe_dump(policy))
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    with pytest.raises(ValueError, match=error):
+        select.scheduled_legacy_accuracy_cases(selected)
+
+
+def test_scheduled_recipe_replaces_kimi_tp8_but_keeps_other_legacy() -> None:
+    """The TP8 recipe claims only its own legacy case.
+
+    Sibling cases keep running on the legacy lane until their own recipes
+    land, so the nightly must drop exactly the claimed set -- no more, no
+    fewer. Computing that set from the checked-in policies keeps this test
+    green as other migration PRs land.
+    """
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    claimed = set()
+    for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml"):
+        claimed.update(
+            yaml.safe_load(path.read_text()).get("replaces_legacy_cases", [])
+        )
+    assert "kimi-k2.6-mxfp4-tp8" in claimed
+    assert "kimi-k2.6-mxfp4-tp8" not in remaining
+    assert remaining == [
+        entry["case_id"] for entry in selected if entry["case_id"] not in claimed
+    ]
+
+
+def test_scheduled_recipe_restores_kimi_tp8_when_the_policy_is_removed(
+    tmp_path, monkeypatch
+) -> None:
+    """Disabling the recipe must fall back to the full legacy schedule."""
+    select = _load_select()
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "tests/ppu/policy/models/kimi-k2.6.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    monkeypatch.syspath_prepend(str(SELECT.parent))
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    assert "kimi-k2.6-mxfp4-tp8" in remaining
+
+
+def test_scheduled_selector_retires_minimax_once_the_recipe_is_enabled() -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    case_ids = [entry["case_id"] for entry in selected]
+    # The flag-off schedule still lists every catalog case, so the fallback is
+    # the untouched matrix this assertion starts from.
+    assert "minimax-m3-fp8" in case_ids
+    claimed = {
+        case_id
+        for path in (ROOT / "tests/ppu/policy/models").glob("*.yaml")
+        for case_id in yaml.safe_load(path.read_text()).get("replaces_legacy_cases", [])
+    }
+    assert "minimax-m3-fp8" in claimed
+    assert select.scheduled_legacy_accuracy_cases(selected) == [
+        case_id for case_id in case_ids if case_id not in claimed
+    ]
+
+
+def test_scheduled_recipe_dp_ep_removes_only_its_legacy_case(
+    tmp_path, monkeypatch
+) -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    (policy_dir / "deepseek-v4-flash-dp-ep.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    before_dp_ep = select.scheduled_legacy_accuracy_cases(selected)
+    retired = "deepseek-v4-mxfp4-dp-ep"
+    assert retired in before_dp_ep
+    assert remaining == [key for key in before_dp_ep if key != retired]
+
+
+@pytest.mark.parametrize(
     ("key", "board"),
     [
         ("qwen3.8-27b", "OAM-810E"),
@@ -115,6 +251,24 @@ def test_qwen_smoke_catalog_targets_both_boards(key: str, board: str) -> None:
     assert int(qwen["ppu_count"]) == 2
     assert qwen["served_name"] == "qwen3.8-27b"
     assert qwen["extra_serve_flags"] == "--trust-remote-code"
+
+
+def test_scheduled_recipe_replaces_only_the_glm53_flash_legacy_case(
+    tmp_path, monkeypatch
+) -> None:
+    select = _load_select()
+    selected = select.build_accuracy_matrix(_catalog(), "")["include"]
+    remaining = select.scheduled_legacy_accuracy_cases(selected)
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    (tmp_path / "tests/ppu/policy/models/glm-5.3-flash.yaml").unlink()
+    monkeypatch.setattr(select, "REPO_ROOT", tmp_path)
+    import ppu_recipe
+
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    legacy = "glm-5.3-flash-mxfp4-tp2"
+    without_flash = select.scheduled_legacy_accuracy_cases(selected)
+    assert legacy in without_flash
+    assert remaining == [case for case in without_flash if case != legacy]
 
 
 def test_accuracy_catalog_keeps_model_ids_and_per_model_card_count() -> None:
@@ -397,6 +551,22 @@ def test_accuracy_catalog_resolves_against_the_evaluator_configs() -> None:
         assert int(entry["ppu_count"]) == max(expected, dp), key
 
 
+def _recipe_golden_contracts() -> dict[str, dict[str, object]]:
+    import yaml
+
+    select = _load_select()
+    contracts: dict[str, dict[str, object]] = {}
+    for entry, _replaces, resolved in select._recipe_entries("", "model_sanity"):
+        policy = yaml.safe_load((ROOT / entry["policy_path"]).read_text())
+        stages = policy["tiers"]["model_sanity"]["stages"]
+        eval_stage = next(st for st in stages if st["kind"] == "evalscope")
+        contracts[resolved["golden_model_key"]] = {
+            "model_id": resolved["hf_model_id"],
+            "generation_config": dict(eval_stage["generation"]),
+        }
+    return contracts
+
+
 def test_committed_goldens_describe_their_own_checkpoint() -> None:
     """A hand-written golden must still be a valid schema-v2 record.
 
@@ -404,7 +574,7 @@ def test_committed_goldens_describe_their_own_checkpoint() -> None:
     or a stale tolerance would silently mis-score the nightly.
     """
     evaluator = _load_evaluator()
-    configs = evaluator.MODEL_CONFIGS
+    configs = {**_recipe_golden_contracts(), **evaluator.MODEL_CONFIGS}
     files = sorted(GOLDEN.glob("accuracy_*.json"))
     assert files, "no committed golden found"
     for path in files:
@@ -498,7 +668,7 @@ def test_committed_goldens_carry_the_weight_sampling_contract() -> None:
     the baseline the plain case established.
     """
     evaluator = _load_evaluator()
-    configs = evaluator.MODEL_CONFIGS
+    configs = {**_recipe_golden_contracts(), **evaluator.MODEL_CONFIGS}
     for path in sorted(GOLDEN.glob("accuracy_*.json")):
         golden = json.loads(path.read_text())
         contract = configs[golden["model"]]["generation_config"]
@@ -539,20 +709,33 @@ def test_sibling_cases_over_one_weight_share_the_contract() -> None:
     assert len(contracts) == 1
 
 
-def test_golden_coverage_names_the_weight_without_a_baseline() -> None:
-    """Every accuracy weight has a golden except the one with no reference.
-
-    GLM-5.3-Flash is deliberately absent: the shared GSM8K summary has no row
-    for it, so the case runs on the threshold gate and uploads a
-    pending-review artifact until a real number exists.
-    """
+def test_accuracy_catalog_checkpoints_have_goldens() -> None:
     covered = {
         json.loads(path.read_text())["model"] for path in GOLDEN.glob("accuracy_*.json")
     }
     catalog_keys = {
         entry["model_key"] for entry in _catalog() if entry["category"] == "accuracy"
     }
-    assert covered == catalog_keys - {"glm_5_3_flash_mxfp4"}
+    assert catalog_keys <= covered
+    extra = covered - catalog_keys
+    if extra:
+        select = _load_select()
+        recipe_keys = {
+            item["golden_model_key"]
+            for item in select.build_recipe_matrix("", "model_sanity")["include"]
+        }
+        assert extra <= recipe_keys
+
+
+def test_glm_flash_890p_golden_uses_a_logical_dataset_id() -> None:
+    record = json.loads((GOLDEN / "accuracy_glm_5_3_flash_mxfp4_890p.json").read_text())
+    assert record["dataset"]["dataset_id"] == "gsm8k@2026-11"
+    assert record["dataset"]["num_expected"] == 1319
+    assert record["tolerance"] == {"mode": "band", "abs": 0.02}
+    assert (
+        round(record["score"] * record["dataset"]["num_expected"])
+        == record["score_num"]
+    )
 
 
 def test_accuracy_matrix_rejects_entry_without_model_key() -> None:
@@ -666,7 +849,8 @@ def test_accuracy_script_seeds_reviewed_goldens_into_the_writable_tree() -> None
 def test_runtime_wrapper_exposes_accuracy_mode_and_environment() -> None:
     text = RUNTIME.read_text()
     assert "pin-ut|model-test|model-accuracy|kernel-perf" in text
-    assert "/source/scripts/ci/ppu_e2e_accuracy.sh" in text
+    assert 'container_ci_dir="/source/scripts/ci"' in text
+    assert '"${container_ci_dir}/ppu_e2e_accuracy.sh"' in text
     for marker in (
         "HF_HOME",
         "HF_HUB_OFFLINE=1",
@@ -781,7 +965,8 @@ def test_nightly_select_step_labels_jobs_with_the_case_id() -> None:
     never runs.
     """
     text = NIGHTLY_WORKFLOW.read_text()
-    assert '{"model": entry["case_id"]}' in text
+    assert 'legacy_cases = [entry["case_id"] for entry in selected]' in text
+    assert '{"model": case_id} for case_id in legacy_cases' in text
     assert "ACCURACY_MODEL_KEYS" not in text
 
 
@@ -801,14 +986,19 @@ def test_accuracy_nightly_is_serial_and_wheel_sourced_from_the_build_commit() ->
         "./.github/workflows/ppu-build-and-test.yaml"
     )
     assert nightly["jobs"]["build"]["with"] == {
-        "pr_head_sha": "${{ github.sha }}",
+        "pr_head_sha": "${{ needs.select.outputs.target_sha }}",
         "skip_device_tests": True,
+        "runtime_version": "${{ needs.select.outputs.version }}",
     }
-    assert accuracy["needs"] == ["build", "select"]
-    # Checkout and wheels must describe the same SAIL tree.
-    assert accuracy["with"]["pr_head_sha"] == "${{ github.sha }}"
-    assert accuracy["with"]["wheel_source_sha"] == "${{ github.sha }}"
-    assert accuracy["with"]["build_run_id"] == "${{ github.run_id }}"
+    assert accuracy["needs"] == ["build", "select", "resolve-image"]
+    # Checkout and wheels must describe the same SAIL tree when building wheels.
+    assert accuracy["with"]["pr_head_sha"] == "${{ needs.select.outputs.target_sha }}"
+    assert accuracy["with"]["wheel_source_sha"] == (
+        "${{ !inputs.skip_wheel_build && needs.select.outputs.target_sha || '' }}"
+    )
+    assert accuracy["with"]["build_run_id"] == (
+        "${{ !inputs.skip_wheel_build && github.run_id || '' }}"
+    )
     assert accuracy["with"]["pr_mode"] is False
     # The accuracy work runs inside the reusable call, not on a hosted shell.
     assert "runs-on" not in accuracy

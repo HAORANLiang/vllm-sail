@@ -22,8 +22,12 @@ CI_REUSE_FILES = set(
     f".github/workflows/{WORKFLOW} .github/workflows/ppu-build-and-test.yaml "
     ".github/workflows/ut.yaml "
     ".github/workflows/_ppu-build.yaml .github/workflows/_ppu-pin-ut.yaml "
-    ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-upstream-reuse.yaml "
-    "scripts/ci/ppu_ci_command.py "
+    ".github/workflows/_ppu-model-tests.yaml .github/workflows/_ppu-recipe-fast-sanity.yaml "
+    ".github/workflows/_ppu-upstream-reuse.yaml "
+    "scripts/ci/ppu_ci_command.py scripts/ci/ppu_wheel_donors.py "
+    "scripts/ci/ppu_native_fingerprint_compat.json "
+    "scripts/ci/ppu_e2e_recipe_sanity.sh scripts/ci/ppu_recipe.py "
+    "scripts/ci/ppu_recipe_runner.py "
     "scripts/ci/ppu_runtime_container.sh scripts/ci/ppu_runtime_image.sh "
     "scripts/ci/ppu_upstream_reuse.sh scripts/ci/ppu_image_stack.py "
     "scripts/ci/ppu_wheel_manifest.py requirements/upstream-reuse.txt "
@@ -124,6 +128,8 @@ class GitHub:
 class Controller:
     """Inject request/GraphQL client, event, environment and sleep for CPU tests."""
 
+    command_help = HELP
+
     def __init__(self, github, event, env=None, sleep=time.sleep):
         self.gh, self.event = github, event
         self.env = os.environ if env is None else env
@@ -140,15 +146,15 @@ class Controller:
     def api(self, method, path, data=None, params=None):
         return self.gh.request(method, self.root + path, data, params)
 
-    def pages(self, path, key=None, limit=None, **params):
+    def pages(self, path, key=None, limit=None, *, page_size=100, **params):
         page = 1
         while limit is None or page <= limit:
             result = self.api(
-                "GET", path, params={**params, "per_page": 100, "page": page}
+                "GET", path, params={**params, "per_page": page_size, "page": page}
             )
             items = result[key] if key else result
             yield from items
-            if len(items) < 100:
+            if len(items) < page_size:
                 break
             page += 1
 
@@ -283,24 +289,20 @@ class Controller:
             for path in paths
         )
 
-    def reusable_wheels(self, pr, sha):
+    def reusable_wheels(self, sha):
         no_wheel_prefixes = tuple(
             "docs/ tests/ benchmarks/ .github/workflows/ scripts/ tools/".split()
         )
         wheel_output_ignored = set(
             "AGENTS.md CONTRIBUTING.md .gitignore .pre-commit-config.yaml".split()
         )
-        native_files = wheel_output_ignored | set(
-            "LICENSE MANIFEST.in README.md requirements/dev.txt "
-            "requirements/ppu.txt requirements/profiling.txt".split()
-        )
-        native_prefixes = no_wheel_prefixes + ("vllm_sail/",)
         rebuild_prefixes = ("cmake/", "csrc/")
         rebuild_files = set(
             ".github/vllm-main-verified.commit .github/workflows/_ppu-build.yaml "
             "CMakeLists.txt pyproject.toml requirements/build.txt setup.py "
             "scripts/ci/build_ppu_wheels.sh scripts/ci/ppu_image_stack.py "
-            "scripts/ci/ppu_wheel_manifest.py vllm_sail/native/manifest.py "
+            "scripts/ci/ppu_wheel_manifest.py scripts/ci/ppu_native_fingerprint_compat.json "
+            "vllm_sail/native/manifest.py "
             "vllm_sail/native/plugin_manifest.py vllm_sail/native/resources.py "
             "vllm_sail/native/toolchain.py".split()
         )
@@ -308,17 +310,10 @@ class Controller:
         def native_input(path):
             return path in rebuild_files or path.startswith(rebuild_prefixes)
 
-        def native_safe(path):
-            return not native_input(path) and (
-                path in native_files or path.startswith(native_prefixes)
-            )
-
         def wheel_output_relevant(path):
             ignored = path in wheel_output_ignored or path.startswith(no_wheel_prefixes)
             return not ignored or native_input(path)
 
-        paths = self.changed_paths(pr, sha)
-        native_ok = paths is not None and all(native_safe(path) for path in paths)
         for run in self.find_runs()[:20]:
             if (
                 run.get("status") != "completed"
@@ -341,11 +336,9 @@ class Controller:
                 or path.startswith(CI_REUSE_PREFIXES),
             ):
                 return "full", str(run["id"]), source
-            if native_ok and self.trees_match(source, sha, native_input):
-                return "native", str(run["id"]), sha
         return "none", "", ""
 
-    def find_runs(self, pr=None, head_sha=None):
+    def find_runs(self, pr=None, head_sha=None, *, limit=10, page_size=100):
         query = (
             {"created": ">=" + pr["created_at"][:10]} if pr else {"status": "success"}
         )
@@ -353,7 +346,8 @@ class Controller:
         for run in self.pages(
             f"/actions/workflows/{WORKFLOW}/runs",
             "workflow_runs",
-            limit=10,
+            limit=limit,
+            page_size=page_size,
             event="workflow_dispatch",
             **query,
         ):
@@ -407,9 +401,9 @@ class Controller:
                 raise Rejected(f"CI request failed (HTTP {exc.code}).") from exc
             raise
 
-    def command(self):
+    def command(self, parse=parse_command):
         try:
-            action = parse_command(self.event)
+            action = parse(self.event)
         except Rejected:
             action = "help"
         if action is None:
@@ -427,15 +421,9 @@ class Controller:
             reaction = "rocket"
             try:
                 if action == "help":
-                    raise Rejected(HELP)
+                    raise Rejected(self.command_help)
                 pr = self.api("GET", f"/pulls/{number}")
-                self.authorize(pr, login)
-                if action == "/ci cancel":
-                    text = self.cancel(pr, login)
-                elif action == "/ci retry":
-                    text = self.retry(pr, login)
-                else:
-                    text = self.run(pr, login, cid, action.endswith("--allow-stale"))
+                text = self.execute(action, pr, login, cid)
             except Rejected as exc:
                 text, reaction = str(exc), "-1"
             self.reply(number, cid, text)
@@ -443,6 +431,14 @@ class Controller:
         except Exception:
             self.react(cid, "confused")
             raise
+
+    def execute(self, action, pr, login, cid):
+        self.authorize(pr, login)
+        if action == "/ci cancel":
+            return self.cancel(pr, login)
+        if action == "/ci retry":
+            return self.retry(pr, login)
+        return self.run(pr, login, cid, action.endswith("--allow-stale"))
 
     def run(self, pr, login, cid, allow_stale):
         sha = pr["head"]["sha"]
@@ -555,13 +551,14 @@ class Controller:
         body = f"{tag}\n@{login}: {HELP}. New commits require `/ci run`. `--allow-stale` permits running behind the base branch. Bare CPU UT and the remaining runtime/source UT run with `/ci run`."
         self.api("POST", f"/issues/{pr['number']}/comments", {"body": body})
 
-    def inputs(self):
+    def inputs(self, **extra_patterns):
         inputs = self.event.get("inputs", {})
         patterns = dict(
             pr_number=r"[1-9][0-9]*",
             head_sha=r"[0-9a-f]{40}",
             requester=LOGIN,
             comment_id=r"[1-9][0-9]*",
+            **extra_patterns,
         )
         for key, pattern in patterns.items():
             value = inputs.get(key)
@@ -586,17 +583,16 @@ class Controller:
         mode, build, source = ("skip", "", "")
         if not skip:
             mode, build, source = best_effort(
-                lambda: self.reusable_wheels(pr, inputs["head_sha"])
+                lambda: self.reusable_wheels(inputs["head_sha"])
             ) or ("none", "", "")
         print(f"Wheel reuse: mode={mode}, run={build}, source={source}")
         existing = build if mode == "full" else ""
-        native = build if mode == "native" else ""
         with open(self.env["GITHUB_OUTPUT"], "a") as output:
             output.write(
                 f"pr_head_ref={pr['head']['ref']}\n"
                 f"skip_ppu={'true' if skip else 'false'}\n"
                 f"existing_build_run_id={existing}\n"
-                f"native_reuse_run_id={native}\nwheel_source_sha={source}\n"
+                f"wheel_source_sha={source}\n"
             )
 
     def report(self):
@@ -636,7 +632,7 @@ class Controller:
         best_effort(comment)
 
 
-def main(argv=None, env=None, github=None, sleep=time.sleep):
+def main(argv=None, env=None, github=None, sleep=time.sleep, *, controller=Controller):
     env = os.environ if env is None else env
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("command", "notify", "validate", "report"))
@@ -647,7 +643,7 @@ def main(argv=None, env=None, github=None, sleep=time.sleep):
         github = github or GitHub(
             env["GITHUB_TOKEN"], env.get("GITHUB_API_URL", "https://api.github.com")
         )
-        getattr(Controller(github, event, env, sleep), mode)()
+        getattr(controller(github, event, env, sleep), mode)()
     except Exception as exc:
         if mode != "validate":
             raise

@@ -93,7 +93,7 @@ Post one of these exact commands as a new PR comment:
 
 | Command | Behavior |
 | --- | --- |
-| `/ci run` | Run the bare CPU UT matrix, build wheels, and run the remaining runtime/source UT and model smoke tests for the current head. |
+| `/ci run` | Run the bare CPU UT matrix, build wheels, and run the remaining runtime/source UT and Recipe Fast Sanity for the current head. |
 | `/ci run --allow-stale` | Run even when the PR is behind its base branch; no automatic merge is performed. |
 | `/ci retry` | Retry failed jobs in the latest run for the current head, falling back to a full rerun if GitHub rejects the partial rerun. |
 | `/ci cancel` | Request cancellation of active PPU CI runs for this PR, including older heads. |
@@ -132,8 +132,27 @@ a repository maintainer can add the `ci-preview` label to opt the PR into the
 `ready` and `ready-run-all-tests`: those labels only authorize the PR author to
 use the trusted default-branch `/ci` executor.
 
-The preview route uses the PR merge commit for both workflow definitions and
-source, builds fresh wheels, and runs pin UT and model tests. While the
+The preview route uses the PR merge commit for workflow definitions and source,
+publishes its own wheel artifact, and runs pin UT and Recipe Fast Sanity.
+Formal `/ci run` keeps its full-artifact reuse path when both wheels and the CI
+inputs match.
+
+When a PR needs a wheel build, both routes try a matching scheduled
+default-branch Nightly artifact first. They can fall back to up to two prior
+successful formal builds whose original build ran from a source tree verified
+on the default branch and skipped all native donor downloads. Each native
+candidate must pass the artifact hashes, upstream vLLM pin, SAIL source commit
+and native build fingerprint checks. The build tries the next candidate after
+an unavailable or invalid artifact and compiles from source if none pass.
+On a match, it reuses the vLLM wheel and SAIL native extensions, then repackages
+SAIL from the commit under test.
+
+The PR Fast Sanity lane runs when `PPU_RECIPE_PUBLIC_ENABLED` is unset or set to
+`true`. Setting it to `false` disables the lane. The PPU CI gate still requires
+Fast Sanity to pass whenever device checks are required and the checkout
+supports Recipe. Pre-Recipe checkouts use the full-weight model smoke as their
+required model check. Manual runs of that smoke are available through
+`ppu-debug.yaml`. While the
 `ci-preview` label remains present, each matching push starts a new preview and
 cancels the older preview for the same PR. Removing the label cancels an active
 preview and skips the preview jobs. Preview results do not publish or replace
@@ -152,6 +171,48 @@ Actions instead of the individual source, PPU build, pin UT, smoke and gate
 job checks. The unified status requires every source and PPU stage
 to succeed. Coordinate this ruleset change with the switch to on-demand CI,
 after verifying the commands on the default branch.
+
+### On-demand PR Nightly accuracy
+
+Repository writers can request real-weight Nightly accuracy coverage on a PR:
+
+- Single case: `/ci run nightly <case>`
+- Multiple cases: `/ci run nightly <case1>,<case2>` (comma- or space-separated)
+- Full Recipe Nightly matrix: `/ci run nightly all` (runs all Recipe
+  `model_sanity` policies, matching scheduled Nightly; legacy accuracy cases
+  remain available by explicit case ID)
+
+Use a Recipe policy slug with a `model_sanity` tier (for example, `glm-5.3`) or
+an exact legacy accuracy case ID (for example, `deepseek-v4-int8-dp-ep`).
+Posting `/ci run nightly` returns usage help and links to the
+[Nightly case matrix](tests/ppu/README.md) without dispatching a run. A
+different configuration of the same model may have a different case ID.
+
+The Nightly workflow runs from the default branch and pins the PR head, case
+selection and the same run's wheels to that commit. Multiple cases execute
+serially across legacy and Recipe lanes. It reports the case results and
+Actions link on the PR, with published accuracy and failure details when
+available. It is a separate on-demand run outside the required `PPU CI` status.
+Use GitHub Actions to cancel or rerun it.
+
+### Scheduled and DevOps Nightly accuracy
+
+The default-branch cron queues `releases/v0.34.0` behind the scheduled `main`
+run. Both versions share one Actions concurrency group with capacity for 100
+waiting runs. Set `PPU_NIGHTLY_SCHEDULE_DISABLED=true` to turn off cron dispatches.
+
+Use `gh workflow run ppu-accuracy-nightly.yaml --ref <branch>` to select the
+workflow and runtime version. For a prebuilt image, pass `skip_wheel_build=true`
+and an `image_tag` or `image_digest` using `-f`. Select an older source revision
+from the same version with `target_ref`.
+
+Runner configuration uses `PPU_CI_RUNTIME_IMAGE` for `main` and
+`PPU_CI_RUNTIME_IMAGE_V034` for `v0.34.0`. Overrides target the configured
+default image repository unless the runner sets the respective
+`PPU_CI_RUNTIME_IMAGE_REPO` or `PPU_CI_RUNTIME_IMAGE_REPO_V034`. Both use
+`PPU_CI_RUNTIME_IMAGE_ALLOWED_REPOS` for override authorization. Configure the
+release image on all eligible runners and merge the release workflow before
+enabling the default-branch cron fan-out.
 
 ## Reporting issues
 

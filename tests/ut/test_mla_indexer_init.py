@@ -32,6 +32,7 @@ def builder_factory(modules, patch_utils_module):
         capability=89,
         text_heads=32,
         kpool=1,
+        max_tokens=4096,
     ):
         calls = []
 
@@ -49,6 +50,7 @@ def builder_factory(modules, patch_utils_module):
                 self.num_sms = 3
                 self.scheduler_metadata_buffer = NS(shape=("upstream",))
                 self.vllm_config = NS(
+                    scheduler_config=NS(max_num_batched_tokens=max_tokens),
                     model_config=NS(
                         hf_config=NS(model_type="multimodal_wrapper"),
                         hf_text_config=NS(
@@ -56,7 +58,7 @@ def builder_factory(modules, patch_utils_module):
                             index_head_dim=128,
                             index_kpool=kpool,
                         ),
-                    )
+                    ),
                 )
 
             @staticmethod
@@ -166,6 +168,16 @@ def test_ppu_fp8_constructor_keeps_geometry_and_reserves_sail_schedule(builder_f
     assert builder.indexer_n_head == 64
     assert builder.indexer_q_head_dim == 128
     assert builder.num_sms == 7
+    assert builder.scheduler_metadata_buffer.shape == (7 * 8 + 1, 2)
+
+
+@pytest.mark.parametrize("max_tokens", [16, 4096, 8192])
+def test_fp4_schedule_shape_is_independent_of_query_batch(builder_factory, max_tokens):
+    builder_cls, _ = builder_factory(ppu=True, fp4=True, max_tokens=max_tokens)
+    builder = builder_cls("config")
+    # DeepGEMM-for-sail #214 returns fixed-size grouped FP4 metadata
+    # [num_sms * tb_per_cu + 1, 2]; expanded query rows (including MTP) no
+    # longer grow the schedule, so the buffer must not reserve for them.
     assert builder.scheduler_metadata_buffer.shape == (7 * 8 + 1, 2)
 
 

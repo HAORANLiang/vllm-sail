@@ -11,6 +11,8 @@ from urllib.error import HTTPError
 import pytest
 import yaml
 
+from scripts.ci.ppu_wheel_donors import select_donors
+
 REPO = "t-head/vllm-sail"
 ROOT = f"/repos/{REPO}"
 SHA = "a" * 40
@@ -1400,7 +1402,6 @@ def test_validate_skips_ppu_for_non_executable_changes(files, github_output, cap
         "pr_head_ref": "feature/ci",
         "skip_ppu": "true",
         "existing_build_run_id": "",
-        "native_reuse_run_id": "",
         "wheel_source_sha": "",
     }
     assert not any(
@@ -1835,7 +1836,6 @@ def reuse_result(mode, run_id="555", source=OLD):
         "pr_head_ref": "feature/ci",
         "skip_ppu": "false",
         "existing_build_run_id": run_id if mode == "full" else "",
-        "native_reuse_run_id": run_id if mode == "native" else "",
         "wheel_source_sha": source if mode != "none" else "",
     }
 
@@ -1869,7 +1869,7 @@ def test_validate_reuses_complete_wheels_for_wheel_output_ignored_changes(
 @pytest.mark.parametrize(
     "path", ["README.md", "LICENSE", "MANIFEST.in", "requirements/dev.txt"]
 )
-def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output):
+def test_wheel_metadata_changes_block_full_reuse(path, github_output):
     control, gh = reuse_setup(
         pr_files=[
             {"filename": "tests/ut/test.py", "status": "modified"},
@@ -1877,22 +1877,20 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
         ],
         source_changes={path: tree_entry(path, oid=CHANGED)},
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", source=SHA
-    )
+    assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
 @pytest.mark.parametrize(
     "path,mode",
     [
-        ("README.md", "native"),
-        ("LICENSE", "native"),
-        ("MANIFEST.in", "native"),
+        ("README.md", "none"),
+        ("LICENSE", "none"),
+        ("MANIFEST.in", "none"),
         ("AGENTS.md", "full"),
         ("CONTRIBUTING.md", "full"),
-        ("requirements/dev.txt", "native"),
-        ("requirements/ppu.txt", "native"),
-        ("requirements/profiling.txt", "native"),
+        ("requirements/dev.txt", "none"),
+        ("requirements/ppu.txt", "none"),
+        ("requirements/profiling.txt", "none"),
         ("scripts/ci/build_ppu_wheels.sh", "none"),
         ("scripts/ci/ppu_image_stack.py", "none"),
         ("scripts/ci/ppu_wheel_manifest.py", "none"),
@@ -1900,7 +1898,7 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
         ("pyproject.toml", "none"),
         ("CMakeLists.txt", "none"),
         ("csrc/kernel.cu", "none"),
-        ("vllm_sail/file.py", "native"),
+        ("vllm_sail/file.py", "none"),
         ("plugin/hooks.py", "none"),
         ("cmake/build.cmake", "none"),
         (".github/vllm-main-verified.commit", "none"),
@@ -1910,9 +1908,7 @@ def test_wheel_metadata_changes_block_full_but_allow_native(path, github_output)
     ],
 )
 @pytest.mark.parametrize("rename", [False, True])
-def test_source_equivalence_and_current_pr_safety_select_reuse_mode(
-    path, mode, rename, github_output
-):
+def test_source_equivalence_selects_full_reuse(path, mode, rename, github_output):
     inventory_file = {"filename": path, "status": "modified"}
     changes = {path: tree_entry(path, oid=CHANGED)}
     if rename:
@@ -1929,9 +1925,7 @@ def test_source_equivalence_and_current_pr_safety_select_reuse_mode(
         ],
         source_changes=changes,
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        mode, source=SHA if mode == "native" else OLD
-    )
+    assert validate_pair(control, gh, github_output) == reuse_result(mode)
 
 
 def test_validate_accepts_older_run_with_identical_ci_files(github_output):
@@ -1951,21 +1945,6 @@ def test_ci_reuse_file_changes_block_full(path, github_output):
     assert validate_pair(control, gh, github_output) == reuse_result("none")
 
 
-def test_native_reuse_does_not_require_ci_file_equivalence(github_output):
-    candidate = run(555, OLD, conclusion="success", head_sha="d" * 40)
-    ci_entry = f".github/workflows/{module().WORKFLOW}"
-    control, gh = reuse_setup(
-        candidates=[candidate],
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
-        },
-        main_changes={ci_entry: tree_entry(ci_entry, oid=CHANGED)},
-    )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", source=SHA
-    )
-
-
 def test_pr_file_failure_is_cached_and_does_not_block_full(github_output, capsys):
     control, gh = reuse_setup(pr_files=http_error(503))
     assert validate_pair(control, gh, github_output) == reuse_result("full")
@@ -1973,18 +1952,8 @@ def test_pr_file_failure_is_cached_and_does_not_block_full(github_output, capsys
     assert "503" in capsys.readouterr().err
 
 
-def test_pr_file_failure_disables_native(github_output):
-    control, gh = reuse_setup(
-        pr_files=http_error(503),
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
-        },
-    )
-    assert validate_pair(control, gh, github_output) == reuse_result("none")
-
-
 @pytest.mark.parametrize("file", MALFORMED_PR_FILES)
-def test_malformed_pr_repository_paths_disable_native(file, github_output):
+def test_malformed_pr_paths_do_not_enable_full_reuse(file, github_output):
     control, gh = reuse_setup(
         pr_files=[{"filename": "vllm_sail/file.py", "status": "modified"}, file],
         source_changes={
@@ -1998,7 +1967,9 @@ def test_malformed_pr_repository_paths_disable_native(file, github_output):
     "previous",
     ["csrc/kernel.cu", None, "", "docs/../csrc/kernel.cu", "docs/\x00old.md"],
 )
-def test_inconsistent_rename_metadata_disables_native(previous, github_output):
+def test_inconsistent_rename_metadata_does_not_enable_full_reuse(
+    previous, github_output
+):
     control, gh = reuse_setup(
         pr_files=[
             {"filename": "vllm_sail/file.py", "status": "modified"},
@@ -2059,27 +2030,219 @@ def test_invalid_tree_aborts_selection_before_an_older_matching_donor(
     assert not any(c[1].endswith("/actions/runs/554/artifacts") for c in gh.calls)
 
 
-def test_native_selection_continues_to_an_older_matching_donor(github_output):
-    latest = base_tree()
-    latest["csrc/kernel.cu"] = tree_entry("csrc/kernel.cu", oid=CHANGED)
-    candidates = [
-        run(555, OLD, conclusion="success"),
-        run(554, "d" * 40, conclusion="success"),
-    ]
-    control, gh = reuse_setup(
-        pr_files=[
-            {"filename": "tests/ut/test.py", "status": "modified"},
-            {"filename": "vllm_sail/file.py", "status": "modified"},
-        ],
-        candidates=candidates,
-        source_changes={
-            "vllm_sail/file.py": tree_entry("vllm_sail/file.py", oid=CHANGED)
+def donor_steps(started, completed, *, reused=False):
+    return [
+        {"name": "Verify checked-out revision", "conclusion": "success"},
+        {
+            "name": "Download native wheel donor",
+            "conclusion": "success" if reused else "skipped",
         },
-        trees={OLD: tree_payload(list(latest.values()))},
+        {"name": "Build or repackage wheels", "conclusion": "success"},
+        {
+            "name": "Upload wheels",
+            "conclusion": "success",
+            "started_at": started,
+            "completed_at": completed,
+        },
+    ]
+
+
+def donor_artifact(
+    gh,
+    ident,
+    job,
+    *,
+    conclusion="success",
+    expired=False,
+    reused=False,
+    wrong_attempt=False,
+):
+    gh.page(
+        f"/actions/runs/{ident}/attempts/2/jobs",
+        [
+            {
+                "name": job,
+                "conclusion": conclusion,
+                "steps": donor_steps(
+                    "2026-11-19T00:00:00Z", "2026-11-19T00:00:03Z", reused=reused
+                ),
+            }
+        ],
+        "jobs",
     )
-    assert validate_pair(control, gh, github_output) == reuse_result(
-        "native", run_id="554", source=SHA
+    gh.page(
+        f"/actions/runs/{ident}/artifacts",
+        [
+            {
+                "id": 2000 + ident,
+                "name": f"ppu-wheels-{ident}",
+                "expired": expired,
+                "created_at": (
+                    "2026-11-18T23:59:59Z" if wrong_attempt else "2026-11-19T00:00:01Z"
+                ),
+            }
+        ],
+        "artifacts",
     )
+
+
+@pytest.mark.parametrize(
+    "nightly_result", ["success", "expired", "failed", "api_error", "wrong_attempt"]
+)
+def test_shared_selector_prioritizes_nightly_then_cold_history(
+    nightly_result, github_output, capsys
+):
+    control, gh, _ = make_controller()
+    newer_source = "d" * 40
+    inherited_source = "e" * 40
+    candidate = "f" * 40
+    nightly = run(
+        555,
+        event="schedule",
+        path=".github/workflows/nightly-wheels.yaml",
+        head_sha=SHA,
+        head_repository={"full_name": REPO},
+        conclusion="failure",  # Independent publication can fail.
+    )
+    route = "/actions/workflows/nightly-wheels.yaml/runs"
+    params = {
+        "branch": "main",
+        "event": "schedule",
+        "status": "completed",
+        "per_page": 5,
+    }
+    if nightly_result == "api_error":
+        gh.add(
+            "GET",
+            ROOT + route,
+            http_error(503),
+            params={**params, "page": 1},
+        )
+    else:
+        gh.page(
+            route,
+            [
+                {**nightly, "id": 900},
+                {**nightly, "id": 559, "event": "workflow_dispatch"},
+                {
+                    **nightly,
+                    "id": 558,
+                    "head_repository": {"full_name": "fork/vllm-sail"},
+                },
+                {**nightly, "id": 556, "head_sha": newer_source},
+                nightly,
+            ],
+            "workflow_runs",
+            **params,
+        )
+    gh.page(
+        RUNS,
+        [
+            run(
+                554,
+                inherited_source,
+                conclusion="success",
+                head_repository={"full_name": REPO},
+            ),
+            run(553, OLD, conclusion="success", head_repository={"full_name": REPO}),
+        ],
+        "workflow_runs",
+        event="workflow_dispatch",
+        status="success",
+        per_page=20,
+    )
+    base = [tree_entry("csrc/kernel.cu")]
+    add_tree(
+        gh, newer_source, tree_payload([tree_entry("csrc/kernel.cu", oid=CHANGED)])
+    )
+    add_tree(gh, SHA, tree_payload(base))
+    add_tree(gh, OLD, tree_payload(base))
+    add_tree(gh, inherited_source, tree_payload(base))
+    # Use the tested candidate, distinct from the workflow revision.
+    add_tree(
+        gh,
+        candidate,
+        tree_payload([*base, tree_entry(".github/workflows/_ppu-build.yaml")]),
+    )
+    for ident in (553, 554):
+        donor_artifact(gh, ident, "ppu / build / PPU wheel build", reused=ident == 554)
+    donor_artifact(
+        gh,
+        555,
+        "build / PPU wheel build",
+        conclusion=nightly_result if nightly_result == "failed" else "success",
+        expired=nightly_result == "expired",
+        wrong_attempt=nightly_result == "wrong_attempt",
+    )
+    gh.add(
+        "GET",
+        ROOT + f"/compare/{OLD}...main",
+        {"status": "ahead", "merge_base_commit": {"sha": OLD}},
+    )
+
+    select_donors(control, candidate)
+
+    expected = [(555, SHA), (553, OLD)] if nightly_result == "success" else [(553, OLD)]
+    assert dict(line.split("=") for line in github_output.read_text().splitlines()) == {
+        f"{key}_{slot}": str(value)
+        for slot, (ident, source) in enumerate(expected, 1)
+        for key, value in {
+            "run": ident,
+            "artifact": 2000 + ident,
+            "source": source,
+        }.items()
+    }
+    err = capsys.readouterr().err
+    assert ("503" in err) if nightly_result == "api_error" else not err
+    assert all(call[0] == "GET" for call in gh.calls)
+    assert not any(f"/compare/{inherited_source}" in call[1] for call in gh.calls)
+
+
+@pytest.mark.parametrize(
+    "merged,equivalent,expected",
+    [
+        (True, True, True),
+        (True, False, False),
+        (False, True, False),
+    ],
+)
+def test_history_requires_source_on_main_or_identical_to_merged_tree(
+    merged, equivalent, expected
+):
+    from scripts.ci.ppu_wheel_donors import trusted_formal_source
+
+    control, gh, _ = make_controller()
+    gh.add(
+        "GET",
+        ROOT + f"/compare/{OLD}...main",
+        {"status": "diverged", "merge_base_commit": {"sha": SHA}},
+    )
+    gh.add(
+        "GET",
+        ROOT + f"/compare/{SHA}...main",
+        {"status": "ahead", "merge_base_commit": {"sha": SHA}},
+    )
+    gh.add(
+        "GET",
+        ROOT + "/pulls/7",
+        {
+            "merged": merged,
+            "merge_commit_sha": SHA,
+            "base": {"ref": "main", "repo": {"full_name": REPO}},
+        },
+    )
+    add_tree(gh, OLD, tree_payload([tree_entry("vllm_sail/file.py")]))
+    add_tree(
+        gh,
+        SHA,
+        tree_payload(
+            [
+                tree_entry("vllm_sail/file.py", oid=BLOB if equivalent else CHANGED),
+            ]
+        ),
+    )
+
+    assert trusted_formal_source(control, 7, OLD) is expected
 
 
 def test_tree_cache_is_shared_across_donors_and_current_main(github_output):
@@ -2253,3 +2416,521 @@ def test_reuse_discovery_has_a_finite_page_budget(github_output):
         )
     assert validate_pair(control, gh, github_output)["existing_build_run_id"] == ""
     assert len([c for c in gh.calls if c[1] == ROOT + RUNS]) <= 10
+
+
+def nightly_setup(body, permission_value="write"):
+    from scripts.ci.ppu_pr_nightly import WORKFLOW, NightlyController
+
+    current, gh, sleeps = command_setup(body=body, value=permission_value)
+    control = NightlyController(gh, current.event, current.env, sleeps.append)
+    gh.page(
+        f"/actions/workflows/{WORKFLOW}/runs",
+        [],
+        "workflow_runs",
+    )
+    path = f"/actions/workflows/{WORKFLOW}/dispatches"
+    gh.add("POST", ROOT + path, None)
+    return control, gh, path
+
+
+@pytest.mark.parametrize(
+    "body, expected_case_id",
+    [
+        ("/ci run nightly deepseek-v4-mxfp4-dp-ep", "deepseek-v4-mxfp4-dp-ep"),
+        ("/ci run nightly all", "all"),
+        (
+            "/ci run nightly glm-5.3,deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+        (
+            "/ci run nightly glm-5.3, deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+        (
+            "/ci run nightly glm-5.3 deepseek-v4-flash",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+    ],
+)
+def test_nightly_command_dispatches_exact_cases_and_head_without_formal_status(
+    body, expected_case_id
+):
+    control, gh, path = nightly_setup(body)
+    control.command()
+    assert gh.writes(path)[0][2] == {
+        "ref": "main",
+        "inputs": {**INPUTS, "case_id": expected_case_id},
+    }
+    assert expected_case_id in reply(gh)
+    assert SHA in reply(gh)
+    assert reactions(gh) == ["eyes", "rocket"]
+    assert states(gh) == []
+
+
+@pytest.mark.parametrize(
+    "body, access, message",
+    [
+        ("/ci nightly", "read", "/ci run nightly <case[,case...]|all>"),
+        ("/ci run nightly", "read", "List of available Nightly cases"),
+        ("/ci run nightly all,glm-5.3", "write", "Cannot combine"),
+        ("/ci run nightly glm-5.3,glm-5.3", "write", "Duplicate"),
+        ("/ci run nightly glm-5.3,", "write", "Use `/ci run nightly"),
+        ("/ci run nightly glm-5.3\n/ci run", "write", "Use `/ci run nightly"),
+        (
+            "/ci run nightly " + ",".join(f"model-case-{i:02d}" for i in range(17)),
+            "write",
+            "Too many Nightly cases",
+        ),
+        ("/ci run nightly glm-5.3", "read", "write permission"),
+        ("/ci run nightly all", "read", "write permission"),
+    ],
+)
+def test_nightly_help_invalid_and_ready_author_do_not_dispatch(body, access, message):
+    control, gh, path = nightly_setup(body, access)
+    control.command()
+    assert message in reply(gh)
+    assert reactions(gh) == ["eyes", "-1"]
+    assert not gh.writes(path)
+    assert states(gh) == []
+
+
+@pytest.mark.parametrize(
+    "body, existing_case_spec",
+    [
+        ("/ci run nightly glm-5.3", "glm-5.3"),
+        ("/ci run nightly all", "all"),
+        (
+            "/ci run nightly deepseek-v4-flash,glm-5.3",
+            "glm-5.3,deepseek-v4-flash",
+        ),
+    ],
+)
+def test_nightly_command_reuses_active_case_for_same_head(body, existing_case_spec):
+    control, gh, path = nightly_setup(body)
+    flow = path.removesuffix("/dispatches")
+    gh.page(
+        f"{flow}/runs",
+        [
+            run(
+                status="queued",
+                display_title=f"PPU PR #7 Nightly {existing_case_spec} @ {SHA} (comment 19)",
+                path=f".github/workflows/{flow.split('/')[-1]}",
+            )
+        ],
+        "workflow_runs",
+    )
+    control.command()
+    assert "already requested" in reply(gh)
+    assert not gh.writes(path)
+
+
+@pytest.mark.parametrize("last_page", [3, 11])
+def test_nightly_command_finds_active_case_on_later_pages(last_page):
+    control, gh, path = nightly_setup("/ci run nightly glm-5.3")
+    flow = path.removesuffix("/dispatches")
+    run_path = f".github/workflows/{flow.split('/')[-1]}"
+    other = run(
+        display_title=f"PPU PR #8 Nightly glm-5.3 @ {SHA} (comment 20)",
+        path=run_path,
+    )
+    for page in range(1, last_page):
+        gh.page(f"{flow}/runs", [other] * 100, "workflow_runs", page=page)
+    active = run(
+        status="queued",
+        display_title=f"PPU PR #7 Nightly glm-5.3 @ {SHA} (comment 19)",
+        path=run_path,
+    )
+    gh.page(f"{flow}/runs", [active], "workflow_runs", page=last_page)
+    control.command()
+    assert not gh.writes(path)
+    assert "already requested" in reply(gh)
+
+
+def test_nightly_dispatcher_still_routes_formal_ci_as_before():
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    base, gh, sleeps = command_setup(value="write")
+    NightlyController(gh, base.event, base.env, sleeps.append).command()
+    assert gh.writes(DISPATCH)[0][2]["inputs"] == INPUTS
+    assert states(gh) == ["pending"]
+
+
+@pytest.mark.parametrize(
+    "problem, case_id, comment_body",
+    [
+        ("none", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("none", "all", "/ci run nightly all"),
+        (
+            "none",
+            "glm-5.3,deepseek-v4-flash",
+            "/ci run nightly glm-5.3, deepseek-v4-flash",
+        ),
+        ("head", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("author", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("issue", "glm-5.3", "/ci run nightly glm-5.3"),
+        ("command", "glm-5.3", "/ci run"),
+        ("command", "glm-5.3,deepseek-v4-flash", "/ci run nightly glm-5.3"),
+        ("write", "glm-5.3", "/ci run nightly glm-5.3"),
+    ],
+)
+def test_nightly_executor_binds_writer_comment_to_current_pr_head(
+    problem, case_id, comment_body
+):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    current, gh, _ = make_controller({"inputs": {**INPUTS, "case_id": case_id}})
+    pr = {**PR, "head": {**PR["head"], "sha": OLD if problem == "head" else SHA}}
+    comment = {
+        "issue_url": f"https://api.github.com{ROOT}/issues/{8 if problem == 'issue' else 7}",
+        "user": {**USER, "login": "another" if problem == "author" else "author"},
+        "body": comment_body,
+    }
+    gh.add("GET", ROOT + "/pulls/7", pr)
+    gh.add("GET", ROOT + "/issues/comments/42", comment)
+    permission(gh, value="read" if problem == "write" else "write")
+    control = NightlyController(gh, current.event, current.env)
+    if problem == "none":
+        control.validate()
+    else:
+        with pytest.raises(module().Rejected):
+            control.validate()
+    assert all(method == "GET" for method, *_ in gh.calls)
+
+
+@pytest.mark.parametrize(
+    "case_result,reason",
+    [
+        ("success", "not_applicable"),
+        ("failure", "server_startup_failed"),
+        ("failure", "gsm8k_gate_failed"),
+        ("failure", "CREDENTIALS_AND_PRIVATE_DATA"),
+        ("skipped", "not_applicable"),
+    ],
+)
+def test_nightly_report_keeps_case_verdict_separate_and_redacts_summary(
+    tmp_path, case_result, reason
+):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    artifact = tmp_path / "ppu-recipe-model_sanity-glm-5.3-900-2"
+    artifact.mkdir()
+    (artifact / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "pass" if case_result == "success" else "fail",
+                "failure_reason": reason,
+                "gsm8k": {"score": 0.92, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+                "extra": "CREDENTIALS_AND_PRIVATE_DATA",
+            }
+        )
+    )
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "glm-5.3"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {"recipe_models": "glm-5.3", "legacy_models": ""},
+                    },
+                    "build": {"result": "success"},
+                    "recipe": {"result": case_result},
+                    "legacy": {"result": "skipped"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    control = NightlyController(gh, current.event, current.env)
+    if case_result == "success":
+        control.report()
+    else:
+        with pytest.raises(module().Rejected):
+            control.report()
+    assert ("92.00% (1319 samples)" in reply(gh)) == (case_result != "skipped")
+    assert "CREDENTIALS_AND_PRIVATE_DATA" not in reply(gh)
+    assert (
+        "**Case did not run**" in reply(gh)
+        if case_result == "skipped"
+        else SHA in reply(gh)
+    )
+    if reason in ("server_startup_failed", "gsm8k_gate_failed"):
+        assert reason in reply(gh)
+    assert states(gh) == []
+
+
+def test_nightly_report_summarizes_multi_case_mixed_lanes_in_table(tmp_path):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    legacy_dir = tmp_path / "ppu-pr-nightly-legacy-deepseek-v4-int8-900-2"
+    legacy_dir.mkdir()
+    (legacy_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.91, "evaluated_samples": 1319},
+                "extra": "PRIVATE_SECRET",
+            }
+        )
+    )
+    recipe_dir = tmp_path / "ppu-recipe-model_sanity-glm-5.3-900-2"
+    recipe_dir.mkdir()
+    (recipe_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "status": "fail",
+                "failure_reason": "gsm8k_gate_failed",
+                "gsm8k": {"score": 0.85, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+                "extra": "PRIVATE_SECRET",
+            }
+        )
+    )
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "all"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "glm-5.3,deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "failure"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    control = NightlyController(gh, current.event, current.env)
+    with pytest.raises(module().Rejected, match="Failed"):
+        control.report()
+    body = reply(gh)
+    assert f"PR Nightly `all` at `{SHA}` — **Failed** (1/3 passed)" in body
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body
+    assert (
+        "| `glm-5.3` | recipe | fail | 85.00% (1319) | pass | `gsm8k_gate_failed` |"
+        in body
+    )
+    assert "| `deepseek-v4-flash` | recipe | unavailable | — | — | — |" in body
+    assert "PRIVATE_SECRET" not in body
+    assert states(gh) == []
+
+
+def test_nightly_report_partial_rerun_uses_exact_job_attempts_and_avoids_stale_fallback(
+    tmp_path,
+):
+    from scripts.ci.ppu_pr_nightly import NightlyController
+
+    # Attempt 1: legacy deepseek-v4-int8 passed, recipe glm-5.3 failed,
+    # recipe deepseek-v4-flash failed.
+    for dirname, payload in (
+        (
+            "ppu-pr-nightly-legacy-deepseek-v4-int8-900-1",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.91, "evaluated_samples": 1319},
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-glm-5.3-900-1",
+            {
+                "status": "fail",
+                "failure_reason": "server_startup_failed",
+                "gsm8k": {"score": None, "evaluated_samples": None},
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-glm-5.3-900-2",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.93, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+            },
+        ),
+        (
+            "ppu-recipe-model_sanity-deepseek-v4-flash-900-1",
+            {
+                "status": "fail",
+                "failure_reason": "gsm8k_gate_failed",
+                "gsm8k": {"score": 0.50, "evaluated_samples": 1319},
+            },
+        ),
+    ):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "summary.json").write_text(json.dumps(payload))
+
+    # Case A: Re-run failed jobs succeeded for both lanes (2/2 passed).
+    current, gh, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "deepseek-v4-int8,glm-5.3"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "glm-5.3",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "success"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly legacy accuracy / Accuracy deepseek-v4-int8",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E glm-5.3",
+                "run_attempt": 2,
+                "conclusion": "success",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh.page(COMMENTS, [])
+    gh.add("POST", ROOT + COMMENTS, {})
+    NightlyController(gh, current.event, current.env).report()
+    body = reply(gh)
+    assert (
+        f"PR Nightly `deepseek-v4-int8,glm-5.3` at `{SHA}` — **Passed** (2/2 passed)"
+        in body
+    )
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body
+    assert "| `glm-5.3` | recipe | pass | 93.00% (1319) | pass | — |" in body
+
+    # Case B: deepseek-v4-flash was rerun in attempt 2 and cancelled before
+    # uploading attempt-2 summary; must NOT fall back to attempt-1 failure summary.
+    current2, gh2, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "deepseek-v4-int8,deepseek-v4-flash"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "deepseek-v4-int8",
+                            "recipe_models": "deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "success"},
+                    "recipe": {"result": "cancelled"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh2.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly legacy accuracy / Accuracy deepseek-v4-int8",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E deepseek-v4-flash",
+                "run_attempt": 2,
+                "conclusion": "cancelled",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh2.page(COMMENTS, [])
+    gh2.add("POST", ROOT + COMMENTS, {})
+    with pytest.raises(module().Rejected, match="Cancelled"):
+        NightlyController(gh2, current2.event, current2.env).report()
+    body2 = reply(gh2)
+    assert "(1/2 passed)" in body2
+    assert "| `deepseek-v4-int8` | legacy | pass | 91.00% (1319) | — | — |" in body2
+    assert "| `deepseek-v4-flash` | recipe | cancelled | — | — | — |" in body2
+    assert "gsm8k_gate_failed" not in body2
+    assert "50.00%" not in body2
+
+    # Case C: Same lane partial rerun where one case passed on attempt 1 and a
+    # sibling case failed on attempt 2 without an attempt-2 summary.
+    for dirname, payload in (
+        (
+            "ppu-recipe-model_sanity-glm-5.3-flash-900-1",
+            {
+                "status": "pass",
+                "failure_reason": "not_applicable",
+                "gsm8k": {"score": 0.94, "evaluated_samples": 1319},
+                "micro_e2e": "pass",
+            },
+        ),
+    ):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "summary.json").write_text(json.dumps(payload))
+    current3, gh3, _ = make_controller(
+        {"inputs": {**INPUTS, "case_id": "glm-5.3-flash,deepseek-v4-flash"}},
+        {
+            "NEEDS": json.dumps(
+                {
+                    "select": {
+                        "result": "success",
+                        "outputs": {
+                            "legacy_models": "",
+                            "recipe_models": "glm-5.3-flash,deepseek-v4-flash",
+                        },
+                    },
+                    "build": {"result": "success"},
+                    "legacy": {"result": "skipped"},
+                    "recipe": {"result": "failure"},
+                }
+            ),
+            "SUMMARY_DIR": str(tmp_path),
+        },
+    )
+    gh3.page(
+        "/actions/runs/900/jobs",
+        [
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E glm-5.3-flash",
+                "run_attempt": 1,
+                "conclusion": "success",
+            },
+            {
+                "name": "PR Nightly Recipe / Model sanity & micro-E2E deepseek-v4-flash",
+                "run_attempt": 2,
+                "conclusion": "failure",
+            },
+        ],
+        "jobs",
+        filter="latest",
+    )
+    gh3.page(COMMENTS, [])
+    gh3.add("POST", ROOT + COMMENTS, {})
+    with pytest.raises(module().Rejected, match="Failed"):
+        NightlyController(gh3, current3.event, current3.env).report()
+    body3 = reply(gh3)
+    assert "(1/2 passed)" in body3
+    assert "| `glm-5.3-flash` | recipe | pass | 94.00% (1319) | pass | — |" in body3
+    assert "| `deepseek-v4-flash` | recipe | unavailable | — | — | — |" in body3
+    assert "50.00%" not in body3

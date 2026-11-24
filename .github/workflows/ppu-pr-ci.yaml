@@ -28,7 +28,7 @@ concurrency:
 jobs:
   validate:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
       contents: read
@@ -39,22 +39,19 @@ jobs:
       pr_head_ref: ${{ steps.validate.outputs.pr_head_ref }}
       skip_ppu: ${{ steps.validate.outputs.skip_ppu }}
       existing_build_run_id: ${{ steps.validate.outputs.existing_build_run_id }}
-      native_reuse_run_id: ${{ steps.validate.outputs.native_reuse_run_id }}
       wheel_source_sha: ${{ steps.validate.outputs.wheel_source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Validate PPU CI request
         id: validate
         env:
           GITHUB_TOKEN: ${{ github.token }}
           CI_TRUSTED_USERS: ${{ vars.CI_TRUSTED_USERS }}
-        run: python -m scripts.ci.ppu_ci_command validate
+        run: python3 -m scripts.ci.ppu_ci_command validate
 
   cpu:
     needs: validate
@@ -76,13 +73,13 @@ jobs:
       pr_head_sha: ${{ inputs.head_sha }}
       skip_ppu: ${{ needs.validate.outputs.skip_ppu == 'true' }}
       existing_build_run_id: ${{ needs.validate.outputs.existing_build_run_id }}
-      native_reuse_run_id: ${{ needs.validate.outputs.native_reuse_run_id }}
+      resolve_native_donors: true
       wheel_source_sha: ${{ needs.validate.outputs.wheel_source_sha }}
 
   report:
     needs: [validate, cpu, ppu]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions:
       contents: read
@@ -95,14 +92,11 @@ jobs:
         if: always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         with:
           ref: ${{ github.sha }}
+          sparse-checkout: scripts/ci
           persist-credentials: false
-      - uses: actions/setup-python@v5
-        if: always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        with:
-          python-version: "3.12"
       - name: Report PPU CI result
         if: always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GITHUB_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
-        run: python -m scripts.ci.ppu_ci_command report
+        run: python3 -m scripts.ci.ppu_ci_command report

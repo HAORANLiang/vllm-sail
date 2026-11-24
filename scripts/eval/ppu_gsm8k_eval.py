@@ -575,13 +575,16 @@ def run_evalscope(
     generation_config: dict[str, Any] | None = None,
     limit: int | None = None,
     work_dir: Path | None = None,
+    seed: int = 42,
+    eval_batch_size: int = 128,
+    dataset_options: dict[str, Any] | None = None,
 ) -> Any:
     """Run evalscope GSM8K (runtime import).
 
     ``generation_config`` is the sampling contract of the weights under test;
     it is passed through to ``TaskConfig`` untouched so every case over one
-    checkpoint samples identically.  The benchmark settings around it --
-    dataset, few-shot, batch size, seed -- stay shared by all cases.
+    checkpoint samples identically. Callers without a versioned dataset retain
+    the legacy benchmark options.
     """
     from evalscope import TaskConfig, run_task  # type: ignore[import-untyped]
 
@@ -596,16 +599,17 @@ def run_evalscope(
         datasets=["gsm8k"],
         dataset_args={
             "gsm8k": {
-                "dataset_id": gsm8k_path,
                 "few_shot_num": 4,
                 "few_shot_random": False,
                 "subset_list": ["main"],
+                **(dataset_options or {}),
+                "dataset_id": gsm8k_path,
             }
         },
         generation_config=generation,
-        eval_batch_size=128,
+        eval_batch_size=eval_batch_size,
         limit=limit,
-        seed=42,
+        seed=seed,
         work_dir=str(work_dir) if work_dir else None,
     )
     return run_task(task_cfg=cfg)
@@ -621,6 +625,18 @@ def extract_score(result: Any) -> tuple[float, int]:
     if num is None:
         num = rep.metrics[0].num
     return float(score), int(num)
+
+
+def _write_ci_result(path: Path, result: dict[str, Any]) -> None:
+    payload = {"status": result["status"]}
+    num = result.get("num")
+    for key in ("score", "golden_score"):
+        score = result.get(key)
+        if type(score) in (int, float) and 0 <= score <= 1:
+            payload[key] = score
+    if type(num) is int and num >= 0:
+        payload["num"] = num
+    path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
 
 
 # ===================================================================
@@ -644,6 +660,7 @@ def run_accuracy_eval(  # noqa: C901
     server_cmd: list[str] | None = None,
     server_env: dict[str, str] | None = None,
     golden_dir: Path | None = None,
+    ci_result_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run the full GSM8K accuracy eval pipeline.
 
@@ -724,17 +741,19 @@ def run_accuracy_eval(  # noqa: C901
         extra_flags=flags,
         server_cmd=server_cmd,
     )
-    server, log_path = start_vllm_server(
-        model_id,
-        served_model_name=unique_served,
-        port=port,
-        tp=ppu_count,
-        extra_flags=flags,
-        server_cmd=server_cmd,
-        server_env=server_env,
-        log_path=log_path,
-    )
+    server = None
+    failure_status: str | None = "server_startup_failed"
     try:
+        server, log_path = start_vllm_server(
+            model_id,
+            served_model_name=unique_served,
+            port=port,
+            tp=ppu_count,
+            extra_flags=flags,
+            server_cmd=server_cmd,
+            server_env=server_env,
+            log_path=log_path,
+        )
         wait_server_ready(
             server,
             log_path,
@@ -750,6 +769,7 @@ def run_accuracy_eval(  # noqa: C901
         _ensure_launched_server_alive(server, log_path, phase="post-readiness warm-up")
 
         # -- run evalscope --------------------------------------------
+        failure_status = "gsm8k_eval_failed"
         result_raw = run_evalscope(
             unique_served,
             port,
@@ -759,6 +779,7 @@ def run_accuracy_eval(  # noqa: C901
             work_dir=wd / "evalscope",
         )
         score, num = extract_score(result_raw)
+        failure_status = None
 
         # -- evalscope version ----------------------------------------
         try:
@@ -810,8 +831,13 @@ def run_accuracy_eval(  # noqa: C901
         )
         result["case_id"] = case_id or model_key
         return result
+    except Exception:
+        if ci_result_file is not None and failure_status is not None:
+            _write_ci_result(ci_result_file, {"status": failure_status})
+        raise
     finally:
-        stop_server(server)
+        if server is not None:
+            stop_server(server)
 
 
 def _golden_compare(
@@ -854,6 +880,7 @@ def _golden_compare(
             "record": record,
         }
 
+    golden_score = None
     # --- Threshold, used only where no golden can arbitrate --------------
     ok_thr, thr_err = check_score_threshold(score, threshold)
 
@@ -886,6 +913,7 @@ def _golden_compare(
             else:
                 # The band replaces the threshold gate entirely here.
                 ok_g, acc_err = check_accuracy_golden(score, num, golden)
+                golden_score = golden["score"]
                 status = "pass" if ok_g else "fail_accuracy"
                 error_msg = acc_err
     elif not ok_thr:
@@ -910,6 +938,7 @@ def _golden_compare(
         "score": score,
         "num": num,
         "golden_path": str(gf),
+        "golden_score": golden_score,
         "error": error_msg,
         "record": record,
     }
@@ -983,6 +1012,7 @@ def main() -> None:
         help="Limit the number of evaluation samples",
     )
     parser.add_argument("--work-dir", default=None)
+    parser.add_argument("--ci-result-file", type=Path, default=None)
     parser.add_argument(
         "--golden-dir",
         default=None,
@@ -1013,8 +1043,11 @@ def main() -> None:
         server_cmd=server_cmd,
         server_env=server_env,
         golden_dir=Path(args.golden_dir) if args.golden_dir else None,
+        ci_result_file=args.ci_result_file,
     )
 
+    if args.ci_result_file is not None:
+        _write_ci_result(args.ci_result_file, result)
     out = {k: v for k, v in result.items() if k != "record"}
     print(json.dumps(out, indent=2))
     if result["status"].startswith("fail"):

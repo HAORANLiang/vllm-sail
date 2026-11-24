@@ -1,0 +1,2533 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Temporary location in vllm-sail; migrates to centralized hub executor/ in Phase 2.
+"""Thin recipe/policy resolver and validator for ``ppu-serving/v1``."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib
+import json
+import os
+import re
+import shlex
+import sys
+from collections.abc import Mapping, Sequence
+from fnmatch import fnmatchcase
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_RECIPES_ROOT = REPO_ROOT / "tests" / "ppu" / "recipes"
+DEFAULT_POLICY_ROOT = REPO_ROOT / "tests" / "ppu" / "policy"
+DEFAULT_MATRIX_DOC = REPO_ROOT / "tests" / "ppu" / "README.md"
+
+SERVING_SCHEMA = "ppu-serving/v1"
+DATASET_SCHEMA = "ppu-dataset/v1"
+POLICY_SCHEMA = "ppu-test-policy/v1"
+POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
+_UNSET: Any = object()
+
+ALLOWED_ENV_PREFIXES = (
+    "VLLM_",
+    "SGLANG_",
+    "SGL_",
+    "NCCL_",
+    "TORCH_",
+    "OMP_",
+    "DG_",
+    "HGGC_",
+    "MC_",
+    "MOONCAKE_",
+)
+FORBIDDEN_RECIPE_ENV = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "HF_DATASETS_CACHE",
+        "HF_DATASETS_OFFLINE",
+        "HF_HOME",
+        "HF_HUB_OFFLINE",
+        "HF_MODULES_CACHE",
+        "NVIDIA_VISIBLE_DEVICES",
+        "SGLANG_USE_MODELSCOPE",
+        "SGLANG_WARMUP_TIMEOUT",
+        "TRANSFORMERS_OFFLINE",
+        "VLLM_SERVER_DEV_MODE",
+        "VLLM_USE_RUST_BENCH",
+        "VLLM_USE_RUST_FRONTEND",
+    }
+)
+EXTERNAL_ENV_PREFIXES = ("DG_", "HGGC_")
+EXTERNAL_ENV_EXACT = frozenset({"SGLANG_NSA_DUAL_STREAM"})
+JSON_FLAGS = frozenset(
+    {
+        "--attention-config",
+        "--compilation-config",
+        "--engram-config",
+        "--hf-overrides",
+        "--kv-transfer-config",
+        "--override-generation-config",
+        "--reasoning-config",
+        "--speculative-config",
+    }
+)
+INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, str], ...] = (
+    ("--enable-prefix-caching", "--no-enable-prefix-caching"),
+    ("--trust-remote-code", "--no-trust-remote-code"),
+    ("--enable-auto-tool-choice", "--disable-auto-tool-choice"),
+    ("--enable-expert-parallel", "--disable-expert-parallel"),
+    ("--enforce-eager", "--no-enforce-eager"),
+)
+ALLOWED_PRESET_SLOTS = frozenset(
+    {
+        "decode_nographs",
+        "dp_ep_low_latency",
+        "eval_longctx",
+        "prefill_long",
+        "tp8",
+    }
+)
+ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
+DEFAULT_MAX_AUTO_LAYER_OVERRIDE = 8
+SEGMENTED_MODEL_TYPES = frozenset({"deepseek_v41"})
+_SAFE_SIGNAL_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_NON_BACKBONE_PREFIX_RE = re.compile(
+    r"(?:^|\.)(?:vision|visual|audio|mtp|draft|mm_projector|multi_modal_projector)[^.]*\."
+)
+_BACKBONE_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.(.+))?$")
+_EXPERT_INDEX_RE = re.compile(r"\bexperts\.\d+\.")
+_TENSOR_PARAM_SUFFIX_RE = re.compile(
+    r"\.(?:weight|bias|qweight|qzeros|scales|g_idx|"
+    r"(?:weight|input|output|k|v|kv)_scale(?:_inv|_2)?)$"
+)
+_LAYER_SPECIFIC_RULE_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])layers(?:[^A-Za-z0-9]|$)", re.I
+)
+_CANONICAL_LAYER_MODULE_PROBES: tuple[str, ...] = (
+    "",
+    "mlp",
+    "mlp.down_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.gate_up_proj",
+    "mlp.fc1",
+    "mlp.fc2",
+    "mlp.c_fc",
+    "mlp.c_proj",
+    "mlp.gate",
+    "mlp.shared_expert_gate",
+    "mlp.experts.0.down_proj",
+    "mlp.experts.0.gate_proj",
+    "mlp.experts.0.up_proj",
+    "mlp.experts.0.gate_up_proj",
+    "mlp.experts.0.w1",
+    "mlp.experts.0.w2",
+    "mlp.experts.0.w3",
+    "mlp.experts.0.w13_proj",
+    "mlp.shared_experts",
+    "mlp.shared_experts.down_proj",
+    "mlp.shared_experts.gate_proj",
+    "mlp.shared_experts.up_proj",
+    "mlp.shared_experts.gate_up_proj",
+    "mlp.shared_experts.w1",
+    "mlp.shared_experts.w2",
+    "mlp.shared_experts.w3",
+    "block_sparse_moe.gate",
+    "block_sparse_moe.experts.0.w1",
+    "block_sparse_moe.experts.0.w2",
+    "block_sparse_moe.experts.0.w3",
+    "ffn",
+    "ffn.w1",
+    "ffn.w2",
+    "ffn.w3",
+    "ffn.shared_experts",
+    "ffn.shared_experts.w1",
+    "ffn.shared_experts.w2",
+    "ffn.shared_experts.w3",
+    "self_attn",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "self_attn.qkv_proj",
+    "self_attn.c_attn",
+    "self_attn.c_proj",
+    "self_attn.q_a_proj",
+    "self_attn.q_b_proj",
+    "self_attn.kv_a_proj_with_mqa",
+    "self_attn.kv_b_proj",
+    "self_attn.compressor",
+    "self_attn.indexer",
+    "attn.qkv_proj",
+    "attn.o_proj",
+    "attn.compressor",
+    "linear_attn",
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_qkvz",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_a",
+    "linear_attn.in_proj_b",
+    "linear_attn.in_proj_ba",
+    "linear_attn.conv1d",
+    "linear_attn.out_proj",
+)
+_NON_LAYER_LIST_KEYS = frozenset(
+    {
+        "architectures",
+        "bad_words_ids",
+        "begin_suppress_tokens",
+        "bos_token_id",
+        "eos_token_id",
+        "forced_bos_token_id",
+        "forced_eos_token_id",
+        "head_dim",
+        "image_grid_pinpoints",
+        "medusa_choices",
+        "mrope_section",
+        "pad_token_id",
+        "rope_scaling",
+        "suppress_tokens",
+        "torch_dtype",
+    }
+)
+
+_PROHIBITED_TOKEN_A = "".join(chr(c) for c in (98, 116, 118))
+_PROHIBITED_TOKEN_B = "".join(chr(c) for c in (102, 108, 121, 116, 105, 103, 101, 114))
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("internal_domain", re.compile(r"\.(?:alibaba-inc\.com|eng\.t-head\.cn)\b", re.I)),
+    ("internal_mirror", re.compile(r"\brsproxy\.cn\b", re.I)),
+    (
+        "local_path",
+        re.compile(
+            r"(?:^|[\s'\"=])(?:/nas_aisw|/ppusw|/mnt/|/Users/|/home/|/root/|/data/)"
+        ),
+    ),
+    (
+        "credential",
+        re.compile(
+            r"\b(?:ghp|gho|ghu|ghs)_[A-Za-z0-9_]{8,}|github_pat_|AKIA[0-9A-Z]{8,}|QODER_PAT\b"
+        ),
+    ),
+    (
+        "prohibited_token",
+        re.compile(rf"(?:{_PROHIBITED_TOKEN_A}|{_PROHIBITED_TOKEN_B})", re.I),
+    ),
+)
+
+
+class ValidationError(ValueError):
+    """Raised when recipe or policy validation fails."""
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValidationError(f"{path}: failed to read YAML: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValidationError(f"{path}: top-level YAML must be a mapping")
+    return data
+
+
+def _check_keys(
+    mapping: Any,
+    *,
+    allowed: set[str] | frozenset[str],
+    required: set[str] | frozenset[str] = frozenset(),
+    context: str,
+) -> dict[str, Any]:
+    if not isinstance(mapping, dict):
+        raise ValidationError(
+            f"{context}: expected mapping, got {type(mapping).__name__}"
+        )
+    unknown = sorted(set(mapping) - set(allowed))
+    if unknown:
+        raise ValidationError(f"{context}: unknown key(s): {', '.join(unknown)}")
+    missing = sorted(set(required) - set(mapping))
+    if missing:
+        raise ValidationError(
+            f"{context}: missing required key(s): {', '.join(missing)}"
+        )
+    return mapping
+
+
+def _check_str_list(value: Any, *, context: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValidationError(f"{context}: expected list of strings")
+    return value
+
+
+def _check_str_dict(value: Any, *, context: str) -> dict[str, str]:
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValidationError(f"{context}: expected string-to-string mapping")
+    return value
+
+
+def _deep_merge_dicts(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _inverse_map() -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for pos, neg in INVERSE_BOOLEAN_GROUPS:
+        pairs[pos] = neg
+        pairs[neg] = pos
+    return pairs
+
+
+_INVERSE_FLAGS = _inverse_map()
+
+
+def _parse_flag_entries(tokens: list[str]) -> list[tuple[str, str | None, bool]]:
+    """Split raw CLI tokens into ``(flag_name, value_or_none, has_equals)``."""
+    entries: list[tuple[str, str | None, bool]] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if not isinstance(tok, str) or not tok.startswith("--"):
+            raise ValidationError(f"expected --flag token, got {tok!r}")
+        if "=" in tok:
+            flag, val = tok.split("=", 1)
+            entries.append((flag, val, True))
+            idx += 1
+        elif idx + 1 < len(tokens) and not str(tokens[idx + 1]).startswith("--"):
+            entries.append((tok, str(tokens[idx + 1]), False))
+            idx += 2
+        else:
+            entries.append((tok, None, False))
+            idx += 1
+    return entries
+
+
+def _apply_flag_entries(
+    ordered: list[tuple[str, str | None, bool]],
+    new_tokens: list[str],
+) -> list[tuple[str, str | None, bool]]:
+    """Append flags with last-wins deduplication and inverse-flag clearing."""
+    result = list(ordered)
+    for flag, val, has_eq in _parse_flag_entries(new_tokens):
+        inverse = _INVERSE_FLAGS.get(flag)
+        result = [
+            item
+            for item in result
+            if item[0] != flag and (inverse is None or item[0] != inverse)
+        ]
+        result.append((flag, val, has_eq))
+    return result
+
+
+def _remove_flag_entries(
+    ordered: list[tuple[str, str | None, bool]],
+    remove_flags: list[str],
+) -> list[tuple[str, str | None, bool]]:
+    to_drop = set(remove_flags)
+    return [item for item in ordered if item[0] not in to_drop]
+
+
+def _merge_json_flag(
+    ordered: list[tuple[str, str | None, bool]],
+    flag: str,
+    patch: dict[str, Any],
+) -> list[tuple[str, str | None, bool]]:
+    existing_obj: dict[str, Any] = {}
+    for item_flag, val, _ in ordered:
+        if item_flag == flag and val is not None:
+            parsed = json.loads(val)
+            if not isinstance(parsed, dict):
+                raise ValidationError(f"cannot json-merge non-object flag {flag}")
+            existing_obj = parsed
+    merged = _deep_merge_dicts(existing_obj, patch)
+    encoded = json.dumps(merged, separators=(",", ":"), sort_keys=True)
+    return _apply_flag_entries(ordered, [flag, encoded])
+
+
+def _render_entries(ordered: list[tuple[str, str | None, bool]]) -> list[str]:
+    tokens: list[str] = []
+    for flag, val, has_eq in ordered:
+        if val is None:
+            tokens.append(flag)
+        elif has_eq:
+            tokens.append(f"{flag}={val}")
+        else:
+            tokens.extend([flag, val])
+    return tokens
+
+
+def _flag_value(ordered: list[tuple[str, str | None, bool]], flag: str) -> str | None:
+    for item_flag, val, _ in reversed(ordered):
+        if item_flag == flag:
+            return val
+    return None
+
+
+def _load_assets_map(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    raw = path.read_text(encoding="utf-8")
+    loaded = yaml.safe_load(raw)
+    if not isinstance(loaded, dict):
+        raise ValidationError(f"assets-map {path}: must be a mapping")
+    if "models" in loaded and isinstance(loaded["models"], dict):
+        return {str(k): str(v) for k, v in loaded["models"].items()}
+    return {str(k): str(v) for k, v in loaded.items()}
+
+
+def _canonical_flags(ordered: list[tuple[str, str | None, bool]]) -> list[str]:
+    canonical: list[str] = []
+    for flag, val, _ in ordered:
+        if val is None:
+            canonical.append(flag)
+        elif flag in JSON_FLAGS:
+            obj = json.loads(val)
+            canonical.extend(
+                [flag, json.dumps(obj, separators=(",", ":"), sort_keys=True)]
+            )
+        else:
+            canonical.extend([flag, val])
+    return canonical
+
+
+def _expand_env_path(raw: str, active_env: Mapping[str, str]) -> Path:
+    expanded = os.path.expandvars(raw)
+    if expanded == "~" or expanded.startswith("~/"):
+        home_base = Path(active_env["HOME"]) if active_env.get("HOME") else Path.home()
+        return home_base if expanded == "~" else home_base / expanded[2:]
+    return Path(os.path.expanduser(expanded))
+
+
+def resolve_local_checkpoint_dir(
+    resolved_model: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Locate a local Hugging Face checkpoint directory without network I/O."""
+    if not resolved_model or not resolved_model.strip():
+        return None
+    active_env = os.environ if env is None else env
+    direct = Path(resolved_model)
+    try:
+        if direct.is_dir() and (direct / "config.json").is_file():
+            return direct
+    except OSError:
+        pass
+
+    explicit_hub = active_env.get("HF_HUB_CACHE") or active_env.get(
+        "HUGGINGFACE_HUB_CACHE"
+    )
+    cache_roots: list[Path] = []
+    primary_hub_cache: Path
+    if explicit_hub:
+        primary_hub_cache = _expand_env_path(explicit_hub, active_env)
+        cache_roots.append(primary_hub_cache)
+    elif hf_home := active_env.get("HF_HOME"):
+        hf_home_dir = _expand_env_path(hf_home, active_env)
+        primary_hub_cache = hf_home_dir / "hub"
+        cache_roots.extend([primary_hub_cache, hf_home_dir])
+    elif xdg_cache := active_env.get("XDG_CACHE_HOME"):
+        primary_hub_cache = (
+            _expand_env_path(xdg_cache, active_env) / "huggingface" / "hub"
+        )
+        cache_roots.append(primary_hub_cache)
+    else:
+        home_base = (
+            _expand_env_path(active_env["HOME"], active_env)
+            if active_env.get("HOME")
+            else Path.home()
+        )
+        primary_hub_cache = home_base / ".cache" / "huggingface" / "hub"
+        cache_roots.append(primary_hub_cache)
+
+    try:
+        hf_hub = importlib.import_module("huggingface_hub")
+        local_dir = Path(
+            hf_hub.snapshot_download(
+                resolved_model,
+                cache_dir=str(primary_hub_cache),
+                local_files_only=True,
+            )
+        )
+        if (local_dir / "config.json").is_file():
+            return local_dir
+    except Exception:
+        pass
+
+    repo_folder = f"models--{resolved_model.strip('/').replace('/', '--')}"
+    seen: set[Path] = set()
+    for root in cache_roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        repo_dir = root / repo_folder
+        try:
+            if (repo_dir / "config.json").is_file():
+                return repo_dir
+            snaps_dir = repo_dir / "snapshots"
+            ref_main = repo_dir / "refs" / "main"
+            if ref_main.is_file():
+                rev = ref_main.read_text(encoding="utf-8").strip()
+                if rev and (snaps_dir / rev / "config.json").is_file():
+                    return snaps_dir / rev
+            if snaps_dir.is_dir():
+                candidates = sorted(
+                    p
+                    for p in snaps_dir.iterdir()
+                    if p.is_dir() and (p / "config.json").is_file()
+                )
+                if candidates:
+                    return candidates[-1]
+        except OSError:
+            continue
+
+    return None
+
+
+def _extract_text_config_and_path(
+    cfg: Mapping[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    for key in ("text_config", "llm_config", "language_config"):
+        sub = cfg.get(key)
+        if isinstance(sub, dict):
+            return sub, (key,)
+    thinker = cfg.get("thinker_config")
+    if isinstance(thinker, dict) and isinstance(thinker.get("text_config"), dict):
+        return thinker["text_config"], ("thinker_config", "text_config")
+    return dict(cfg), ()
+
+
+def _hf_overrides_has_num_hidden_layers(hf_ov: Mapping[str, Any]) -> bool:
+    if "num_hidden_layers" in hf_ov:
+        return True
+    sub, path = _extract_text_config_and_path(hf_ov)
+    return bool(path) and "num_hidden_layers" in sub
+
+
+def build_layer_hf_overrides(
+    num_layers: int,
+    model_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build ``--hf-overrides`` payload targeting the checkpoint's text config."""
+    if type(num_layers) is not int or num_layers < 1:
+        raise ValidationError(f"num_layers must be a positive int, got {num_layers!r}")
+    if model_dir is not None and (model_dir / "config.json").is_file():
+        try:
+            cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cfg = None
+        if isinstance(cfg, dict):
+            _, path = _extract_text_config_and_path(cfg)
+            if path:
+                nested: dict[str, Any] = {"num_hidden_layers": num_layers}
+                for key in reversed(path):
+                    nested = {key: nested}
+                if type(cfg.get("num_hidden_layers")) is int:
+                    nested["num_hidden_layers"] = num_layers
+                return nested
+    return {"num_hidden_layers": num_layers}
+
+
+def _expand_module_suffix_aliases(mod_suffix: str) -> list[str]:
+    aliases = [mod_suffix]
+    for src_leaf, fused_leaf in (
+        (".q_proj", ".qkv_proj"),
+        (".k_proj", ".qkv_proj"),
+        (".v_proj", ".qkv_proj"),
+        (".gate_proj", ".gate_up_proj"),
+        (".up_proj", ".gate_up_proj"),
+        (".w1", ".w13_proj"),
+        (".w3", ".w13_proj"),
+    ):
+        if mod_suffix.endswith(src_leaf):
+            aliases.append(mod_suffix[: -len(src_leaf)] + fused_leaf)
+    return aliases
+
+
+def _read_safetensors_weight_keys(model_dir: Path) -> tuple[list[str], str | None]:
+    """Read tensor parameter names from ``index.json`` or ``.safetensors`` headers."""
+    index_file = model_dir / "model.safetensors.index.json"
+    if index_file.is_file():
+        try:
+            doc = json.loads(index_file.read_text(encoding="utf-8"))
+            weight_map = doc.get("weight_map")
+            if isinstance(weight_map, dict) and weight_map:
+                return [str(k) for k in weight_map], "safetensors_index"
+        except (OSError, ValueError):
+            pass
+
+    shard_files = sorted(model_dir.glob("*.safetensors"))
+    keys: list[str] = []
+    for shard in shard_files:
+        try:
+            with shard.open("rb") as fh:
+                raw_len = fh.read(8)
+                if len(raw_len) != 8:
+                    continue
+                header_len = int.from_bytes(raw_len, "little")
+                if not (0 < header_len <= 64 * 1024 * 1024):
+                    continue
+                header = json.loads(fh.read(header_len).decode("utf-8"))
+            if isinstance(header, dict):
+                keys.extend(str(k) for k in header if k != "__metadata__")
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+    return (keys, "safetensors_header") if keys else ([], None)
+
+
+def _parse_layer_index_enum(raw: str, depth: int) -> set[int]:
+    """Parse ``'3,4,5'`` or ``'3..44'`` / ``'3-44'`` layer index expressions."""
+    indices: set[int] = set()
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        sep = ".." if ".." in token else ("-" if "-" in token else None)
+        if sep is not None:
+            lhs, rhs = token.split(sep, 1)
+            if lhs.strip().isdigit() and rhs.strip().isdigit():
+                start, end = int(lhs), int(rhs)
+                if start <= end:
+                    indices.update(i for i in range(start, end + 1) if 0 <= i < depth)
+        elif token.isdigit():
+            val = int(token)
+            if 0 <= val < depth:
+                indices.add(val)
+    return indices
+
+
+def _record_signal(signals: list[str], name: str) -> None:
+    if name not in signals and _SAFE_SIGNAL_KEY_RE.fullmatch(name):
+        signals.append(name)
+
+
+def infer_fast_sanity_layer_override(
+    model_dir: Path | None,
+    *,
+    flags: Sequence[str] = (),
+    max_override_layers: int = DEFAULT_MAX_AUTO_LAYER_OVERRIDE,
+) -> dict[str, Any]:
+    """Infer minimal ``num_hidden_layers`` prefix covering every layer archetype.
+
+    Returns a public-safe metadata mapping (never containing filesystem paths)
+    with ``layer_override`` set to an integer in ``[2, cap]`` when a prefix
+    covers all distinct ``(T(i), Q(i), C(i))`` layer signatures, or ``None``
+    when ``fast_sanity`` should run the full layer stack.
+    """
+
+    def _result(
+        override: int | None,
+        reason: str,
+        *,
+        depth: int | None = None,
+        distinct: int | None = None,
+        min_prefix: int | None = None,
+        cap: int | None = None,
+        signals: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "layer_override": override,
+            "reason": reason,
+            "num_hidden_layers": depth,
+            "distinct_archetypes": distinct,
+            "min_prefix_layers": min_prefix,
+            "cap_layers": cap,
+            "signals": list(signals or []),
+        }
+
+    try:
+        parsed_flags = _parse_flag_entries(list(flags))
+    except ValidationError:
+        parsed_flags = []
+    quant_flag = _flag_value(parsed_flags, "--quantization")
+    if quant_flag and quant_flag.startswith("w8a8_dynamic"):
+        return _result(None, "online_quantization", signals=["flag:quantization"])
+    hf_ov_raw = _flag_value(parsed_flags, "--hf-overrides")
+    if hf_ov_raw:
+        try:
+            hf_ov = json.loads(hf_ov_raw)
+        except ValueError:
+            hf_ov = None
+        if isinstance(hf_ov, dict):
+            if hf_ov.get("sail_quantization_recipe") or hf_ov.get(
+                "ppu_quantization_recipe"
+            ):
+                return _result(
+                    None, "online_quantization", signals=["flag:hf_overrides"]
+                )
+            if _hf_overrides_has_num_hidden_layers(hf_ov):
+                return _result(
+                    None, "explicit_hf_override", signals=["flag:hf_overrides"]
+                )
+
+    if model_dir is None or not (model_dir / "config.json").is_file():
+        return _result(None, "missing_checkpoint")
+    try:
+        cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _result(None, "invalid_config")
+    if not isinstance(cfg, dict):
+        return _result(None, "invalid_config")
+
+    text_cfg, _ = _extract_text_config_and_path(cfg)
+    merged_cfg: dict[str, Any] = {**cfg, **text_cfg}
+    if merged_cfg.get("sail_quantization_recipe") or merged_cfg.get(
+        "ppu_quantization_recipe"
+    ):
+        return _result(None, "online_quantization", signals=["config:quant_recipe"])
+
+    if merged_cfg.get("is_encoder_decoder") is True:
+        return _result(None, "encoder_decoder", signals=["config:is_encoder_decoder"])
+    for enc_k, dec_k in (
+        ("num_encoder_layers", "num_decoder_layers"),
+        ("encoder_layers", "decoder_layers"),
+    ):
+        enc_v, dec_v = merged_cfg.get(enc_k), merged_cfg.get(dec_k)
+        if type(enc_v) is int and enc_v > 0 and type(dec_v) is int and dec_v > 0:
+            return _result(None, "encoder_decoder", signals=[f"config:{enc_k}"])
+
+    model_types = {
+        str(v)
+        for v in (cfg.get("model_type"), text_cfg.get("model_type"))
+        if isinstance(v, str) and v
+    }
+    if model_types & SEGMENTED_MODEL_TYPES:
+        return _result(
+            None,
+            "segmented_architecture",
+            depth=(
+                merged_cfg["num_hidden_layers"]
+                if type(merged_cfg.get("num_hidden_layers")) is int
+                else None
+            ),
+            signals=["config:model_type"],
+        )
+
+    depth = merged_cfg.get("num_hidden_layers")
+    if type(depth) is not int or depth <= 0:
+        return _result(None, "missing_num_hidden_layers")
+    if depth <= 2:
+        return _result(None, "shallow_model", depth=depth)
+
+    signals: list[str] = []
+    t_sets: list[set[str]] = [set() for _ in range(depth)]
+    layer_mod_suffixes: list[set[str]] = [set() for _ in range(depth)]
+    weight_keys, weight_source = _read_safetensors_weight_keys(model_dir)
+    has_backbone_weights = False
+    for key in weight_keys:
+        if _NON_BACKBONE_PREFIX_RE.search(key):
+            continue
+        match = _BACKBONE_LAYER_RE.search(key)
+        if match is None:
+            continue
+        layer_idx = int(match.group(1))
+        rel_key = match.group(2) or "*"
+        if 0 <= layer_idx < depth:
+            has_backbone_weights = True
+            t_sets[layer_idx].add(_EXPERT_INDEX_RE.sub("experts.*.", rel_key))
+            mod_suffix = _TENSOR_PARAM_SUFFIX_RE.sub("", rel_key)
+            for alias in _expand_module_suffix_aliases(mod_suffix):
+                layer_mod_suffixes[layer_idx].add(alias)
+    if has_backbone_weights and weight_source:
+        _record_signal(signals, weight_source)
+
+    q_sets: list[set[str]] = [set() for _ in range(depth)]
+    quant_sources: list[dict[str, Any]] = []
+    if isinstance(merged_cfg.get("quantization_config"), dict):
+        quant_sources.append(merged_cfg["quantization_config"])
+    for qfile in ("quantization_config.json", "hf_quant_config.json"):
+        qpath = model_dir / qfile
+        if qpath.is_file():
+            try:
+                qdoc = json.loads(qpath.read_text(encoding="utf-8"))
+                if isinstance(qdoc, dict):
+                    quant_sources.append(qdoc)
+            except (OSError, ValueError):
+                pass
+    if quant_sources:
+        candidates_by_layer: list[list[tuple[str, str]]] = []
+        for idx in range(depth):
+            suffixes = sorted(
+                set(_CANONICAL_LAYER_MODULE_PROBES) | layer_mod_suffixes[idx]
+            )
+            layer_cands: list[tuple[str, str]] = []
+            for suffix in suffixes:
+                norm_suffix = (
+                    _EXPERT_INDEX_RE.sub("experts.*.", suffix) if suffix else "*"
+                )
+                for prefix in ("model.layers", "language_model.model.layers", "layers"):
+                    if suffix:
+                        layer_cands.append((f"{prefix}.{idx}.{suffix}", norm_suffix))
+                    else:
+                        layer_cands.append((f"{prefix}.{idx}", "*"))
+                        layer_cands.append((f"{prefix}.{idx}.", "*"))
+            candidates_by_layer.append(layer_cands)
+
+        def _apply_quant_rule(rule_str: str, tag_prefix: str, signal_name: str) -> bool:
+            """Apply one quantization rule string; return True if unresolved."""
+            if rule_str.startswith("re:"):
+                raw_pat = rule_str[3:]
+                try:
+                    pat = re.compile(raw_pat)
+                except re.error:
+                    return bool(_LAYER_SPECIFIC_RULE_RE.search(raw_pat))
+                matched_any = False
+                for idx in range(depth):
+                    for cand_name, norm_suffix in candidates_by_layer[idx]:
+                        if pat.search(cand_name):
+                            q_sets[idx].add(f"{tag_prefix}:{raw_pat}:{norm_suffix}")
+                            matched_any = True
+                if matched_any:
+                    _record_signal(signals, signal_name)
+                    return False
+                if _LAYER_SPECIFIC_RULE_RE.search(
+                    raw_pat
+                ) and not _NON_BACKBONE_PREFIX_RE.search(raw_pat):
+                    _record_signal(signals, signal_name)
+                    return True
+                return False
+
+            if _NON_BACKBONE_PREFIX_RE.search(rule_str):
+                return False
+
+            if any(ch in rule_str for ch in "*?["):
+                matched_any = False
+                for idx in range(depth):
+                    for cand_name, norm_suffix in candidates_by_layer[idx]:
+                        if fnmatchcase(cand_name, rule_str):
+                            q_sets[idx].add(f"{tag_prefix}:{rule_str}:{norm_suffix}")
+                            matched_any = True
+                if matched_any:
+                    _record_signal(signals, signal_name)
+                    return False
+                if _LAYER_SPECIFIC_RULE_RE.search(rule_str):
+                    _record_signal(signals, signal_name)
+                    return True
+                return False
+
+            match = _BACKBONE_LAYER_RE.search(rule_str)
+            if match is not None:
+                idx = int(match.group(1))
+                if 0 <= idx < depth:
+                    suffix = match.group(2) or "*"
+                    q_sets[idx].add(
+                        f"{tag_prefix}:{_EXPERT_INDEX_RE.sub('experts.*.', suffix)}"
+                    )
+                    _record_signal(signals, signal_name)
+            return False
+
+        for qcfg in quant_sources:
+            for field in (
+                "ignore",
+                "ignored_layers",
+                "modules_to_not_convert",
+                "exclude",
+            ):
+                entries = qcfg.get(field)
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if isinstance(item, str) and _apply_quant_rule(
+                        item, field, f"quant:{field}"
+                    ):
+                        return _result(
+                            None,
+                            "unresolved_quantization_rule",
+                            depth=depth,
+                            signals=signals,
+                        )
+            for field in ("layer_quant_config", "quantized_layers"):
+                mapping = qcfg.get(field)
+                if not isinstance(mapping, dict):
+                    continue
+                for pattern, scheme in sorted(mapping.items()):
+                    if not isinstance(pattern, str):
+                        continue
+                    scheme_tok = hashlib.sha256(
+                        json.dumps(scheme, sort_keys=True, default=str).encode("utf-8")
+                    ).hexdigest()[:12]
+                    if _apply_quant_rule(
+                        pattern, f"{field}:{scheme_tok}", f"quant:{field}"
+                    ):
+                        return _result(
+                            None,
+                            "unresolved_quantization_rule",
+                            depth=depth,
+                            signals=signals,
+                        )
+            config_groups = qcfg.get("config_groups")
+            if isinstance(config_groups, dict):
+                for group_name, group_cfg in sorted(config_groups.items()):
+                    if not isinstance(group_cfg, dict):
+                        continue
+                    targets = group_cfg.get("targets")
+                    if not isinstance(targets, list):
+                        continue
+                    scheme_body = {k: v for k, v in group_cfg.items() if k != "targets"}
+                    scheme_tok = hashlib.sha256(
+                        json.dumps(scheme_body, sort_keys=True, default=str).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()[:12]
+                    for item in targets:
+                        if isinstance(item, str) and _apply_quant_rule(
+                            item,
+                            f"group:{group_name}:{scheme_tok}",
+                            "quant:config_groups",
+                        ):
+                            return _result(
+                                None,
+                                "unresolved_quantization_rule",
+                                depth=depth,
+                                signals=signals,
+                            )
+            mix_layers = qcfg.get("mix_layers")
+            if isinstance(mix_layers, list):
+                for idx in mix_layers:
+                    if type(idx) is int and 0 <= idx < depth:
+                        q_sets[idx].add("mix_layer")
+                        _record_signal(signals, "quant:mix_layers")
+
+    c_lists: list[list[tuple[str, str]]] = [[] for _ in range(depth)]
+    mtp_extra = max(
+        [
+            val
+            for key in (
+                "num_nextn_predict_layers",
+                "num_mtp_layers",
+                "mtp_num_layers",
+            )
+            if type(val := merged_cfg.get(key)) is int and val > 0
+        ],
+        default=0,
+    )
+    max_list_len = depth + max(mtp_extra, 4)
+
+    for key, val in sorted(merged_cfg.items()):
+        if key in _NON_LAYER_LIST_KEYS:
+            continue
+        if isinstance(val, list) and depth <= len(val) <= max_list_len:
+            sliced = val[:depth]
+            encoded = [
+                json.dumps(item, sort_keys=True, separators=(",", ":"))
+                for item in sliced
+            ]
+            if len(set(encoded)) > 1:
+                for idx, tok in enumerate(encoded):
+                    c_lists[idx].append((key, tok))
+                _record_signal(signals, f"config:{key}")
+            continue
+        if (
+            isinstance(val, list)
+            and 0 < len(val) < depth
+            and key.endswith(("_layer_ids", "_layers", "_layer_indices", "_layer_idxs"))
+            and all(type(x) is int and 0 <= x < depth for x in val)
+        ):
+            idx_set = set(val)
+            if 0 < len(idx_set) < depth:
+                for idx in range(depth):
+                    c_lists[idx].append((key, "1" if idx in idx_set else "0"))
+                _record_signal(signals, f"config:{key}")
+            continue
+        if isinstance(val, str) and key.endswith(("_layers_enum", "_layer_ids")):
+            idx_set = _parse_layer_index_enum(val, depth)
+            if 0 < len(idx_set) < depth:
+                for idx in range(depth):
+                    c_lists[idx].append((key, "1" if idx in idx_set else "0"))
+                _record_signal(signals, f"config:{key}")
+
+    first_dense = merged_cfg.get("first_k_dense_replace")
+    if type(first_dense) is int and 0 < first_dense < depth:
+        for idx in range(depth):
+            c_lists[idx].append(
+                ("first_k_dense_replace", "dense" if idx < first_dense else "moe")
+            )
+        _record_signal(signals, "config:first_k_dense_replace")
+
+    full_attn_iv = merged_cfg.get("full_attention_interval")
+    if type(full_attn_iv) is int and 1 < full_attn_iv <= depth:
+        for idx in range(depth):
+            c_lists[idx].append(
+                (
+                    "full_attention_interval",
+                    "full" if (idx + 1) % full_attn_iv == 0 else "sub",
+                )
+            )
+        _record_signal(signals, "config:full_attention_interval")
+
+    for step_key, one_based in (
+        ("moe_layer_freq", False),
+        ("interleave_moe_layer_step", True),
+        ("decoder_sparse_step", True),
+    ):
+        step_val = merged_cfg.get(step_key)
+        if type(step_val) is int and 1 < step_val <= depth:
+            for idx in range(depth):
+                pos = idx + 1 if one_based else idx
+                c_lists[idx].append((step_key, "1" if pos % step_val == 0 else "0"))
+            _record_signal(signals, f"config:{step_key}")
+
+    has_config_heterogeneity = any(c_lists) or any(q_sets)
+    if not has_backbone_weights and not has_config_heterogeneity and "auto_map" in cfg:
+        return _result(
+            None,
+            "missing_weight_metadata",
+            depth=depth,
+            signals=["config:auto_map"],
+        )
+
+    signatures = [
+        (tuple(sorted(t_sets[idx])), tuple(sorted(q_sets[idx])), tuple(c_lists[idx]))
+        for idx in range(depth)
+    ]
+    all_archetypes = set(signatures)
+    distinct_count = len(all_archetypes)
+    seen_archetypes: set[Any] = set()
+    min_cover = depth
+    for idx, sig in enumerate(signatures):
+        seen_archetypes.add(sig)
+        if len(seen_archetypes) == distinct_count:
+            min_cover = idx + 1
+            break
+
+    k_min = max(2, min_cover)
+    cap = min(max_override_layers, max(2, depth // 3))
+    if k_min > cap:
+        return _result(
+            None,
+            "exceeds_override_cap",
+            depth=depth,
+            distinct=distinct_count,
+            min_prefix=k_min,
+            cap=cap,
+            signals=signals,
+        )
+    return _result(
+        k_min,
+        "inferred_prefix_cover",
+        depth=depth,
+        distinct=distinct_count,
+        min_prefix=k_min,
+        cap=cap,
+        signals=signals,
+    )
+
+
+def resolve_recipe(
+    recipe_path: Path,
+    *,
+    policy_path: Path | None = None,
+    tier: str | None = None,
+    variant: str | None = None,
+    hardware: str = "zhenwu_m890",
+    preset: str | None = None,
+    cache: str | None = None,
+    dummy_weights: bool = False,
+    layer_override: Any = _UNSET,
+    assets_map_path: Path | None = None,
+    model_dir: Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 9985,
+    served_model_name: str | None = None,
+) -> dict[str, Any]:
+    """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
+    recipe = _load_yaml(recipe_path)
+    validate_serving_recipe_structure(recipe, context=str(recipe_path))
+
+    ppu_blk = recipe["ppu"]
+    if ppu_blk["framework"] != "vllm":
+        raise ValidationError(
+            f"{recipe_path}: vllm-sail executor only resolves framework='vllm', got {ppu_blk['framework']!r}"
+        )
+
+    policy: dict[str, Any] | None = None
+    if policy_path is not None:
+        policy = _load_yaml(policy_path)
+        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
+
+    eff_cache = cache
+    eff_dummy = dummy_weights
+    eff_layers: int | str | None = None if layer_override is _UNSET else layer_override
+    eff_preset = preset
+    eff_variant = (
+        variant
+        if variant is not None
+        else (policy.get("variant") if policy is not None else None) or "default"
+    )
+    needs_dev_mode = False
+
+    if policy is not None:
+        if tier is None:
+            raise ValidationError("--tier is required when --policy is supplied")
+        tiers = policy.get("tiers", {})
+        if tier not in tiers:
+            raise ValidationError(f"{policy_path}: tier {tier!r} not found")
+        tier_cfg = tiers[tier]
+        if tier == "fast_sanity":
+            if eff_cache is None:
+                eff_cache = tier_cfg.get("cache", "enabled")
+            if not dummy_weights:
+                eff_dummy = bool(tier_cfg.get("dummy_weights", True))
+            if layer_override is _UNSET:
+                eff_layers = tier_cfg.get("layer_override", "auto")
+            if eff_preset is None:
+                eff_preset = tier_cfg.get("preset")
+        elif tier == "model_sanity":
+            stages = tier_cfg.get("stages", [])
+            if eff_cache is None and stages:
+                eff_cache = stages[0].get("cache", "enabled")
+            if any(st.get("kind") == "bench" for st in stages):
+                needs_dev_mode = True
+            for st in stages:
+                if eff_preset is None and st.get("preset"):
+                    eff_preset = st["preset"]
+                    break
+        if policy.get("hardware") and hardware == "zhenwu_m890":
+            hardware = policy["hardware"]
+
+    ordered: list[tuple[str, str | None, bool]] = []
+    server_env: dict[str, str] = {}
+
+    # 1. base_args / base_env
+    model_blk = recipe["model"]
+    ordered = _apply_flag_entries(ordered, list(model_blk.get("base_args", [])))
+    server_env.update(model_blk.get("base_env", {}))
+
+    # 2. variants.<variant>
+    variants_blk = recipe.get("variants", {})
+    if eff_variant not in variants_blk:
+        raise ValidationError(f"{recipe_path}: unknown variant {eff_variant!r}")
+    var_blk = variants_blk[eff_variant]
+    ordered = _apply_flag_entries(ordered, list(var_blk.get("extra_args", [])))
+    server_env.update(var_blk.get("extra_env", {}))
+
+    # 3. hardware_overrides.<hw>
+    hw_blk = recipe.get("hardware_overrides", {}).get(hardware, {})
+    ordered = _apply_flag_entries(ordered, list(hw_blk.get("extra_args", [])))
+    server_env.update(hw_blk.get("extra_env", {}))
+
+    # 4. enabled features (ppu.default_features overridden by preset.select.features)
+    presets_blk = recipe.get("presets", {})
+    preset_blk: dict[str, Any] = {}
+    if eff_preset is not None:
+        if eff_preset not in presets_blk:
+            raise ValidationError(f"{recipe_path}: unknown preset {eff_preset!r}")
+        preset_blk = presets_blk[eff_preset]
+
+    enabled_features = {name: True for name in ppu_blk.get("default_features", [])}
+    select_features = preset_blk.get("select", {}).get("features", {})
+    for feat_name, flag_on in select_features.items():
+        enabled_features[feat_name] = bool(flag_on)
+
+    features_blk = recipe.get("features", {})
+    active_features: list[str] = []
+    for feat_name, is_enabled in enabled_features.items():
+        if not is_enabled:
+            continue
+        if feat_name not in features_blk:
+            raise ValidationError(f"{recipe_path}: unknown feature {feat_name!r}")
+        active_features.append(feat_name)
+        feat = features_blk[feat_name]
+        if "modes" in feat:
+            mode_name = feat.get("default_mode") or next(iter(feat["modes"]))
+            mode_cfg = feat["modes"][mode_name]
+            ordered = _apply_flag_entries(ordered, list(mode_cfg.get("args", [])))
+            server_env.update(mode_cfg.get("env", {}))
+        else:
+            ordered = _apply_flag_entries(ordered, list(feat.get("args", [])))
+            server_env.update(feat.get("env", {}))
+
+    # 5. presets.<slot>
+    if preset_blk:
+        if preset_blk.get("remove_args"):
+            ordered = _remove_flag_entries(ordered, list(preset_blk["remove_args"]))
+        if preset_blk.get("tp") is not None:
+            ordered = _apply_flag_entries(
+                ordered, ["--tensor-parallel-size", str(preset_blk["tp"])]
+            )
+        for json_flag, json_patch in preset_blk.get("json_args", {}).items():
+            ordered = _merge_json_flag(ordered, json_flag, json_patch)
+        ordered = _apply_flag_entries(ordered, list(preset_blk.get("args", [])))
+        server_env.update(preset_blk.get("env", {}))
+
+    # 6. assets-map + runtime endpoint resolution
+    assets_map = _load_assets_map(assets_map_path)
+    eff_assets = {**ppu_blk["assets"], **var_blk.get("assets", {})}
+    asset_name = eff_assets["model"]
+    hf_model_id = (
+        var_blk.get("hf_model_id")
+        or ppu_blk.get("hf_model_id")
+        or model_blk["model_id"]
+    )
+    resolved_model = assets_map.get(asset_name, hf_model_id)
+    effective_served_name = (
+        served_model_name
+        or var_blk.get("served_name")
+        or ppu_blk.get("served_name")
+        or asset_name
+    )
+    golden_model_key = (
+        var_blk.get("golden_model_key") or ppu_blk.get("golden_model_key") or asset_name
+    )
+
+    # 7. policy switches (prefix cache, dummy load format, layer override)
+    if eff_cache == "enabled":
+        ordered = _apply_flag_entries(ordered, ["--enable-prefix-caching"])
+    elif eff_cache == "disabled":
+        ordered = _apply_flag_entries(ordered, ["--no-enable-prefix-caching"])
+    elif eff_cache is not None:
+        raise ValidationError(f"unsupported cache value: {eff_cache!r}")
+
+    if eff_dummy:
+        ordered = _apply_flag_entries(ordered, ["--load-format", "dummy"])
+    if eff_layers is not None and eff_layers != "auto":
+        if type(eff_layers) is not int or eff_layers < 1:
+            raise ValidationError(
+                f"layer_override must be a positive int, 'auto', or None, got {eff_layers!r}"
+            )
+        eff_model_dir = model_dir
+        if eff_model_dir is None:
+            lookup_env = {**os.environ, **{k: str(v) for k, v in server_env.items()}}
+            eff_model_dir = resolve_local_checkpoint_dir(resolved_model, env=lookup_env)
+        ordered = _merge_json_flag(
+            ordered,
+            "--hf-overrides",
+            build_layer_hf_overrides(eff_layers, eff_model_dir),
+        )
+
+    flags_only = _render_entries(ordered)
+    argv = [
+        "vllm",
+        "serve",
+        resolved_model,
+        "--served-model-name",
+        effective_served_name,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        *flags_only,
+    ]
+
+    dp_raw = _flag_value(ordered, "--data-parallel-size")
+    tp_raw = _flag_value(ordered, "--tensor-parallel-size")
+    if dp_raw is not None:
+        ppu_count = int(dp_raw) * (int(tp_raw) if tp_raw is not None else 1)
+    elif tp_raw is not None:
+        ppu_count = int(tp_raw)
+    else:
+        ppu_count = int(ppu_blk["topology"]["devices_per_node"])
+
+    runtime_env: dict[str, str] = {}
+    if needs_dev_mode:
+        runtime_env["VLLM_SERVER_DEV_MODE"] = "1"
+
+    digest_payload = {
+        "framework": ppu_blk["framework"],
+        "model_id": model_blk["model_id"],
+        "hf_model_id": hf_model_id,
+        "variant": eff_variant,
+        "hardware": hardware,
+        "preset": eff_preset,
+        "tier": tier,
+        "cache": eff_cache,
+        "dummy_weights": eff_dummy,
+        "layer_override": eff_layers,
+        "flags": _canonical_flags(ordered),
+        "server_env": dict(sorted(server_env.items())),
+    }
+    config_digest = hashlib.sha256(
+        json.dumps(digest_payload, separators=(",", ":"), sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    return {
+        "argv": argv,
+        "flags": flags_only,
+        "server_env": server_env,
+        "runtime_env": runtime_env,
+        "ppu_count": ppu_count,
+        "model_id": model_blk["model_id"],
+        "hf_model_id": hf_model_id,
+        "resolved_model": resolved_model,
+        "golden_model_key": golden_model_key,
+        "served_name": effective_served_name,
+        "config_digest": config_digest,
+        "tier": tier,
+        "preset": eff_preset,
+        "variant": eff_variant,
+        "hardware": hardware,
+        "enabled_features": active_features,
+        "layer_override": eff_layers,
+        "dummy_weights": eff_dummy,
+    }
+
+
+def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list[str]:
+    findings: list[str] = []
+    for label, pattern in _SENSITIVE_PATTERNS:
+        if pattern.search(text):
+            findings.append(f"{context}: matched {label}")
+    for match in _IPV4_RE.finditer(text):
+        ip = match.group(0)
+        if allow_loopback and ip == "127.0.0.1":
+            continue
+        findings.append(f"{context}: matched ipv4_literal ({ip})")
+    return findings
+
+
+def _walk_strings(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    if isinstance(obj, str):
+        items.append((prefix, obj))
+    elif isinstance(obj, list):
+        for idx, elem in enumerate(obj):
+            items.extend(_walk_strings(elem, f"{prefix}[{idx}]"))
+    elif isinstance(obj, dict):
+        for key, val in obj.items():
+            items.extend(_walk_strings(key, f"{prefix}.{key}(key)"))
+            items.extend(_walk_strings(val, f"{prefix}.{key}"))
+    return items
+
+
+def redact_and_verify_public_payload(
+    payload: Any, *, allow_loopback: bool = True
+) -> None:
+    """Fail closed if a public output dict/text contains internal paths, hosts, IPs, or tokens."""
+    text = (
+        payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    )
+    findings = _scan_text(text, context="public_payload", allow_loopback=allow_loopback)
+    if findings:
+        raise ValidationError("redaction gate blocked output: " + "; ".join(findings))
+
+
+def _validate_env_block(
+    env: Any,
+    *,
+    external_env: set[str],
+    context: str,
+) -> None:
+    checked = _check_str_dict(env, context=context)
+    for name in checked:
+        if name in FORBIDDEN_RECIPE_ENV:
+            raise ValidationError(
+                f"{context}: runtime-mode env {name!r} must not be set in recipe"
+            )
+        if not name.startswith(ALLOWED_ENV_PREFIXES):
+            raise ValidationError(
+                f"{context}: env {name!r} does not match allowed prefixes"
+            )
+        if (name.startswith(EXTERNAL_ENV_PREFIXES) or name in EXTERNAL_ENV_EXACT) and (
+            name not in external_env
+        ):
+            raise ValidationError(
+                f"{context}: external env {name!r} must be listed in ppu.external_env"
+            )
+
+
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_hf_model_id(value: Any, *, context: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{context} must be non-empty string")
+    if not _HF_REPO_ID_RE.fullmatch(value):
+        raise ValidationError(
+            f"{context} must be a valid owner/name Hugging Face repo ID: {value!r}"
+        )
+    owner, repo = value.split("/", 1)
+    if owner.endswith(("-", ".")) or repo.endswith(("-", ".")) or len(repo) > 96:
+        raise ValidationError(
+            f"{context} violates Hugging Face repo ID rules (max 96 chars for name): {value!r}"
+        )
+
+
+def _validate_flag_list(tokens: Any, *, context: str) -> None:
+    raw = _check_str_list(tokens, context=context)
+    for flag, val, _ in _parse_flag_entries(raw):
+        if flag in JSON_FLAGS:
+            if val is None:
+                raise ValidationError(f"{context}: JSON flag {flag} requires a value")
+            if "`" in val or "$(" in val:
+                raise ValidationError(
+                    f"{context}: JSON flag {flag} must not contain shell substitution"
+                )
+            try:
+                parsed = json.loads(val)
+            except json.JSONDecodeError as exc:
+                raise ValidationError(
+                    f"{context}: JSON flag {flag} invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValidationError(
+                    f"{context}: JSON flag {flag} must decode to a JSON object"
+                )
+
+
+def validate_serving_recipe_structure(
+    recipe: dict[str, Any],
+    *,
+    context: str,
+    allow_internal_visibility: bool = False,
+) -> None:
+    """Validate structure, env allowlist, JSON flags, and redaction for ``ppu-serving/v1``."""
+    _check_keys(
+        recipe,
+        allowed={
+            "schema_version",
+            "ppu",
+            "model",
+            "features",
+            "variants",
+            "hardware_overrides",
+            "presets",
+            "notes",
+        },
+        required={"schema_version", "ppu", "model"},
+        context=context,
+    )
+    if recipe["schema_version"] != SERVING_SCHEMA:
+        raise ValidationError(f"{context}: schema_version must be {SERVING_SCHEMA!r}")
+
+    ppu = _check_keys(
+        recipe["ppu"],
+        allowed={
+            "framework",
+            "visibility",
+            "upstream_schema",
+            "assets",
+            "hf_model_id",
+            "golden_model_key",
+            "served_name",
+            "topology",
+            "default_features",
+            "external_env",
+        },
+        required={"framework", "visibility", "assets", "topology"},
+        context=f"{context}.ppu",
+    )
+    if ppu["framework"] not in {"vllm", "sglang"}:
+        raise ValidationError(f"{context}.ppu.framework invalid: {ppu['framework']!r}")
+    if ppu["visibility"] not in {"public", "internal_restricted"}:
+        raise ValidationError(
+            f"{context}.ppu.visibility invalid: {ppu['visibility']!r}"
+        )
+    if ppu["visibility"] == "internal_restricted" and not allow_internal_visibility:
+        raise ValidationError(
+            f"{context}.ppu.visibility='internal_restricted' is forbidden in public repo"
+        )
+    assets = _check_keys(
+        ppu["assets"],
+        allowed={"model", "tokenizer"},
+        required={"model", "tokenizer"},
+        context=f"{context}.ppu.assets",
+    )
+    _check_str_dict(assets, context=f"{context}.ppu.assets")
+
+    topo = _check_keys(
+        ppu["topology"],
+        allowed={"kind", "nodes", "devices_per_node"},
+        required={"kind", "nodes", "devices_per_node"},
+        context=f"{context}.ppu.topology",
+    )
+    if topo["kind"] not in {"single_node", "multi_node_ep", "pd_disagg"}:
+        raise ValidationError(f"{context}.ppu.topology.kind invalid: {topo['kind']!r}")
+    if not isinstance(topo["nodes"], int) or topo["nodes"] <= 0:
+        raise ValidationError(f"{context}.ppu.topology.nodes must be positive int")
+    if not isinstance(topo["devices_per_node"], int) or topo["devices_per_node"] <= 0:
+        raise ValidationError(
+            f"{context}.ppu.topology.devices_per_node must be positive int"
+        )
+
+    if "hf_model_id" in ppu:
+        _validate_hf_model_id(ppu["hf_model_id"], context=f"{context}.ppu.hf_model_id")
+    external_env = set(
+        _check_str_list(
+            ppu.get("external_env", []), context=f"{context}.ppu.external_env"
+        )
+    )
+
+    model = _check_keys(
+        recipe["model"],
+        allowed={"model_id", "base_args", "base_env"},
+        required={"model_id", "base_args"},
+        context=f"{context}.model",
+    )
+    if not isinstance(model["model_id"], str) or not model["model_id"]:
+        raise ValidationError(f"{context}.model.model_id must be non-empty string")
+    _validate_flag_list(model["base_args"], context=f"{context}.model.base_args")
+    _validate_env_block(
+        model.get("base_env", {}),
+        external_env=external_env,
+        context=f"{context}.model.base_env",
+    )
+
+    features = recipe.get("features", {})
+    if not isinstance(features, dict):
+        raise ValidationError(f"{context}.features must be mapping")
+    for fname in ppu.get("default_features", []):
+        if fname not in features:
+            raise ValidationError(
+                f"{context}.ppu.default_features references unknown feature {fname!r}"
+            )
+    for fname, fcfg in features.items():
+        if not isinstance(fcfg, dict):
+            raise ValidationError(f"{context}.features.{fname} must be mapping")
+        if "modes" in fcfg:
+            _check_keys(
+                fcfg,
+                allowed={"default_mode", "modes"},
+                required={"modes"},
+                context=f"{context}.features.{fname}",
+            )
+            if not isinstance(fcfg["modes"], dict) or not fcfg["modes"]:
+                raise ValidationError(
+                    f"{context}.features.{fname}.modes must be non-empty mapping"
+                )
+            for mname, mcfg in fcfg["modes"].items():
+                _check_keys(
+                    mcfg,
+                    allowed={"args", "env"},
+                    context=f"{context}.features.{fname}.modes.{mname}",
+                )
+                _validate_flag_list(
+                    mcfg.get("args", []),
+                    context=f"{context}.features.{fname}.modes.{mname}.args",
+                )
+                _validate_env_block(
+                    mcfg.get("env", {}),
+                    external_env=external_env,
+                    context=f"{context}.features.{fname}.modes.{mname}.env",
+                )
+        else:
+            _check_keys(
+                fcfg, allowed={"args", "env"}, context=f"{context}.features.{fname}"
+            )
+            _validate_flag_list(
+                fcfg.get("args", []), context=f"{context}.features.{fname}.args"
+            )
+            _validate_env_block(
+                fcfg.get("env", {}),
+                external_env=external_env,
+                context=f"{context}.features.{fname}.env",
+            )
+
+    for vname, vcfg in recipe.get("variants", {}).items():
+        _check_keys(
+            vcfg,
+            allowed={
+                "precision",
+                "extra_args",
+                "extra_env",
+                "assets",
+                "hf_model_id",
+                "golden_model_key",
+                "served_name",
+            },
+            required={"precision"},
+            context=f"{context}.variants.{vname}",
+        )
+        if "assets" in vcfg:
+            v_assets = _check_keys(
+                vcfg["assets"],
+                allowed={"model", "tokenizer"},
+                required={"model", "tokenizer"},
+                context=f"{context}.variants.{vname}.assets",
+            )
+            _check_str_dict(v_assets, context=f"{context}.variants.{vname}.assets")
+        if "hf_model_id" in vcfg:
+            _validate_hf_model_id(
+                vcfg["hf_model_id"], context=f"{context}.variants.{vname}.hf_model_id"
+            )
+        for key in ("golden_model_key", "served_name"):
+            if key in vcfg and (
+                not isinstance(vcfg[key], str) or not vcfg[key].strip()
+            ):
+                raise ValidationError(
+                    f"{context}.variants.{vname}.{key} must be non-empty string"
+                )
+        _validate_flag_list(
+            vcfg.get("extra_args", []), context=f"{context}.variants.{vname}.extra_args"
+        )
+        _validate_env_block(
+            vcfg.get("extra_env", {}),
+            external_env=external_env,
+            context=f"{context}.variants.{vname}.extra_env",
+        )
+
+    for hname, hcfg in recipe.get("hardware_overrides", {}).items():
+        if hname not in {"zhenwu_m890", "zhenwu_810e"}:
+            raise ValidationError(
+                f"{context}.hardware_overrides: unknown hardware {hname!r}"
+            )
+        _check_keys(
+            hcfg,
+            allowed={"extra_args", "extra_env"},
+            context=f"{context}.hardware_overrides.{hname}",
+        )
+        _validate_flag_list(
+            hcfg.get("extra_args", []),
+            context=f"{context}.hardware_overrides.{hname}.extra_args",
+        )
+        _validate_env_block(
+            hcfg.get("extra_env", {}),
+            external_env=external_env,
+            context=f"{context}.hardware_overrides.{hname}.extra_env",
+        )
+
+    for pname, pcfg in recipe.get("presets", {}).items():
+        if pname not in ALLOWED_PRESET_SLOTS:
+            raise ValidationError(f"{context}.presets: unknown preset slot {pname!r}")
+        _check_keys(
+            pcfg,
+            allowed={
+                "hardware",
+                "tp",
+                "select",
+                "args",
+                "env",
+                "remove_args",
+                "json_args",
+            },
+            context=f"{context}.presets.{pname}",
+        )
+        if "tp" in pcfg and (not isinstance(pcfg["tp"], int) or pcfg["tp"] <= 0):
+            raise ValidationError(f"{context}.presets.{pname}.tp must be positive int")
+        if "select" in pcfg:
+            sel = _check_keys(
+                pcfg["select"],
+                allowed={"features"},
+                context=f"{context}.presets.{pname}.select",
+            )
+            for fname, enabled in sel.get("features", {}).items():
+                if fname not in features or not isinstance(enabled, bool):
+                    raise ValidationError(
+                        f"{context}.presets.{pname}.select.features.{fname} invalid"
+                    )
+        _check_str_list(
+            pcfg.get("remove_args", []),
+            context=f"{context}.presets.{pname}.remove_args",
+        )
+        for jflag, jval in pcfg.get("json_args", {}).items():
+            if jflag not in JSON_FLAGS or not isinstance(jval, dict):
+                raise ValidationError(
+                    f"{context}.presets.{pname}.json_args.{jflag} invalid"
+                )
+        _validate_flag_list(
+            pcfg.get("args", []), context=f"{context}.presets.{pname}.args"
+        )
+        _validate_env_block(
+            pcfg.get("env", {}),
+            external_env=external_env,
+            context=f"{context}.presets.{pname}.env",
+        )
+
+    for loc, s in _walk_strings(recipe, context):
+        findings = _scan_text(s, context=loc, allow_loopback=False)
+        if findings:
+            raise ValidationError("; ".join(findings))
+
+
+def validate_dataset_structure(dataset: dict[str, Any], *, context: str) -> None:
+    """Validate structure and redaction for ``ppu-dataset/v1``."""
+    _check_keys(
+        dataset,
+        allowed={
+            "schema_version",
+            "id",
+            "version",
+            "dataset_asset",
+            "subset_list",
+            "few_shot_num",
+            "few_shot_random",
+            "num_expected",
+            "scoring",
+            "filters",
+            "sandbox",
+        },
+        required={"schema_version", "id", "version", "dataset_asset", "scoring"},
+        context=context,
+    )
+    if dataset["schema_version"] != DATASET_SCHEMA:
+        raise ValidationError(f"{context}: schema_version must be {DATASET_SCHEMA!r}")
+    if "sandbox" in dataset:
+        sb = _check_keys(
+            dataset["sandbox"], allowed={"enabled"}, context=f"{context}.sandbox"
+        )
+        if not isinstance(sb.get("enabled"), bool):
+            raise ValidationError(f"{context}.sandbox.enabled must be bool")
+    for loc, s in _walk_strings(dataset, context):
+        findings = _scan_text(s, context=loc, allow_loopback=False)
+        if findings:
+            raise ValidationError("; ".join(findings))
+
+
+def _validate_stage_cache_rules(
+    stage: dict[str, Any],
+    *,
+    resolved_flags: list[str],
+    context: str,
+) -> None:
+    kind = stage.get("kind")
+    cache = stage.get("cache")
+    cache_mode = stage.get("cache_mode")
+    if kind in {"sanity", "evalscope"}:
+        if cache != "enabled":
+            raise ValidationError(f"{context}: kind={kind!r} requires cache='enabled'")
+        if any(
+            f in resolved_flags for f in ("--disable-cuda-graph", "--enforce-eager")
+        ):
+            raise ValidationError(
+                f"{context}: kind={kind!r} cannot run with --disable-cuda-graph or --enforce-eager"
+            )
+    elif kind == "bench":
+        if cache == "enabled" and cache_mode not in ALLOWED_CACHE_MODES:
+            raise ValidationError(
+                f"{context}: bench with cache='enabled' requires cache_mode in {sorted(ALLOWED_CACHE_MODES)}"
+            )
+        if cache not in {"enabled", "disabled"}:
+            raise ValidationError(f"{context}: invalid bench cache={cache!r}")
+        bench_input = stage.get("input")
+        if isinstance(bench_input, dict) and "range_ratio" in bench_input:
+            ratio = bench_input["range_ratio"]
+            if (
+                isinstance(ratio, bool)
+                or not isinstance(ratio, int | float)
+                or not (0.0 <= float(ratio) < 1.0)
+            ):
+                raise ValidationError(
+                    f"{context}: input.range_ratio must be in [0.0, 1.0), got {ratio!r}"
+                )
+
+
+def validate_policy_structure(
+    policy: dict[str, Any],
+    *,
+    context: str,
+    base_dir: Path = REPO_ROOT,
+) -> None:
+    """Validate structure, cache guardrails, and redaction for ``ppu-test-policy/v1``."""
+    _check_keys(
+        policy,
+        allowed={
+            "schema_version",
+            "model_id",
+            "recipe",
+            "variant",
+            "hardware",
+            "frameworks",
+            "measurement",
+            "accuracy_gate",
+            "eval_defaults",
+            "replaces_legacy_cases",
+            "stages",
+            "tiers",
+        },
+        required={"schema_version", "model_id", "hardware"},
+        context=context,
+    )
+    if policy["schema_version"] != POLICY_SCHEMA:
+        raise ValidationError(f"{context}: schema_version must be {POLICY_SCHEMA!r}")
+    if "tiers" not in policy and "stages" not in policy:
+        raise ValidationError(f"{context}: policy must define 'tiers' or 'stages'")
+
+    if "variant" in policy and (
+        not isinstance(policy["variant"], str) or not policy["variant"].strip()
+    ):
+        raise ValidationError(f"{context}.variant must be non-empty string")
+    policy_variant = policy.get("variant", "default")
+
+    recipe_path: Path | None = None
+    if "recipe" in policy:
+        rel = Path(policy["recipe"])
+        recipe_path = rel if rel.is_absolute() else (base_dir / rel)
+        if not recipe_path.is_file():
+            raise ValidationError(
+                f"{context}: referenced recipe not found: {policy['recipe']}"
+            )
+        rec_doc = _load_yaml(recipe_path)
+        variants_blk = rec_doc.get("variants", {})
+        if policy_variant not in variants_blk:
+            raise ValidationError(
+                f"{context}: unknown variant {policy_variant!r} in {policy['recipe']}"
+            )
+
+    tiers = policy.get("tiers", {})
+    if tiers:
+        _check_keys(
+            tiers,
+            allowed=POLICY_TIERS,
+            context=f"{context}.tiers",
+        )
+    if "replaces_legacy_cases" in policy:
+        cases = policy["replaces_legacy_cases"]
+        if (
+            not isinstance(cases, list)
+            or not cases
+            or any(not isinstance(case, str) or not case.strip() for case in cases)
+            or len(set(cases)) != len(cases)
+        ):
+            raise ValidationError(
+                f"{context}.replaces_legacy_cases must be a nonempty list of unique case IDs"
+            )
+        if "model_sanity" not in tiers:
+            raise ValidationError(
+                f"{context}.replaces_legacy_cases requires tiers.model_sanity"
+            )
+    if tiers:
+        if "fast_sanity" in tiers:
+            fs = _check_keys(
+                tiers["fast_sanity"],
+                allowed={
+                    "dummy_weights",
+                    "layer_override",
+                    "fallback_full_layers",
+                    "cache",
+                    "preset",
+                    "probe",
+                },
+                required={"dummy_weights", "cache", "probe"},
+                context=f"{context}.tiers.fast_sanity",
+            )
+            if fs["cache"] != "enabled":
+                raise ValidationError(
+                    f"{context}.tiers.fast_sanity.cache must be 'enabled'"
+                )
+            if type(fs["dummy_weights"]) is not bool:
+                raise ValidationError(
+                    f"{context}.tiers.fast_sanity.dummy_weights must be boolean"
+                )
+            if "layer_override" in fs:
+                lo = fs["layer_override"]
+                if lo is not None and lo != "auto" and (type(lo) is not int or lo < 1):
+                    raise ValidationError(
+                        f"{context}.tiers.fast_sanity.layer_override must be a positive integer, 'auto', or null"
+                    )
+            if (
+                "fallback_full_layers" in fs
+                and type(fs["fallback_full_layers"]) is not bool
+            ):
+                raise ValidationError(
+                    f"{context}.tiers.fast_sanity.fallback_full_layers must be boolean"
+                )
+            probe_context = f"{context}.tiers.fast_sanity.probe"
+            if not isinstance(fs["probe"], dict):
+                raise ValidationError(f"{probe_context} must be mapping")
+            if "stream" in fs["probe"]:
+                stream_context = f"{probe_context}.stream"
+                stream = _check_keys(
+                    fs["probe"]["stream"],
+                    allowed={"max_tokens", "enable_thinking"},
+                    required={"max_tokens"},
+                    context=stream_context,
+                )
+                budget = stream["max_tokens"]
+                if type(budget) is not int or not 1 <= budget <= 128:
+                    raise ValidationError(
+                        f"{stream_context}.max_tokens must be an integer in [1, 128]"
+                    )
+                if (
+                    "enable_thinking" in stream
+                    and type(stream["enable_thinking"]) is not bool
+                ):
+                    raise ValidationError(
+                        f"{stream_context}.enable_thinking must be boolean"
+                    )
+        if "model_sanity" in tiers:
+            ms = _check_keys(
+                tiers["model_sanity"],
+                allowed={"stages"},
+                required={"stages"},
+                context=f"{context}.tiers.model_sanity",
+            )
+            if not isinstance(ms["stages"], list):
+                raise ValidationError(
+                    f"{context}.tiers.model_sanity.stages must be a list"
+                )
+            seen_kinds: set[str] = set()
+            for idx, stage in enumerate(ms["stages"]):
+                _check_keys(
+                    stage,
+                    allowed={
+                        "id",
+                        "kind",
+                        "cache",
+                        "cache_mode",
+                        "preset",
+                        "dataset",
+                        "limit",
+                        "seed",
+                        "eval_batch_size",
+                        "generation",
+                        "probe",
+                        "engine",
+                        "input",
+                        "concurrencies",
+                        "request_count_by_concurrency",
+                        "warmup_count_by_concurrency",
+                    },
+                    required={"id", "kind", "cache"},
+                    context=f"{context}.tiers.model_sanity.stages[{idx}]",
+                )
+                stage_kind = stage["kind"]
+                if stage_kind not in {"sanity", "evalscope", "bench"}:
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity.stages[{idx}]: invalid kind {stage_kind!r}"
+                    )
+                if stage_kind in seen_kinds:
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity: duplicate stage kind {stage_kind!r}"
+                    )
+                seen_kinds.add(stage_kind)
+                flags: list[str] = []
+                if recipe_path is not None:
+                    resolved = resolve_recipe(
+                        recipe_path,
+                        variant=policy_variant,
+                        hardware=policy["hardware"],
+                        preset=stage.get("preset"),
+                        cache=stage.get("cache"),
+                    )
+                    flags = resolved["flags"]
+                _validate_stage_cache_rules(
+                    stage,
+                    resolved_flags=flags,
+                    context=f"{context}.tiers.model_sanity.stages[{idx}]",
+                )
+                if stage.get("cache") != "enabled":
+                    raise ValidationError(
+                        f"{context}.tiers.model_sanity.stages[{idx}]: requires cache='enabled' for shared model_sanity server"
+                    )
+                dataset_ref = stage.get("dataset")
+                if dataset_ref is not None:
+                    if not isinstance(dataset_ref, str) or "@" not in dataset_ref:
+                        raise ValidationError(
+                            f"{context}.tiers.model_sanity.stages[{idx}].dataset must be <id>@<version>"
+                        )
+                    ds_id, ds_ver = dataset_ref.split("@", 1)
+                    ds_path = (
+                        base_dir
+                        / "tests"
+                        / "ppu"
+                        / "policy"
+                        / "datasets"
+                        / f"{ds_id}.yaml"
+                    )
+                    if not ds_path.is_file():
+                        raise ValidationError(
+                            f"{context}: referenced dataset definition not found: {dataset_ref}"
+                        )
+                    ds_doc = _load_yaml(ds_path)
+                    if (
+                        ds_doc.get("id") != ds_id
+                        or str(ds_doc.get("version")) != ds_ver
+                    ):
+                        raise ValidationError(
+                            f"{context}: dataset {dataset_ref} version mismatch in {ds_path}"
+                        )
+            missing_kinds = sorted({"sanity", "evalscope", "bench"} - seen_kinds)
+            if missing_kinds:
+                raise ValidationError(
+                    f"{context}.tiers.model_sanity: missing required stage kind(s): {', '.join(missing_kinds)}"
+                )
+
+    for idx, stage in enumerate(policy.get("stages", [])):
+        _validate_stage_cache_rules(
+            stage, resolved_flags=[], context=f"{context}.stages[{idx}]"
+        )
+
+    for loc, s in _walk_strings(policy, context):
+        findings = _scan_text(s, context=loc, allow_loopback=False)
+        if findings:
+            raise ValidationError("; ".join(findings))
+
+
+def _build_vllm_serve_parser() -> argparse.ArgumentParser:
+    """Build the real ``vllm serve`` ArgumentParser with PPU plugin patches loaded."""
+    plugins = importlib.import_module("vllm.plugins")
+    plugins.load_general_plugins()
+    try:
+        serve_mod = importlib.import_module("vllm.entrypoints.cli.serve")
+        argparse_utils = importlib.import_module("vllm.utils.argparse_utils")
+        root_parser = argparse_utils.FlexibleArgumentParser(prog="vllm")
+        subparsers = root_parser.add_subparsers(dest="subcommand")
+        return serve_mod.ServeSubcommand().subparser_init(subparsers)
+    except Exception:
+        cli_args = importlib.import_module("vllm.entrypoints.openai.cli_args")
+        argparse_utils = importlib.import_module("vllm.utils.argparse_utils")
+        return cli_args.make_arg_parser(argparse_utils.FlexibleArgumentParser())
+
+
+def validate_flags_with_parser(
+    parser: argparse.ArgumentParser,
+    flags: list[str],
+    *,
+    context: str,
+) -> None:
+    """Validate every ``--flag`` and parsed types/choices against an argparse parser."""
+    option_actions = getattr(parser, "_option_string_actions", {})
+    for flag, _, _ in _parse_flag_entries(flags):
+        if flag not in option_actions:
+            raise ValidationError(f"{context}: unknown vLLM serve flag {flag!r}")
+
+    has_positional = any(not action.option_strings for action in parser._actions)
+    test_argv = ["placeholder/model", *flags] if has_positional else list(flags)
+    orig_error = parser.error
+    errors: list[str] = []
+
+    def _capture_error(message: str) -> None:
+        errors.append(message)
+        raise SystemExit(2)
+
+    parser.error = _capture_error  # type: ignore[method-assign]
+    try:
+        parser.parse_args(test_argv)
+    except SystemExit as exc:
+        detail = "; ".join(errors) if errors else f"exit={exc.code}"
+        raise ValidationError(f"{context}: parser rejected args: {detail}") from exc
+    finally:
+        parser.error = orig_error  # type: ignore[method-assign]
+
+
+def _collect_all_recipe_flag_sets(
+    recipe_path: Path, recipe: dict[str, Any]
+) -> list[tuple[str, list[str]]]:
+    sets: list[tuple[str, list[str]]] = []
+    default_res = resolve_recipe(recipe_path, cache="enabled")
+    sets.append((f"{recipe_path.name}:default", default_res["flags"]))
+    sets.append(
+        (
+            f"{recipe_path.name}:fast_sanity_2l",
+            resolve_recipe(
+                recipe_path, cache="enabled", dummy_weights=True, layer_override=2
+            )["flags"],
+        )
+    )
+    for feat_name, feat_cfg in recipe.get("features", {}).items():
+        if "modes" in feat_cfg:
+            for mode_name, mode_cfg in feat_cfg["modes"].items():
+                sets.append(
+                    (
+                        f"{recipe_path.name}:feature:{feat_name}.{mode_name}",
+                        list(mode_cfg.get("args", [])),
+                    )
+                )
+        else:
+            sets.append(
+                (
+                    f"{recipe_path.name}:feature:{feat_name}",
+                    list(feat_cfg.get("args", [])),
+                )
+            )
+    for var_name in recipe.get("variants", {}):
+        sets.append(
+            (
+                f"{recipe_path.name}:variant:{var_name}",
+                resolve_recipe(recipe_path, variant=var_name)["flags"],
+            )
+        )
+    for preset_name in recipe.get("presets", {}):
+        sets.append(
+            (
+                f"{recipe_path.name}:preset:{preset_name}",
+                resolve_recipe(recipe_path, preset=preset_name, cache="enabled")[
+                    "flags"
+                ],
+            )
+        )
+    return sets
+
+
+def validate_paths(
+    paths: list[Path],
+    *,
+    vllm_parser_mode: str = "auto",
+    parser: argparse.ArgumentParser | None = None,
+    allow_internal_visibility: bool = False,
+) -> dict[str, Any]:
+    """Validate recipe, dataset, and policy YAML files."""
+    if vllm_parser_mode not in {"auto", "required", "skip"}:
+        raise ValidationError(f"invalid vllm_parser_mode: {vllm_parser_mode!r}")
+
+    recipe_items: list[tuple[Path, dict[str, Any]]] = []
+    validated: list[str] = []
+
+    for path in paths:
+        doc = _load_yaml(path)
+        schema = doc.get("schema_version")
+        if schema == SERVING_SCHEMA:
+            validate_serving_recipe_structure(
+                doc,
+                context=str(path),
+                allow_internal_visibility=allow_internal_visibility,
+            )
+            recipe_items.append((path, doc))
+        elif schema == DATASET_SCHEMA:
+            validate_dataset_structure(doc, context=str(path))
+        elif schema == POLICY_SCHEMA:
+            validate_policy_structure(doc, context=str(path), base_dir=REPO_ROOT)
+        else:
+            raise ValidationError(f"{path}: unsupported schema_version {schema!r}")
+        validated.append(str(path))
+
+    parser_checked = False
+    checked_flag_sets = 0
+    if recipe_items and vllm_parser_mode != "skip":
+        active_parser = parser
+        if active_parser is None:
+            try:
+                active_parser = _build_vllm_serve_parser()
+            except ImportError as exc:
+                if vllm_parser_mode == "required":
+                    raise ValidationError(
+                        f"vLLM parser check required but vllm is not importable: {exc}"
+                    ) from exc
+                active_parser = None
+        if active_parser is not None:
+            for rpath, rdoc in recipe_items:
+                if rdoc["ppu"]["framework"] != "vllm":
+                    continue
+                for label, flag_set in _collect_all_recipe_flag_sets(rpath, rdoc):
+                    validate_flags_with_parser(active_parser, flag_set, context=label)
+                    checked_flag_sets += 1
+            parser_checked = True
+
+    return {
+        "validated_files": validated,
+        "parser_checked": parser_checked,
+        "checked_flag_sets": checked_flag_sets,
+    }
+
+
+def _discover_default_paths() -> list[Path]:
+    paths: list[Path] = []
+    for root in (DEFAULT_RECIPES_ROOT, DEFAULT_POLICY_ROOT):
+        if root.is_dir():
+            paths.extend(
+                sorted(p for p in root.rglob("*.yaml") if not p.name.startswith("."))
+            )
+    if not paths:
+        raise ValidationError("no recipe or policy YAML files found under tests/ppu")
+    return paths
+
+
+def _md_cell(value: str) -> str:
+    return (
+        value.strip().replace("|", "&#124;").replace("\r\n", "\n").replace("\n", "<br>")
+    )
+
+
+def _md_code(value: str) -> str:
+    if "`" in value:
+        return f"`` {value} ``"
+    return f"`{value}`"
+
+
+def _md_link(label: str, repo_relative_path: str, *, base_dir: Path) -> str:
+    rel = os.path.relpath(
+        (REPO_ROOT / repo_relative_path).resolve(), base_dir.resolve()
+    )
+    posix_rel = Path(rel).as_posix()
+    return f"[{_md_code(label)}]({posix_rel})"
+
+
+def _format_preset(resolved: dict[str, Any]) -> str:
+    preset = resolved.get("preset")
+    variant = resolved.get("variant", "default")
+    preset_text = _md_code(preset) if preset else f"{_md_code('default')} (none)"
+    if variant != "default":
+        return f"variant {_md_code(variant)}, {preset_text}"
+    return preset_text
+
+
+def _format_features(resolved: dict[str, Any]) -> str:
+    features = resolved.get("enabled_features") or []
+    if not features:
+        return _md_code("none")
+    return ", ".join(_md_code(name) for name in features)
+
+
+def _format_flags_and_env(flags: list[str], server_env: dict[str, str]) -> str:
+    parts: list[str] = []
+    if flags:
+        parts.append(_md_code(shlex.join(flags)))
+    else:
+        parts.append(_md_code("none"))
+    if server_env:
+        env_items = ", ".join(
+            _md_code(f"{k}={v}") for k, v in sorted(server_env.items())
+        )
+        parts.append(f"env: {env_items}")
+    return "<br>".join(parts)
+
+
+def _format_fast_sanity_weights(
+    policy_doc: dict[str, Any], resolved: dict[str, Any]
+) -> str:
+    weight = _md_code("dummy") if resolved.get("dummy_weights") else "real"
+    layer_override = resolved.get("layer_override")
+    if layer_override is None:
+        return f"{weight}, full layers"
+    fs_cfg = policy_doc.get("tiers", {}).get("fast_sanity", {})
+    suffix = " (fallback: full)" if fs_cfg.get("fallback_full_layers") else ""
+    if layer_override == "auto":
+        return f"{weight}, {_md_code('auto')} layers{suffix}"
+    return f"{weight}, {layer_override} layers{suffix}"
+
+
+def _format_model_sanity_stages(policy_doc: dict[str, Any]) -> str:
+    stages = policy_doc.get("tiers", {}).get("model_sanity", {}).get("stages", [])
+    gate = policy_doc.get("accuracy_gate") or {}
+    band = gate.get("golden_band_abs")
+    items: list[str] = []
+    for stage in stages:
+        stage_id = str(stage["id"])
+        kind = stage["kind"]
+        if kind == "evalscope":
+            limit = stage.get("limit")
+            scope = "full" if limit is None else f"limit={limit}"
+            if band is not None:
+                items.append(f"{_md_code(stage_id)} ({scope}, ±{band})")
+            else:
+                items.append(f"{_md_code(stage_id)} ({scope})")
+        elif kind == "bench":
+            concs = stage.get("concurrencies") or []
+            if concs:
+                conc_str = ",".join(str(c) for c in concs)
+                items.append(f"{_md_code(stage_id)} ({_md_code(f'C={conc_str}')})")
+            else:
+                items.append(_md_code(stage_id))
+        else:
+            items.append(_md_code(stage_id))
+    return ", ".join(items) if items else _md_code("none")
+
+
+def _legacy_serve_flags(server_cmd: list[str]) -> list[str]:
+    if not server_cmd:
+        return []
+    first_flag = next(
+        (idx for idx, tok in enumerate(server_cmd) if str(tok).startswith("--")),
+        len(server_cmd),
+    )
+    entries = _parse_flag_entries([str(tok) for tok in server_cmd[first_flag:]])
+    filtered = _remove_flag_entries(
+        entries, ["--served-model-name", "--host", "--port"]
+    )
+    return _render_entries(filtered)
+
+
+def _render_md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(_md_cell(h) for h in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(_md_cell(cell) for cell in row) + " |")
+    return lines
+
+
+def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
+    """Render the PR and Nightly PPU CI recipe matrix Markdown document."""
+    ci_dir = str(Path(__file__).resolve().parent)
+    if ci_dir not in sys.path:
+        sys.path.insert(0, ci_dir)
+    select = importlib.import_module("ppu_e2e_select")
+    doc_dir = base_dir if base_dir is not None else DEFAULT_MATRIX_DOC.parent
+
+    fast_rows: list[list[str]] = []
+    for entry, _replaces, resolved in select._recipe_entries("", "fast_sanity"):
+        pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        fast_rows.append(
+            [
+                _md_link(entry["key"], entry["policy_path"], base_dir=doc_dir),
+                _md_link(
+                    Path(entry["recipe_path"]).name,
+                    entry["recipe_path"],
+                    base_dir=doc_dir,
+                ),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_fast_sanity_weights(pol_doc, resolved),
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    nightly_rows: list[list[str]] = []
+    for entry, replaces, resolved in select._recipe_entries("", "model_sanity"):
+        pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        replaces_text = (
+            ", ".join(_md_code(case_id) for case_id in replaces)
+            if replaces
+            else _md_code("none")
+        )
+        nightly_rows.append(
+            [
+                _md_link(entry["key"], entry["policy_path"], base_dir=doc_dir),
+                _md_link(
+                    Path(entry["recipe_path"]).name,
+                    entry["recipe_path"],
+                    base_dir=doc_dir,
+                ),
+                f"{_md_code(resolved['hardware'])} / {resolved['ppu_count']}",
+                _format_preset(resolved),
+                _format_features(resolved),
+                _format_model_sanity_stages(pol_doc),
+                replaces_text,
+                _format_flags_and_env(resolved["flags"], resolved["server_env"]),
+            ]
+        )
+
+    catalog = json.loads(select.CATALOG.read_text(encoding="utf-8"))
+    acc_entries = select.build_accuracy_matrix(catalog, "")["include"]
+    remaining_ids = set(select.scheduled_legacy_accuracy_cases(acc_entries))
+    legacy_rows: list[list[str]] = []
+    for item in sorted(
+        (e for e in acc_entries if e["case_id"] in remaining_ids),
+        key=lambda e: e["case_id"],
+    ):
+        legacy_flags = _legacy_serve_flags(item.get("server_cmd") or [])
+        legacy_env = item.get("server_env") or {}
+        if legacy_flags or legacy_env:
+            serve_config = _format_flags_and_env(legacy_flags, legacy_env)
+        else:
+            serve_config = "built-in evaluator defaults"
+        legacy_rows.append(
+            [
+                _md_code(item["case_id"]),
+                f"{_md_code(item['board'])} / {item['ppu_count']}",
+                _md_code(item["model_id"]),
+                serve_config,
+            ]
+        )
+
+    lines = [
+        "<!-- Generated by `python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md`. Do not edit manually. -->",
+        "",
+        "# PPU Recipe CI Matrix",
+        "",
+        "This document is generated from `tests/ppu/recipes/`, `tests/ppu/policy/models/`,",
+        "and `scripts/ci/ppu_e2e_models.json` using the same selector logic as GitHub Actions.",
+        "",
+        "## Configuration Resolution Rules",
+        "",
+        "- **Resolution order**: `model.base_args` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> `ppu.default_features` -> optional `presets.<preset>` -> policy runtime switches (`--enable-prefix-caching`, `--load-format dummy`, `--hf-overrides`).",
+        "- **Auto layer override in `fast_sanity`**: When `layer_override: auto` (default), the runner inspects local checkpoint metadata (`config.json` and safetensors headers) to select the minimal prefix covering every distinct layer archetype (`2..8` layers), or runs full layers when prefix coverage exceeds the cap or the architecture is segmented.",
+        "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `dp_ep_low_latency`) are not applied unless explicitly selected by a policy or `--preset`.",
+        "- **Shared server in `model_sanity`**: All stages in `model_sanity` run against one server process; when a `bench` stage is present, the runner injects `VLLM_SERVER_DEV_MODE=1` into the server process environment for cache resets between concurrency points.",
+        "- **Regenerate / verify**:",
+        "  ```bash",
+        "  python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md",
+        "  python3 scripts/ci/ppu_recipe.py render-matrix --check",
+        "  ```",
+        "",
+        "## PR CI (`fast_sanity`)",
+        "",
+    ]
+    if fast_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Weights / Layers",
+                    "Effective serve flags",
+                ],
+                fast_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(["", "## Nightly CI — Recipe (`model_sanity`)", ""])
+    if nightly_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Policy",
+                    "Recipe",
+                    "Hardware / Cards",
+                    "Preset",
+                    "Features",
+                    "Stages",
+                    "Replaces legacy",
+                    "Effective serve flags",
+                ],
+                nightly_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(
+        [
+            "",
+            "## Nightly CI — Remaining Legacy Accuracy Cases",
+            "",
+            "These entries in `scripts/ci/ppu_e2e_models.json` still run in scheduled Nightly",
+            "until replaced by a model policy's `replaces_legacy_cases` declaration.",
+            "",
+        ]
+    )
+    if legacy_rows:
+        lines.extend(
+            _render_md_table(
+                ["Case ID", "Board / Cards", "Model ID", "Serve config"],
+                legacy_rows,
+            )
+        )
+    else:
+        lines.append(
+            "_None — all scheduled Nightly accuracy cases have migrated to recipes._"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _parse_layer_override_cli(raw: str) -> int | str | None:
+    lowered = raw.strip().lower()
+    if lowered == "auto":
+        return "auto"
+    if lowered in {"none", "null", "full"}:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "layer-override must be a positive int, 'auto', or 'full'"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("layer-override must be >= 1")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Resolve and validate ppu-serving/v1")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    res = sub.add_parser("resolve", help="Resolve a recipe into argv/env/digest")
+    res.add_argument("--recipe", type=Path, required=True)
+    res.add_argument("--policy", type=Path, default=None)
+    res.add_argument("--tier", choices=["fast_sanity", "model_sanity"], default=None)
+    res.add_argument("--variant", default=None)
+    res.add_argument("--hardware", default="zhenwu_m890")
+    res.add_argument("--preset", default=None)
+    res.add_argument("--cache", choices=["enabled", "disabled"], default=None)
+    res.add_argument("--dummy-weights", action="store_true")
+    res.add_argument(
+        "--layer-override", type=_parse_layer_override_cli, default=argparse.SUPPRESS
+    )
+    res.add_argument("--assets-map", type=Path, default=None)
+    res.add_argument("--model-dir", type=Path, default=None)
+    res.add_argument("--host", default="127.0.0.1")
+    res.add_argument("--port", type=int, default=9985)
+    res.add_argument("--served-model-name", default=None)
+
+    val = sub.add_parser("validate", help="Validate recipe/policy/dataset files")
+    val.add_argument("paths", nargs="*", type=Path)
+    val.add_argument("--all", action="store_true")
+    val.add_argument(
+        "--vllm-parser",
+        choices=["auto", "required", "skip"],
+        default="auto",
+    )
+    val.add_argument("--require-vllm-parser", action="store_true")
+
+    rmat = sub.add_parser(
+        "render-matrix",
+        help="Render or check the generated PR/Nightly CI recipe matrix Markdown",
+    )
+    rmat.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Target Markdown path (default: stdout, or tests/ppu/README.md with --check)"
+        ),
+    )
+    rmat.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify the target Markdown file matches the generated matrix",
+    )
+
+    args = parser.parse_args(argv)
+    if args.command == "resolve":
+        result = resolve_recipe(
+            args.recipe,
+            policy_path=args.policy,
+            tier=args.tier,
+            variant=args.variant,
+            hardware=args.hardware,
+            preset=args.preset,
+            cache=args.cache,
+            dummy_weights=args.dummy_weights,
+            layer_override=getattr(args, "layer_override", _UNSET),
+            assets_map_path=args.assets_map,
+            model_dir=args.model_dir,
+            host=args.host,
+            port=args.port,
+            served_model_name=args.served_model_name,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "render-matrix":
+        target = args.output
+        expected = render_ci_matrix_markdown()
+        if args.check:
+            check_path = target if target is not None else DEFAULT_MATRIX_DOC
+            if not check_path.is_file():
+                print(
+                    f"matrix doc missing: {check_path}. Regenerate with:\n"
+                    "  python3 scripts/ci/ppu_recipe.py render-matrix "
+                    "--output tests/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            actual = check_path.read_text(encoding="utf-8")
+            if actual != expected:
+                print(
+                    f"matrix doc out of date: {check_path}. Regenerate with:\n"
+                    "  python3 scripts/ci/ppu_recipe.py render-matrix "
+                    "--output tests/ppu/README.md",
+                    file=sys.stderr,
+                )
+                return 1
+            return 0
+        if target is None:
+            print(expected, end="")
+        else:
+            target.write_text(expected, encoding="utf-8")
+        return 0
+
+    target_paths = list(args.paths)
+    if args.all or not target_paths:
+        target_paths = _discover_default_paths()
+    parser_mode = "required" if args.require_vllm_parser else args.vllm_parser
+    report = validate_paths(target_paths, vllm_parser_mode=parser_mode)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ValidationError as error:
+        print(f"validation error: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

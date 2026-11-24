@@ -365,8 +365,10 @@ def _builder_init_wrapper(self, *args, **kwargs) -> None:
     from vllm_sail.utils.deep_gemm import get_num_sms
 
     self.num_sms = get_num_sms()
-    # All reference policies size schedules by their selected blocks per CU.
-    # Upstream narrows this capacity to the actual returned metadata shape.
+    # DeepGEMM-for-sail #214 (0f9756f) returns fixed-size grouped FP4 decode
+    # metadata: [num_sms * tb_per_cu + 1, 2], independent of the query-row
+    # count -- the same contract as legacy INT8/FP8. Size the capture-stable
+    # buffer to that shape so upstream's row-sliced copy never needs a resize.
     self.scheduler_metadata_buffer = torch.empty(
         (self.num_sms * _indexer_module.PPU_DEEP_GEMM_TB_PER_CU + 1, 2),
         dtype=torch.int32,
