@@ -2286,6 +2286,8 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
     assert "PPU_NIGHTLY_SCHEDULE_DISABLED == 'true'" in group_expr
     assert "accuracy-nightly-disabled-schedule-" in group_expr
     assert "github.run_id" in group_expr
+    # Workflow-level concurrency.group cannot reference env.* in GitHub Actions.
+    assert "env." not in group_expr
     assert concurrency["queue"] == "max"
     for ref, version in (
         ("refs/heads/main", "main"),
@@ -2299,7 +2301,7 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
                 "github.run_attempt": "1",
                 "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
             }
-            assert expression(group_expr, context) == "accuracy-nightly-refs/heads/main"
+            assert expression(group_expr, context) == f"accuracy-nightly-{version}"
             assert expression(wf["env"]["NIGHTLY_VERSION"], context) == version
             dispatch = jobs["dispatch-release"]
             assert bool(expression(dispatch["if"], context)) is (
@@ -2311,20 +2313,24 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
                     expression(group_expr, context)
                     == "accuracy-nightly-disabled-schedule-42"
                 )
+            else:
+                assert expression(group_expr, context) == f"accuracy-nightly-{version}"
             assert not expression(dispatch["if"], context)
     for workflow_ref, target, version in (
         ("refs/heads/main", "releases/v0.34.0", "v0.34.0"),
         ("refs/heads/main", "refs/heads/releases/v0.34.0", "v0.34.0"),
         ("refs/heads/releases/v0.34.0", "main", "main"),
+        ("refs/heads/releases/v0.34.0", "refs/heads/main", "main"),
         ("refs/heads/releases/v0.34.0", "v0.34.0", "v0.34.0"),
     ):
-        assert (
-            expression(
-                wf["env"]["NIGHTLY_VERSION"],
-                {"github.ref": workflow_ref, "inputs.target_ref": target},
-            )
-            == version
-        )
+        override_ctx = {
+            "github.event_name": "workflow_dispatch",
+            "github.ref": workflow_ref,
+            "inputs.target_ref": target,
+            "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+        }
+        assert expression(wf["env"]["NIGHTLY_VERSION"], override_ctx) == version
+        assert expression(group_expr, override_ctx) == f"accuracy-nightly-{version}"
     assert dispatch["permissions"] == {"actions": "write"}
     assert "--ref releases/v0.34.0" in dispatch["steps"][0]["run"]
     for consumer in ("build", "accuracy", "recipe-model-sanity"):
@@ -2336,6 +2342,15 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
         pin_step["env"]["PPU_CI_RUNTIME_VERSION"]
         == "${{ needs.select.outputs.version }}"
     )
+
+
+def test_recipe_model_sanity_runs_two_way_parallel_while_legacy_stays_serial():
+    recipe_sanity = workflow("_ppu-recipe-model-sanity.yaml")["jobs"]["sanity"]
+    legacy_leaf = workflow("_ppu-accuracy-tests.yaml")["jobs"]["accuracy"]
+    nightly_legacy = workflow("ppu-accuracy-nightly.yaml")["jobs"]["accuracy"]
+    assert recipe_sanity["strategy"]["max-parallel"] == 2
+    assert legacy_leaf["strategy"]["max-parallel"] == 1
+    assert nightly_legacy["strategy"]["max-parallel"] == 1
 
 
 def test_nightly_public_summary_exports_safe_image_digest_and_versions(tmp_path):

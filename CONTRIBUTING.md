@@ -197,9 +197,11 @@ Use GitHub Actions to cancel or rerun it.
 
 ### Scheduled and DevOps Nightly accuracy
 
-The default-branch cron queues `releases/v0.34.0` behind the scheduled `main`
-run. Both versions share one Actions concurrency group with capacity for 100
-waiting runs. Set `PPU_NIGHTLY_SCHEDULE_DISABLED=true` to turn off cron dispatches.
+The default-branch cron also dispatches `releases/v0.34.0` so both versions run
+in parallel. Each version uses its own Actions concurrency group
+(`accuracy-nightly-main` / `accuracy-nightly-v0.34.0`, `cancel-in-progress: false`,
+capacity for 100 waiting runs) to serialize re-entrant runs within the same
+version. Set `PPU_NIGHTLY_SCHEDULE_DISABLED=true` to turn off cron dispatches.
 
 Use `gh workflow run ppu-accuracy-nightly.yaml --ref <branch>` to select the
 workflow and runtime version. For a prebuilt image, pass `skip_wheel_build=true`

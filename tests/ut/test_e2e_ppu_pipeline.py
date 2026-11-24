@@ -935,7 +935,7 @@ def test_accuracy_entrypoints_are_the_manual_debug_and_the_nightly_runs() -> Non
 
     nightly = _workflow(NIGHTLY_WORKFLOW)
     assert set(nightly[True]) == {"workflow_dispatch", "schedule"}
-    assert nightly[True]["schedule"] == [{"cron": "0 12 * * *"}]
+    assert nightly[True]["schedule"] == [{"cron": "0 16 * * *"}]
     assert set(nightly["jobs"]["accuracy"]["with"]) >= {
         "build_run_id",
         "models",

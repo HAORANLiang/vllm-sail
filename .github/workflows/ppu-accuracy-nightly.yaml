@@ -41,9 +41,9 @@ name: PPU accuracy nightly
 # that chip. A true 810E lane needs the ppu-scheduler-action route the kernel
 # and perf lanes use, which the local Docker wrapper cannot provide.
 #
-# Schedule: 12:00 UTC = 20:00 CST. The serial accuracy cases are long, so the
-# window is chosen only to start ahead of the 18:30 UTC upstream-reuse and
-# 20:00 UTC perf lanes; the run does not wait for them.
+# Schedule: 16:00 UTC = 00:00 CST. The accuracy cases are long, so the window
+# starts at midnight CST ahead of the 18:30 UTC upstream-reuse and 20:00 UTC
+# perf lanes; the run does not wait for them.
 
 on:
   workflow_dispatch:
@@ -75,7 +75,7 @@ on:
         type: boolean
 
   schedule:
-    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
 
 permissions:
   contents: read
@@ -94,19 +94,25 @@ env:
     'v0.34.0' || 'main' }}
 
 concurrency:
-  # Both branches use the same literal group. Keep the old main key so
-  # runs queued before the rollout still hold the same lock.
-  # Disabled cron ticks do not need to wait for that lock.
+  # Isolate concurrency queues per Nightly version (main vs v0.34.0) so both
+  # versions can run in parallel across the runner pool while still serializing
+  # re-entrant runs of the same version. Workflow-level concurrency cannot read
+  # env.*, so evaluate the same version rule directly from github/inputs.
+  # Disabled cron ticks route to a per-run group so they do not wait on a queue.
   group: >-
     ${{ (github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED == 'true') &&
     format('accuracy-nightly-disabled-schedule-{0}', github.run_id) ||
-    'accuracy-nightly-refs/heads/main' }}
+    ((inputs.target_ref == 'releases/v0.34.0' ||
+    inputs.target_ref == 'refs/heads/releases/v0.34.0' ||
+    (github.ref == 'refs/heads/releases/v0.34.0' &&
+    inputs.target_ref != 'main' && inputs.target_ref != 'refs/heads/main')) &&
+    'accuracy-nightly-v0.34.0' || 'accuracy-nightly-main') }}
   cancel-in-progress: false
   queue: max
 
 jobs:
   dispatch-release:
-    name: Queue v0.34.0 Nightly
+    name: Dispatch v0.34.0 Nightly
     if: >-
       ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' &&
       github.run_attempt == '1' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true' }}
