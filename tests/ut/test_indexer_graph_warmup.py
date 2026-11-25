@@ -76,6 +76,10 @@ def harness(modules, patch_utils_module):
     )
     modules("vllm.models.deepseek_v4.attention", DeepseekV4Indexer=Indexer)
     modules("vllm.v1.worker.gpu.cudagraph_utils", CudaGraphManager=Manager)
+    modules(
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator",
+        DFlashSpeculator=type("Speculator", (), {"capture": lambda self: None}),
+    )
     relative = "vllm_sail/patch/enhancement/models/deepseek_v4_graph_warmup.py"
     load_patch(relative)
     return state, NS(capture=Manager().capture), run
@@ -116,3 +120,59 @@ def test_long_context_warmup_does_not_duplicate_projection(harness):
     state.max_seq_len = 8192
     runner.capture()
     assert state.calls == 2
+
+
+@pytest.mark.parametrize("ppu,dspark", [(True, True), (True, False), (False, True)])
+def test_dspark_capture_joins_pending_target_work(
+    modules, patch_utils_module, ppu, dspark
+):
+    events = []
+    pending_target_work = [True]
+    device = object()
+    result = object()
+
+    def synchronize(selected_device):
+        assert selected_device is device
+        events.append("target work completed")
+        pending_target_work[0] = False
+
+    class Speculator:
+        vllm_config = NS(speculative_config=NS(use_dspark=lambda: dspark))
+
+        def capture(self):
+            if ppu and dspark:
+                assert not pending_target_work[0]
+            events.append("draft warmup and capture")
+            return result
+
+    modules("torch", cuda=NS(synchronize=synchronize))
+    modules("vllm.platforms", current_platform=NS(is_ppu=lambda: ppu))
+    modules("vllm.forward_context", get_forward_context=lambda: None)
+    modules(
+        "vllm.models.deepseek_v4.attention",
+        DeepseekV4Indexer=type("Indexer", (), {"forward": lambda self: None}),
+    )
+    modules(
+        "vllm.v1.worker.gpu.cudagraph_utils",
+        CudaGraphManager=type("Manager", (), {"capture": lambda self: None}),
+    )
+    modules(
+        "vllm.v1.worker.gpu.spec_decode.dflash.speculator",
+        DFlashSpeculator=Speculator,
+    )
+    original = Speculator.capture
+    module = load_patch(
+        "vllm_sail/patch/enhancement/models/deepseek_v4_graph_warmup.py"
+    )
+    assert Speculator.capture is module.capture_speculator
+    assert (
+        getattr(Speculator.capture, module.PATCH_MARKER)[module._SPECULATOR_TARGET]
+        is original
+    )
+    speculator = Speculator()
+    speculator.device = device
+    assert speculator.capture() is result
+    expected = ["draft warmup and capture"]
+    if ppu and dspark:
+        expected.insert(0, "target work completed")
+    assert events == expected

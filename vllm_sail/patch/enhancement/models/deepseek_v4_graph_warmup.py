@@ -14,6 +14,8 @@ _MANAGER = "vllm.v1.worker.gpu.cudagraph_utils"
 _MANAGER_TARGET = f"{_MANAGER}.CudaGraphManager.capture"
 _INDEXER = "vllm.models.deepseek_v4.attention"
 _INDEXER_TARGET = f"{_INDEXER}.DeepseekV4Indexer.forward"
+_SPECULATOR = "vllm.v1.worker.gpu.spec_decode.dflash.speculator"
+_SPECULATOR_TARGET = f"{_SPECULATOR}.DFlashSpeculator.capture"
 _REMOVE_WHEN = (
     "Upstream graph warmup exercises the V4 indexer query projection and "
     "quantization even when all short-context candidates are selected."
@@ -40,6 +42,32 @@ def _run_graph_warmup(original, self, args, kwargs):
         return original(self, *args, **kwargs)
     finally:
         _GRAPH_WARMUP.reset(token)
+
+
+@patch(
+    _SPECULATOR,
+    "DFlashSpeculator.capture",
+    reason=(
+        "PPU DSpark warmup must wait for target and decoder-replay capture "
+        "work before launching draft MegaMoE on a new capture stream. "
+        "Otherwise outstanding EP work can stall the first draft warmup."
+    ),
+    affected_versions=">=0.34.0,<0.35.0",
+    remove_when=(
+        "The GPU runner joins all target and decoder-replay capture streams "
+        "before beginning DSpark capture."
+    ),
+)
+def capture_speculator(self):
+    if (
+        current_platform.is_ppu()
+        and self.vllm_config.speculative_config.use_dspark()
+    ):
+        # This is a startup boundary, not a per-token synchronization. Waiting
+        # inside torch.cuda.graph is too late: its eager warmup already ran.
+        torch.cuda.synchronize(self.device)
+    original = getattr(capture_speculator, PATCH_MARKER)[_SPECULATOR_TARGET]
+    return original(self)
 
 
 @patch(

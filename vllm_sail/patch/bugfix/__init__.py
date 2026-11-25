@@ -5,7 +5,9 @@
 def install() -> None:
     from vllm_sail.patch.bugfix import (
         async_llm_shutdown,
+        deepseek_v41_replay_padding,
         dp_idle_mtp_dummy_batch,
+        dspark_profile_token_budget,
         glm5_next_int8_mla_dequant,
         numa_bind_default,
         pp_empty_kv_cache_group,
@@ -15,6 +17,8 @@ def install() -> None:
 
     async_llm_shutdown.install()
     dp_idle_mtp_dummy_batch.install()
+    deepseek_v41_replay_padding.install()
+    dspark_profile_token_budget.install()
     glm5_next_int8_mla_dequant.install()
     numa_bind_default.install()
     pp_empty_kv_cache_group.install()
