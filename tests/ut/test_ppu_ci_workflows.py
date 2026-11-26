@@ -1264,9 +1264,21 @@ def expression(value, context):
     def contains_value(values, item):
         return item in values
 
+    def starts_with(text, prefix):
+        return (
+            ("" if text is None else str(text))
+            .lower()
+            .startswith(("" if prefix is None else str(prefix)).lower())
+        )
+
     return eval(
         value.strip(),
-        {"__builtins__": {}, "contains_value": contains_value, "format": str.format},
+        {
+            "__builtins__": {},
+            "contains_value": contains_value,
+            "format": str.format,
+            "startsWith": starts_with,
+        },
         {},
     )
 
@@ -1811,6 +1823,8 @@ def test_accuracy_nightly_routes_selected_models(
             expression(
                 jobs["notify-summary"]["if"],
                 {
+                    "github.repository": "vllm-project/vllm-sail",
+                    "github.ref": "refs/heads/main",
                     "github.event_name": event,
                     "inputs.models": models,
                     "needs.select.result": "failure",
@@ -1824,6 +1838,8 @@ def test_accuracy_nightly_routes_selected_models(
     values = dict(line.split("=", 1) for line in output.read_text().splitlines())
     legacy_matrix = values.get("matrix", "")
     context = {
+        "github.repository": "vllm-project/vllm-sail",
+        "github.ref": "refs/heads/main",
         "github.event_name": event,
         "vars.PPU_RECIPE_PUBLIC_ENABLED": str(recipe_enabled).lower(),
         "inputs.skip_wheel_build": False,
@@ -1931,11 +1947,197 @@ def test_accuracy_nightly_notification_when_selection_did_not_confirm_full_run(
 ):
     notify = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]
     context = {
+        "github.repository": "vllm-project/vllm-sail",
+        "github.ref": "refs/heads/main",
         "github.event_name": event,
         "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": disabled,
         "needs.select.result": selection,
     }
     assert bool(expression(notify["if"], context)) == expected
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref", "event", "disabled", "selection", "full_run", "expected"),
+    [
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/main",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.34.0",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.35.0",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/ci/deepseek-v41-forward-perf",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/feat/test",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases-preview",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "someone/vllm-sail",
+            "refs/heads/main",
+            "schedule",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "someone/vllm-sail",
+            "refs/heads/main",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/tags/v1.0.0",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+        (
+            "someone/vllm-sail",
+            "refs/heads/releases/v0.34.0",
+            "workflow_dispatch",
+            "false",
+            "success",
+            "true",
+            False,
+        ),
+    ],
+)
+def test_accuracy_nightly_notification_requires_official_repo_and_branch(
+    repository, ref, event, disabled, selection, full_run, expected
+):
+    notify = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]
+    context = {
+        "github.repository": repository,
+        "github.ref": ref,
+        "github.event_name": event,
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": disabled,
+        "needs.select.result": selection,
+        "needs.select.outputs.full_run": full_run,
+    }
+    assert bool(expression(notify["if"], context)) == expected
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref", "webhook", "expected"),
+    [
+        ("vllm-project/vllm-sail", "refs/heads/main", "https://example.invalid", True),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.34.0",
+            "https://example.invalid",
+            True,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/v0.35.0",
+            "https://example.invalid",
+            True,
+        ),
+        ("vllm-project/vllm-sail", "refs/heads/Main", "https://example.invalid", False),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/Releases/candidate",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/releases/",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/heads/ci/deepseek-v41-forward-perf",
+            "https://example.invalid",
+            False,
+        ),
+        (
+            "vllm-project/vllm-sail",
+            "refs/tags/v1.0.0",
+            "https://example.invalid",
+            False,
+        ),
+        ("VLLM-PROJECT/vllm-sail", "refs/heads/main", "https://example.invalid", False),
+        ("someone/vllm-sail", "refs/heads/main", "https://example.invalid", False),
+        ("vllm-project/vllm-sail", "refs/heads/main", "", False),
+    ],
+)
+def test_accuracy_nightly_notification_configured_step_enforces_exact_case(
+    tmp_path, repository, ref, webhook, expected
+):
+    steps = workflow("ppu-accuracy-nightly.yaml")["jobs"]["notify-summary"]["steps"]
+    configured = next(step for step in steps if step.get("id") == "configured")
+    output = tmp_path / "github_output.txt"
+    result = subprocess.run(
+        ["bash", "-e", "-c", configured["run"]],
+        env={
+            **os.environ,
+            "GITHUB_REPOSITORY": repository,
+            "GITHUB_REF": ref,
+            "PPU_CI_NOTIFY_WEBHOOK_URL": webhook,
+            "GITHUB_OUTPUT": str(output),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.returncode == 0
+    published = (
+        dict(line.split("=", 1) for line in output.read_text().splitlines())
+        if output.exists()
+        else {}
+    )
+    assert (published.get("enabled") == "true") is expected
 
 
 @pytest.mark.parametrize("models", ["", " \t"])
@@ -2074,6 +2276,8 @@ def test_accuracy_nightly_devops_dispatch_dual_mode_and_cron_switch(tmp_path, mo
     assert values["full_run"] == "true"
     assert len(values["target_sha"]) == 40
     prebuilt_ctx = {
+        "github.repository": "vllm-project/vllm-sail",
+        "github.ref": "refs/heads/main",
         "github.event_name": "workflow_dispatch",
         "vars.PPU_RECIPE_PUBLIC_ENABLED": "true",
         "inputs.skip_wheel_build": True,
@@ -2331,6 +2535,46 @@ def test_accuracy_nightly_hardening_target_trust_digest_pin_and_cron_concurrency
         }
         assert expression(wf["env"]["NIGHTLY_VERSION"], override_ctx) == version
         assert expression(group_expr, override_ctx) == f"accuracy-nightly-{version}"
+    dev_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "github.ref_type": "branch",
+        "github.ref": "refs/heads/ci/deepseek-v41-forward-perf",
+        "github.ref_name": "ci/deepseek-v41-forward-perf",
+        "inputs.target_ref": "",
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+    }
+    assert (
+        expression(group_expr, dev_ctx)
+        == "accuracy-nightly-dev-ci/deepseek-v41-forward-perf"
+    )
+    branch_same_name_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "github.ref_type": "branch",
+        "github.ref": "refs/heads/v1.0.0",
+        "github.ref_name": "v1.0.0",
+        "inputs.target_ref": "",
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+    }
+    assert expression(group_expr, branch_same_name_ctx) == "accuracy-nightly-dev-v1.0.0"
+    tag_ctx = {
+        "github.event_name": "workflow_dispatch",
+        "github.ref_type": "tag",
+        "github.ref": "refs/tags/v1.0.0",
+        "github.ref_name": "v1.0.0",
+        "inputs.target_ref": "",
+        "vars.PPU_NIGHTLY_SCHEDULE_DISABLED": "",
+    }
+    assert expression(group_expr, tag_ctx) == "accuracy-nightly-main"
+    assert (
+        expression(group_expr, {**tag_ctx, "inputs.target_ref": "releases/v0.34.0"})
+        == "accuracy-nightly-v0.34.0"
+    )
+    for target, expected_group in (
+        ("releases/v0.34.0", "accuracy-nightly-v0.34.0"),
+        ("main", "accuracy-nightly-main"),
+    ):
+        dev_override_ctx = {**dev_ctx, "inputs.target_ref": target}
+        assert expression(group_expr, dev_override_ctx) == expected_group
     assert dispatch["permissions"] == {"actions": "write"}
     assert "--ref releases/v0.34.0" in dispatch["steps"][0]["run"]
     for consumer in ("build", "accuracy", "recipe-model-sanity"):

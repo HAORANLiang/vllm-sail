@@ -98,15 +98,27 @@ concurrency:
   # versions can run in parallel across the runner pool while still serializing
   # re-entrant runs of the same version. Workflow-level concurrency cannot read
   # env.*, so evaluate the same version rule directly from github/inputs.
-  # Disabled cron ticks route to a per-run group so they do not wait on a queue.
+  # Disabled cron ticks route to a per-run group so they do not wait on a queue,
+  # and manual workflow_dispatch runs on non-official branches (ref_type == 'branch')
+  # without a target_ref override route to a branch-scoped dev group so they do not
+  # occupy the official Nightly queues or collide with tag dispatches.
+  # Note: GitHub Actions workflow-level expressions compare strings case-insensitively;
+  # exact case-sensitive branch enforcement for notifications is applied in
+  # jobs.notify-summary's configured step.
   group: >-
     ${{ (github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED == 'true') &&
     format('accuracy-nightly-disabled-schedule-{0}', github.run_id) ||
+    ((github.event_name == 'workflow_dispatch' &&
+    github.ref_type == 'branch' &&
+    github.ref != 'refs/heads/main' &&
+    !startsWith(github.ref, 'refs/heads/releases/') &&
+    inputs.target_ref == '') &&
+    format('accuracy-nightly-dev-{0}', github.ref_name) ||
     ((inputs.target_ref == 'releases/v0.34.0' ||
     inputs.target_ref == 'refs/heads/releases/v0.34.0' ||
     (github.ref == 'refs/heads/releases/v0.34.0' &&
     inputs.target_ref != 'main' && inputs.target_ref != 'refs/heads/main')) &&
-    'accuracy-nightly-v0.34.0' || 'accuracy-nightly-main') }}
+    'accuracy-nightly-v0.34.0' || 'accuracy-nightly-main')) }}
   cancel-in-progress: false
   queue: max
 
@@ -537,6 +549,8 @@ jobs:
     needs: [select, build, resolve-image, accuracy, recipe-model-sanity]
     if: >-
       always() && !cancelled() &&
+      github.repository == 'vllm-project/vllm-sail' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/releases/')) &&
       ((github.event_name == 'schedule' && vars.PPU_NIGHTLY_SCHEDULE_DISABLED != 'true') ||
        (github.event_name == 'workflow_dispatch' && needs.select.result == 'success' &&
         needs.select.outputs.full_run == 'true'))
@@ -552,8 +566,19 @@ jobs:
         env:
           PPU_CI_NOTIFY_WEBHOOK_URL: ${{ secrets.PPU_CI_NOTIFY_WEBHOOK_URL }}
         run: |
+          # Job-level if: uses case-insensitive GitHub Actions expressions.
+          # Enforce exact-case repository and branch matching here so mixed-case
+          # refs such as refs/heads/Main or refs/heads/Releases/candidate cannot send.
           if [[ -n "$PPU_CI_NOTIFY_WEBHOOK_URL" ]]; then
-            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+            case "$GITHUB_REPOSITORY" in
+              vllm-project/vllm-sail)
+                case "$GITHUB_REF" in
+                  refs/heads/main | refs/heads/releases/?*)
+                    echo 'enabled=true' >> "$GITHUB_OUTPUT"
+                    ;;
+                esac
+                ;;
+            esac
           fi
 
       - if: steps.configured.outputs.enabled == 'true'
