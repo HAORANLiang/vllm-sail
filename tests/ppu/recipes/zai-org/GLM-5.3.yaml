@@ -16,7 +16,8 @@ ppu:
   default_features:
     - tool_calling
     - reasoning
-  external_env: []
+  external_env:
+    - HGGC_EMBEDDED_COPY_THRESHOLD
 model:
   model_id: zai-org/GLM-5.3
   base_args:
@@ -25,6 +26,8 @@ model:
     - "4"
     - --max-model-len
     - "16384"
+    - --gpu-memory-utilization
+    - "0.9"
     - --distributed-timeout-seconds
     - "3600"
     - --cpu-distributed-timeout-seconds
@@ -39,7 +42,7 @@ features:
   reasoning:
     args:
       - --reasoning-parser
-      - glm45
+      - glm47
   spec_decoding:
     default_mode: mtp
     modes:
@@ -50,29 +53,157 @@ features:
 variants:
   default:
     precision: mxfp4
+    hardware: zhenwu_m890
+    assets:
+      model: glm-5.3-mxfp4
+      tokenizer: glm-5.3-mxfp4
+    hf_model_id: T-HEAD/GLM-5.3-MoE-Quant-W-MXFP4-A-MXFP4-Dense-Quant-W-FP8-PerChannel-A-FP8-PerToken
+    golden_model_key: glm_5_3_mxfp4
+    served_name: glm-5.3-mxfp4
     extra_args: []
+    extra_env: {}
+  fp8_channel:
+    precision: fp8
+    hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    assets:
+      model: glm-5.3-fp8-channel
+      tokenizer: glm-5.3-fp8-channel
+    hf_model_id: T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel
+    golden_model_key: glm_5_3_fp8_channel
+    served_name: glm-5.3-fp8-channel
+    extra_args:
+      - --tensor-parallel-size
+      - "8"
+    extra_env: {}
+  w8a8_int8:
+    precision: w8a8_int8
+    hardware: zhenwu_810e
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 16
+    assets:
+      model: glm-5.3-w8a8-int8
+      tokenizer: glm-5.3-w8a8-int8
+    hf_model_id: T-HEAD/GLM-5.3-Quant-W-INT8-PerChannel-A-INT8-PerToken
+    golden_model_key: glm_5_3_w8a8_int8
+    served_name: glm-5.3-w8a8-int8
+    extra_args:
+      - --tensor-parallel-size
+      - "16"
     extra_env: {}
 hardware_overrides:
   zhenwu_m890:
     extra_args: []
     extra_env: {}
+  zhenwu_810e:
+    extra_args:
+      - --gpu-memory-utilization
+      - "0.95"
+    extra_env: {}
 presets:
-  tp8:
-    hardware: zhenwu_m890
-    tp: 8
-    args: []
-  prefill_long:
-    hardware: zhenwu_m890
-    tp: 4
+  prefill:
     select:
       features:
         spec_decoding: false
     args: []
-  eval_longctx:
+  decode:
     hardware: zhenwu_m890
+    topology:
+      kind: single_node
+      nodes: 1
+      devices_per_node: 8
+    tp: 8
+    select:
+      features:
+        spec_decoding: true
     args: []
+  decode_ep:
+    hardware: zhenwu_m890
+    topology:
+      kind: multi_node_ep
+      nodes: 4
+      devices_per_node: 8
+    remove_args:
+      - --tensor-parallel-size
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "32"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --max-model-len
+      - auto
+      - --nnodes
+      - "4"
+      - --node-rank
+      - "{node_rank}"
+      - --master-addr
+      - "{master_addr}"
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      VLLM_ENGINE_READY_TIMEOUT_S: "60000"
+      VLLM_PROCESS_GROUP_TIMEOUT_M: "60"
+  pd_prefill:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 1
+      devices_per_node: 8
+      role: prefill
+    tp: 8
+    select:
+      features:
+        spec_decoding: false
+    args:
+      - --gpu-memory-utilization
+      - "0.85"
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
+      VLLM_MOONCAKE_BOOTSTRAP_PORT: "{kv_port}"
+  pd_decode:
+    hardware: zhenwu_m890
+    topology:
+      kind: pd_disagg
+      nodes: 1
+      devices_per_node: 8
+      role: decode
+    remove_args:
+      - --tensor-parallel-size
+    select:
+      features:
+        spec_decoding: true
+    args:
+      - --data-parallel-size
+      - "8"
+      - --enable-expert-parallel
+      - --all2all-backend
+      - deepep_low_latency
+      - --gpu-memory-utilization
+      - "0.85"
+      - --kv-transfer-config
+      - '{"kv_connector":"MooncakeConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"mooncake_protocol":"rdma","device_name":"{ib_devices}"}}'
+    env:
+      HGGC_EMBEDDED_COPY_THRESHOLD: "0x10000"
+      MC_NUM_QP_PER_EP: "4"
+      MOONCAKE_PROTOCOL: rdma
+      VLLM_HOST_IP: "{kv_ip}"
 notes: >-
-  Serving parameters follow the checked-in glm-5.3-mxfp4-tp4 catalog entry
-  (TP4 on 4 Zhenwu M890 cards with glm47 tool-call and glm45 reasoning
-  parsers). The committed 890p golden records a historical BF16 TP8 reference
-  score; use preset tp8 when reproducing an 8-card layout.
+  Reference #0 full-scenario serving recipe for zai-org/GLM-5.3 across Zhenwu
+  M890 (default mxfp4 and fp8_channel) and Zhenwu 810E (w8a8_int8) variants,
+  covering prefill (TP4/TP8/TP16 without MTP), single-node decode (TP8 with
+  MTP), 4-node DP32+EP decode_ep, and paired Mooncake pd_prefill/pd_decode
+  disaggregation presets. Tool-call and reasoning parsers are unified on glm47,
+  memory utilization is cleaned to 0.9/0.95, and prefix caching is policy-owned.

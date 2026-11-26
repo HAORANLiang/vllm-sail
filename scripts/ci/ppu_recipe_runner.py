@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from ppu_recipe import (  # noqa: E402
+    _validate_resolved_topology_and_placeholders,
     infer_fast_sanity_layer_override,
     redact_and_verify_public_payload,
     resolve_local_checkpoint_dir,
@@ -599,6 +600,10 @@ def _launch_resolved_server(
     env = dict(os.environ)
     env.update({k: str(v) for k, v in resolved.get("server_env", {}).items()})
     env.update({k: str(v) for k, v in resolved.get("runtime_env", {}).items()})
+    if "flags" in resolved and "topology" in resolved:
+        _validate_resolved_topology_and_placeholders(
+            resolved, context="launch_resolved_server", base_env=env
+        )
     if (
         model_dir is not None
         and model_dir.parent.name == "snapshots"
@@ -840,7 +845,7 @@ def run_fast_sanity(
         "tier": "fast_sanity",
         "model_id": policy["model_id"],
         "variant": eff_variant,
-        "preset": preset,
+        "preset": base_resolved["preset"],
         "status": final_attempt["status"],
         "parser_checked": val_report["parser_checked"],
         "config_digest": final_attempt["config_digest"],
@@ -1166,7 +1171,7 @@ def run_model_sanity(
             "variant": resolved["variant"],
             "hf_model_id": resolved["hf_model_id"],
             "golden_model_key": resolved["golden_model_key"],
-            "preset": preset,
+            "preset": resolved["preset"],
             "status": "pass" if acc_ok and bench_ok else "fail",
             "parser_checked": val_report["parser_checked"],
             "config_digest": resolved["config_digest"],

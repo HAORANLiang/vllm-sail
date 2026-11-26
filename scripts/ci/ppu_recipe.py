@@ -25,11 +25,28 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RECIPES_ROOT = REPO_ROOT / "tests" / "ppu" / "recipes"
 DEFAULT_POLICY_ROOT = REPO_ROOT / "tests" / "ppu" / "policy"
 DEFAULT_MATRIX_DOC = REPO_ROOT / "tests" / "ppu" / "README.md"
+DEFAULT_AUTHORING_DOC = REPO_ROOT / "tests" / "ppu" / "AUTHORING.md"
 
 SERVING_SCHEMA = "ppu-serving/v1"
 DATASET_SCHEMA = "ppu-dataset/v1"
 POLICY_SCHEMA = "ppu-test-policy/v1"
 POLICY_TIERS = frozenset({"fast_sanity", "model_sanity", "nightly", "release"})
+SUPPORTED_HARDWARE = frozenset({"zhenwu_m890", "zhenwu_810e"})
+_M890_PRECISION_RE = re.compile(
+    r"^(?:(?:mx)?fp4(?:_fp8)?|fp8(?:_[a-z0-9]+)?|w4a4_mxfp4|w8a8_fp8)$"
+)
+_810E_PRECISION_RE = re.compile(r"^(?:int8|w[48]a8_int8(?:_[a-z0-9]+)?)$")
+MULTI_NODE_LAUNCH_FLAGS = frozenset(
+    {
+        "--data-parallel-address",
+        "--data-parallel-start-rank",
+        "--headless",
+        "--master-addr",
+        "--master-port",
+        "--nnodes",
+        "--node-rank",
+    }
+)
 _UNSET: Any = object()
 
 ALLOWED_ENV_PREFIXES = (
@@ -57,6 +74,7 @@ FORBIDDEN_RECIPE_ENV = frozenset(
         "SGLANG_WARMUP_TIMEOUT",
         "TRANSFORMERS_OFFLINE",
         "VLLM_SERVER_DEV_MODE",
+        "VLLM_USE_MODELSCOPE",
         "VLLM_USE_RUST_BENCH",
         "VLLM_USE_RUST_FRONTEND",
     }
@@ -75,22 +93,63 @@ JSON_FLAGS = frozenset(
         "--speculative-config",
     }
 )
-INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, str], ...] = (
+INVERSE_BOOLEAN_GROUPS: tuple[tuple[str, ...], ...] = (
     ("--enable-prefix-caching", "--no-enable-prefix-caching"),
     ("--trust-remote-code", "--no-trust-remote-code"),
-    ("--enable-auto-tool-choice", "--disable-auto-tool-choice"),
-    ("--enable-expert-parallel", "--disable-expert-parallel"),
+    (
+        "--enable-auto-tool-choice",
+        "--disable-auto-tool-choice",
+        "--no-enable-auto-tool-choice",
+    ),
+    (
+        "--enable-expert-parallel",
+        "--no-enable-expert-parallel",
+        "--disable-expert-parallel",
+    ),
     ("--enforce-eager", "--no-enforce-eager"),
+    ("--data-parallel-external-lb", "--no-data-parallel-external-lb"),
+    ("--data-parallel-hybrid-lb", "--no-data-parallel-hybrid-lb"),
+)
+FORBIDDEN_RECIPE_FLAGS = frozenset(
+    {
+        "--disable-radix-cache",
+        "--enable-prefix-caching",
+        "--host",
+        "--load-format",
+        "--model-path",
+        "--no-enable-prefix-caching",
+        "--port",
+        "--served-model-name",
+        "--tokenizer-path",
+    }
 )
 ALLOWED_PRESET_SLOTS = frozenset(
     {
+        "decode",
+        "decode_ep",
         "decode_nographs",
         "dp_ep_low_latency",
         "eval_longctx",
+        "pd_decode",
+        "pd_prefill",
+        "prefill",
         "prefill_long",
         "tp8",
     }
 )
+TOPOLOGY_PLACEHOLDERS: dict[str, tuple[str, Any]] = {
+    "master_addr": ("127.0.0.1", "127.0.0.1"),
+    "master_port": ("29500", 29500),
+    "node_rank": ("0", 0),
+    "kv_ip": ("127.0.0.1", "127.0.0.1"),
+    "kv_port": ("8998", 8998),
+    "ib_devices": ("rdma0", "rdma0"),
+}
+MULTI_NODE_REQUIRED_PLACEHOLDERS = frozenset({"master_addr", "node_rank"})
+PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "kv_port", "ib_devices"})
+PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS = frozenset({"kv_ip", "ib_devices"})
+PD_DISAGG_REQUIRED_PLACEHOLDERS = PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
+_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 ALLOWED_CACHE_MODES = frozenset({"sanity_throughput_guard", "prefix_reuse_bench"})
 DEFAULT_MAX_AUTO_LAYER_OVERRIDE = 8
 SEGMENTED_MODEL_TYPES = frozenset({"deepseek_v41"})
@@ -214,6 +273,10 @@ _SENSITIVE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
+        "nic_device",
+        re.compile(r"\bmlx5_bond_\d+\b", re.I),
+    ),
+    (
         "prohibited_token",
         re.compile(rf"(?:{_PROHIBITED_TOKEN_A}|{_PROHIBITED_TOKEN_B})", re.I),
     ),
@@ -280,11 +343,14 @@ def _deep_merge_dicts(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, 
     return merged
 
 
-def _inverse_map() -> dict[str, str]:
-    pairs: dict[str, str] = {}
-    for pos, neg in INVERSE_BOOLEAN_GROUPS:
-        pairs[pos] = neg
-        pairs[neg] = pos
+def _inverse_map() -> dict[str, frozenset[str]]:
+    pairs: dict[str, frozenset[str]] = {}
+    for group in INVERSE_BOOLEAN_GROUPS:
+        pos = group[0]
+        negs = frozenset(group[1:])
+        pairs[pos] = negs
+        for neg in negs:
+            pairs[neg] = frozenset({pos, *(n for n in negs if n != neg)})
     return pairs
 
 
@@ -301,14 +367,24 @@ def _parse_flag_entries(tokens: list[str]) -> list[tuple[str, str | None, bool]]
             raise ValidationError(f"expected --flag token, got {tok!r}")
         if "=" in tok:
             flag, val = tok.split("=", 1)
-            entries.append((flag, val, True))
-            idx += 1
+            has_eq = True
+            step = 1
         elif idx + 1 < len(tokens) and not str(tokens[idx + 1]).startswith("--"):
-            entries.append((tok, str(tokens[idx + 1]), False))
-            idx += 2
+            flag, val = tok, str(tokens[idx + 1])
+            has_eq = False
+            step = 2
         else:
-            entries.append((tok, None, False))
-            idx += 1
+            flag, val = tok, None
+            has_eq = False
+            step = 1
+        opt_head = flag.split(".", 1)[0]
+        if len(opt_head) <= 2 or "_" in opt_head:
+            raise ValidationError(
+                f"CLI flag {flag!r} must use canonical hyphenated spelling "
+                f"({opt_head.replace('_', '-')!r})"
+            )
+        entries.append((flag, val, has_eq))
+        idx += step
     return entries
 
 
@@ -319,11 +395,11 @@ def _apply_flag_entries(
     """Append flags with last-wins deduplication and inverse-flag clearing."""
     result = list(ordered)
     for flag, val, has_eq in _parse_flag_entries(new_tokens):
-        inverse = _INVERSE_FLAGS.get(flag)
+        inverses = _INVERSE_FLAGS.get(flag)
         result = [
             item
             for item in result
-            if item[0] != flag and (inverse is None or item[0] != inverse)
+            if item[0] != flag and (inverses is None or item[0] not in inverses)
         ]
         result.append((flag, val, has_eq))
     return result
@@ -1023,13 +1099,917 @@ def infer_fast_sanity_layer_override(
     )
 
 
-def resolve_recipe(
-    recipe_path: Path,
+def _normalize_precision(precision: Any, *, context: str) -> str:
+    if not isinstance(precision, str) or not precision.strip():
+        raise ValidationError(f"{context}: precision must be a non-empty string")
+    return precision.strip().lower()
+
+
+def _variant_compatible_hardware(
+    var_cfg: Mapping[str, Any], *, context: str
+) -> frozenset[str]:
+    explicit = var_cfg.get("hardware")
+    if explicit is not None:
+        if explicit not in SUPPORTED_HARDWARE:
+            raise ValidationError(
+                f"{context}.hardware invalid: {explicit!r}; "
+                f"expected one of {sorted(SUPPORTED_HARDWARE)}"
+            )
+        return frozenset({str(explicit)})
+    prec = _normalize_precision(var_cfg.get("precision"), context=context)
+    if prec == "bf16":
+        return SUPPORTED_HARDWARE
+    if _810E_PRECISION_RE.fullmatch(prec):
+        return frozenset({"zhenwu_810e"})
+    return frozenset({"zhenwu_m890"})
+
+
+def _infer_variant_hardware(var_cfg: Mapping[str, Any], *, context: str) -> str:
+    explicit = var_cfg.get("hardware")
+    if explicit is not None:
+        if explicit not in SUPPORTED_HARDWARE:
+            raise ValidationError(
+                f"{context}.hardware invalid: {explicit!r}; "
+                f"expected one of {sorted(SUPPORTED_HARDWARE)}"
+            )
+        return str(explicit)
+    prec = _normalize_precision(var_cfg.get("precision"), context=context)
+    if _810E_PRECISION_RE.fullmatch(prec):
+        return "zhenwu_810e"
+    return "zhenwu_m890"
+
+
+def _validate_hardware_precision(
     *,
-    policy_path: Path | None = None,
+    hardware: str,
+    precision: Any,
+    context: str,
+) -> None:
+    if hardware not in SUPPORTED_HARDWARE:
+        raise ValidationError(
+            f"{context}: unknown hardware {hardware!r}; "
+            f"expected one of {sorted(SUPPORTED_HARDWARE)}"
+        )
+    prec = _normalize_precision(precision, context=context)
+    if prec == "bf16":
+        return
+    if hardware == "zhenwu_m890":
+        if not _M890_PRECISION_RE.fullmatch(prec):
+            raise ValidationError(
+                f"{context}: hardware 'zhenwu_m890' only allows bf16 or mxfp4/fp4/fp8 "
+                f"precision variants, got {prec!r}"
+            )
+    elif hardware == "zhenwu_810e":
+        if not _810E_PRECISION_RE.fullmatch(prec):
+            raise ValidationError(
+                f"{context}: hardware 'zhenwu_810e' only allows bf16 or int8 precision "
+                f"variants (e.g. w8a8_int8, w4a8_int8), got {prec!r}"
+            )
+
+
+def _iter_variant_preset_targets(
+    recipe: Mapping[str, Any], *, context: str
+) -> list[tuple[str, str | None, str]]:
+    """Return deterministic ``(variant, preset, hardware)`` expansion tuples."""
+    variants_blk = recipe.get("variants", {})
+    presets_blk = recipe.get("presets", {})
+    targets: list[tuple[str, str | None, str]] = []
+    for vname, vcfg in variants_blk.items():
+        vctx = f"{context}.variants.{vname}"
+        compat_hw = _variant_compatible_hardware(vcfg, context=vctx)
+        default_hw = _infer_variant_hardware(vcfg, context=vctx)
+        baseline_hws = [default_hw] + [
+            hw for hw in sorted(compat_hw) if hw != default_hw
+        ]
+        for hw in baseline_hws:
+            targets.append((vname, None, hw))
+        for pname, pcfg in presets_blk.items():
+            if pcfg.get("variants") is not None and vname not in pcfg["variants"]:
+                continue
+            preset_hw = pcfg.get("hardware")
+            if preset_hw is not None:
+                if preset_hw not in compat_hw:
+                    continue
+                targets.append((vname, pname, str(preset_hw)))
+            else:
+                for hw in baseline_hws:
+                    targets.append((vname, pname, hw))
+    return targets
+
+
+def _validate_topology_block(
+    topo: Any,
+    *,
+    context: str,
+    allow_role: bool = False,
+    expected_role: str | None = None,
+) -> dict[str, Any]:
+    allowed = {"kind", "nodes", "devices_per_node"}
+    if allow_role:
+        allowed = allowed | {"role"}
+    checked = _check_keys(
+        topo,
+        allowed=allowed,
+        required={"kind", "nodes", "devices_per_node"},
+        context=context,
+    )
+    kind = checked["kind"]
+    if kind not in {"single_node", "multi_node_ep", "pd_disagg"}:
+        raise ValidationError(f"{context}.kind invalid: {kind!r}")
+    nodes = checked["nodes"]
+    devices = checked["devices_per_node"]
+    if type(nodes) is not int or nodes <= 0:
+        raise ValidationError(f"{context}.nodes must be positive int")
+    if type(devices) is not int or devices <= 0:
+        raise ValidationError(f"{context}.devices_per_node must be positive int")
+    if kind == "single_node" and nodes != 1:
+        raise ValidationError(
+            f"{context}: single_node topology requires nodes=1, got {nodes}"
+        )
+    if kind == "multi_node_ep" and nodes < 2:
+        raise ValidationError(
+            f"{context}: multi_node_ep topology requires nodes >= 2, got {nodes}"
+        )
+    if "role" in checked:
+        if kind != "pd_disagg":
+            raise ValidationError(
+                f"{context}.role is only allowed for pd_disagg topology"
+            )
+        if checked["role"] not in {"prefill", "decode"}:
+            raise ValidationError(
+                f"{context}.role must be 'prefill' or 'decode', got {checked['role']!r}"
+            )
+        if expected_role is not None and checked["role"] != expected_role:
+            raise ValidationError(
+                f"{context}.role must be {expected_role!r}, got {checked['role']!r}"
+            )
+    return checked
+
+
+def _find_placeholders_in_obj(obj: Any) -> set[str]:
+    found: set[str] = set()
+    if isinstance(obj, str):
+        found.update(_PLACEHOLDER_RE.findall(obj))
+    elif isinstance(obj, list):
+        for elem in obj:
+            found.update(_find_placeholders_in_obj(elem))
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            found.update(_find_placeholders_in_obj(k))
+            found.update(_find_placeholders_in_obj(v))
+    return found
+
+
+def _extract_placeholders_from_flags_and_env(
+    flags: Sequence[str], server_env: Mapping[str, str]
+) -> set[str]:
+    found: set[str] = set()
+    for flag, val, _ in _parse_flag_entries(list(flags)):
+        if val is None:
+            continue
+        if flag in JSON_FLAGS:
+            found.update(_find_placeholders_in_obj(json.loads(val)))
+        else:
+            found.update(_PLACEHOLDER_RE.findall(val))
+    for val in server_env.values():
+        found.update(_PLACEHOLDER_RE.findall(val))
+    return found
+
+
+def _build_placeholder_table(
+    values: Mapping[str, Any] | None = None,
+) -> dict[str, tuple[str, Any]]:
+    table = dict(TOPOLOGY_PLACEHOLDERS)
+    if values is not None:
+        unknown = sorted(set(values) - set(TOPOLOGY_PLACEHOLDERS))
+        if unknown:
+            raise ValidationError(
+                f"unknown topology placeholder override(s): {', '.join(unknown)}"
+            )
+        for name, raw in values.items():
+            table[name] = (str(raw), raw)
+    return table
+
+
+def _substitute_placeholders_in_str(
+    text: str, table: Mapping[str, tuple[str, Any]] = TOPOLOGY_PLACEHOLDERS
+) -> str:
+    def _repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in table:
+            raise ValidationError(f"unknown topology placeholder '{{{name}}}'")
+        return table[name][0]
+
+    return _PLACEHOLDER_RE.sub(_repl, text)
+
+
+def _substitute_placeholders_in_json_obj(
+    obj: Any, table: Mapping[str, tuple[str, Any]] = TOPOLOGY_PLACEHOLDERS
+) -> Any:
+    if isinstance(obj, str):
+        exact = _PLACEHOLDER_RE.fullmatch(obj)
+        if exact:
+            name = exact.group(1)
+            if name not in table:
+                raise ValidationError(f"unknown topology placeholder '{{{name}}}'")
+            return table[name][1]
+        return _substitute_placeholders_in_str(obj, table)
+    if isinstance(obj, list):
+        return [_substitute_placeholders_in_json_obj(elem, table) for elem in obj]
+    if isinstance(obj, dict):
+        return {
+            _substitute_placeholders_in_str(
+                str(k), table
+            ): _substitute_placeholders_in_json_obj(v, table)
+            for k, v in obj.items()
+        }
+    return obj
+
+
+def substitute_validation_placeholders(
+    flags: Sequence[str],
+    server_env: Mapping[str, str] | None = None,
+    *,
+    values: Mapping[str, Any] | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Substitute topology placeholders with valid dummy or caller-supplied values."""
+    table = _build_placeholder_table(values)
+    sub_entries: list[tuple[str, str | None, bool]] = []
+    for flag, val, has_eq in _parse_flag_entries(list(flags)):
+        if val is None:
+            sub_entries.append((flag, None, has_eq))
+        elif flag in JSON_FLAGS:
+            parsed = json.loads(val)
+            substituted = _substitute_placeholders_in_json_obj(parsed, table)
+            encoded = json.dumps(substituted, separators=(",", ":"), sort_keys=True)
+            sub_entries.append((flag, encoded, has_eq))
+        else:
+            sub_entries.append(
+                (flag, _substitute_placeholders_in_str(val, table), has_eq)
+            )
+    sub_env = {
+        str(k): _substitute_placeholders_in_str(str(v), table)
+        for k, v in (server_env or {}).items()
+    }
+    return _render_entries(sub_entries), sub_env
+
+
+def _validate_port_value(raw: str, *, context: str) -> None:
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: port must be an integer in [1, 65535], got {raw!r}"
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise ValidationError(f"{context}: port must be in [1, 65535], got {port}")
+
+
+def _parse_mooncake_host_port(address: str, *, context: str) -> tuple[str, int]:
+    """Parse ``host:port`` or ``[ipv6]:port`` matching pinned vLLM ``split_host_port``."""
+    if not address or any(ch.isspace() for ch in address) or "/" in address:
+        raise ValidationError(
+            f"{context}: bootstrap_server_address must be 'host:port' or '[ipv6]:port' "
+            f"(no scheme, path, or whitespace), got {address!r}"
+        )
+    if address.startswith("["):
+        if "]" not in address:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address has unclosed IPv6 bracket: {address!r}"
+            )
+        host_part, rest = address.rsplit("]", 1)
+        host = host_part[1:]
+        if not host or "[" in host or "]" in host or not rest.startswith(":"):
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be '[ipv6]:port', got {address!r}"
+            )
+        port_raw = rest[1:]
+        if ":" in port_raw:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be '[ipv6]:port', got {address!r}"
+            )
+    else:
+        parts = address.split(":")
+        if len(parts) != 2:
+            raise ValidationError(
+                f"{context}: bootstrap_server_address must be 'host:port', got {address!r}"
+            )
+        host, port_raw = parts
+    if not host:
+        raise ValidationError(
+            f"{context}: bootstrap_server_address requires non-empty host, got {address!r}"
+        )
+    _validate_port_value(port_raw, context=context)
+    return host, int(port_raw)
+
+
+def _parse_pos_int_flag(flag_name: str, raw: str | None, *, context: str) -> int | None:
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a positive int, got {raw!r}"
+        ) from exc
+    if val <= 0:
+        raise ValidationError(
+            f"{context}: {flag_name} must be a positive int, got {raw!r}"
+        )
+    return val
+
+
+def _effective_bool_flag(
+    entries: Sequence[tuple[str, str | None, bool]],
+    pos_flag: str,
+    neg_flags: Sequence[str] = (),
+    *,
+    default: bool = False,
+    context: str,
+) -> bool:
+    neg_set = set(neg_flags)
+    state = default
+    for flag, val, _ in entries:
+        if flag == pos_flag:
+            if val is not None:
+                raise ValidationError(
+                    f"{context}: boolean flag {flag} does not accept a value, got {val!r}"
+                )
+            state = True
+        elif flag in neg_set:
+            if val is not None:
+                raise ValidationError(
+                    f"{context}: boolean flag {flag} does not accept a value, got {val!r}"
+                )
+            state = False
+    return state
+
+
+def _compute_parallel_and_dp_local(
+    entries: list[tuple[str, str | None, bool]],
+    server_env: Mapping[str, Any],
+    *,
+    topo_nodes: int,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
+) -> tuple[int, int, int, int | None, int, bool]:
+    """Return ``(ppu_count, dp_size, dp_size_local, dpl_explicit, world_within_dp, ext_lb)`` matching pinned vLLM."""
+    effective_env: dict[str, str] = dict(os.environ if base_env is None else base_env)
+    effective_env.update({k: str(v) for k, v in server_env.items()})
+
+    cli_dp_val = (
+        _parse_pos_int_flag(
+            "--data-parallel-size",
+            _flag_value(entries, "--data-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    tp_val = (
+        _parse_pos_int_flag(
+            "--tensor-parallel-size",
+            _flag_value(entries, "--tensor-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    pp_val = (
+        _parse_pos_int_flag(
+            "--pipeline-parallel-size",
+            _flag_value(entries, "--pipeline-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    pcp_val = (
+        _parse_pos_int_flag(
+            "--prefill-context-parallel-size",
+            _flag_value(entries, "--prefill-context-parallel-size"),
+            context=context,
+        )
+        or 1
+    )
+    world_within_dp = tp_val * pp_val * pcp_val
+    cli_world = cli_dp_val * world_within_dp
+
+    dist_exec_backend = _flag_value(entries, "--distributed-executor-backend")
+    if dist_exec_backend is not None:
+        allowed_exec = {"mp", "ray", "uni"} if topo_nodes == 1 else {"mp", "uni"}
+        if dist_exec_backend not in allowed_exec:
+            raise ValidationError(
+                f"{context}: --distributed-executor-backend must be one of "
+                f"{sorted(allowed_exec)} for nodes={topo_nodes}, got {dist_exec_backend!r}"
+            )
+        if dist_exec_backend == "uni" and world_within_dp > 1:
+            raise ValidationError(
+                f"{context}: --distributed-executor-backend 'uni' requires per-replica "
+                f"world size 1, got {world_within_dp}"
+            )
+
+    dpl_explicit = _parse_pos_int_flag(
+        "--data-parallel-size-local",
+        _flag_value(entries, "--data-parallel-size-local"),
+        context=context,
+    )
+    if dpl_explicit is not None and dpl_explicit > cli_dp_val:
+        raise ValidationError(
+            f"{context}: --data-parallel-size-local ({dpl_explicit}) "
+            f"cannot exceed --data-parallel-size ({cli_dp_val})"
+        )
+    dpl_val: int | None = dpl_explicit
+
+    dp_rank_raw = _flag_value(entries, "--data-parallel-rank")
+    dp_rank_val: int | None = None
+    if dp_rank_raw is not None:
+        try:
+            dp_rank_val = int(dp_rank_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --data-parallel-rank must be an integer, got {dp_rank_raw!r}"
+            ) from exc
+        if not 0 <= dp_rank_val < cli_dp_val:
+            raise ValidationError(
+                f"{context}: --data-parallel-rank must be in [0, {cli_dp_val - 1}], got {dp_rank_val}"
+            )
+
+    dp_start_rank_raw = _flag_value(entries, "--data-parallel-start-rank")
+    dp_start_rank_val: int | None = None
+    if dp_start_rank_raw is not None:
+        try:
+            dp_start_rank_val = int(dp_start_rank_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --data-parallel-start-rank must be an integer, got {dp_start_rank_raw!r}"
+            ) from exc
+
+    dp_backend = _flag_value(entries, "--data-parallel-backend") or "mp"
+    if dp_backend not in {"mp", "ray"}:
+        raise ValidationError(
+            f"{context}: --data-parallel-backend must be 'mp' or 'ray', got {dp_backend!r}"
+        )
+
+    ext_lb_flag = _effective_bool_flag(
+        entries,
+        "--data-parallel-external-lb",
+        ("--no-data-parallel-external-lb",),
+        default=False,
+        context=context,
+    )
+    hybrid_lb = _effective_bool_flag(
+        entries,
+        "--data-parallel-hybrid-lb",
+        ("--no-data-parallel-hybrid-lb",),
+        default=False,
+        context=context,
+    )
+    headless = any(flag == "--headless" for flag, _, _ in entries)
+    if headless and hybrid_lb:
+        raise ValidationError(
+            f"{context}: --data-parallel-hybrid-lb is not applicable in --headless mode"
+        )
+    if hybrid_lb and ext_lb_flag:
+        raise ValidationError(
+            f"{context}: --data-parallel-hybrid-lb and --data-parallel-external-lb "
+            f"cannot both be enabled"
+        )
+    if topo_nodes > 1 and dp_backend != "mp":
+        raise ValidationError(
+            f"{context}: multi-node topology (nodes={topo_nodes}) requires "
+            f"--data-parallel-backend mp, got {dp_backend!r}"
+        )
+
+    if topo_nodes > 1:
+        if cli_world % topo_nodes != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+                f"vLLM world size ({cli_world})"
+            )
+        local_world = cli_world // topo_nodes
+        inferred_dp_rank = 0
+        if cli_dp_val > 1 and ext_lb_flag:
+            if dp_rank_val is None:
+                if topo_nodes % cli_dp_val != 0:
+                    raise ValidationError(
+                        f"{context}: --node-rank cannot unambiguously identify external "
+                        f"data-parallel ranks when --nnodes ({topo_nodes}) is not divisible "
+                        f"by --data-parallel-size ({cli_dp_val})"
+                    )
+                dp_rank_val = inferred_dp_rank
+        elif dpl_val is None:
+            dpl_val = max(local_world // world_within_dp, 1)
+
+    ext_lb = ext_lb_flag or (dp_rank_val is not None)
+    if ext_lb:
+        if dp_rank_val is None:
+            raise ValidationError(
+                f"{context}: --data-parallel-external-lb requires --data-parallel-rank when nodes=1"
+            )
+        if dpl_val not in (None, 1):
+            raise ValidationError(
+                f"{context}: external data-parallel mode requires --data-parallel-size-local 1 "
+                f"or omitted, got {dpl_val}"
+            )
+        dp_local_val = 1
+        hybrid_lb = False
+    elif dpl_val is not None:
+        dp_local_val = dpl_val
+        if dp_start_rank_val is not None and not headless:
+            hybrid_lb = True
+        if hybrid_lb and dp_local_val == 1:
+            ext_lb = True
+            hybrid_lb = False
+        if (
+            dp_start_rank_val is not None
+            and cli_dp_val > 1
+            and not 0 <= dp_start_rank_val < cli_dp_val
+        ):
+            raise ValidationError(
+                f"{context}: --data-parallel-start-rank must be in [0, {cli_dp_val - 1}], "
+                f"got {dp_start_rank_val}"
+            )
+    else:
+        if hybrid_lb:
+            raise ValidationError(
+                f"{context}: --data-parallel-hybrid-lb requires --data-parallel-size-local"
+            )
+        if (
+            dp_backend == "ray"
+            and effective_env.get("VLLM_RAY_DP_PACK_STRATEGY", "") == "span"
+        ):
+            dp_local_val = 1
+        else:
+            dp_local_val = cli_dp_val
+
+    if cli_dp_val <= 1 and ext_lb:
+        raise ValidationError(
+            f"{context}: data_parallel_external_lb can only be set when data_parallel_size > 1"
+        )
+
+    def _parse_dp_env_int(var_name: str, *, positive: bool = False) -> int:
+        raw = effective_env[var_name]
+        try:
+            val = int(raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: environment variable {var_name} must be an integer"
+            ) from exc
+        if positive and val <= 0:
+            raise ValidationError(
+                f"{context}: environment variable {var_name} must be a positive integer"
+            )
+        return val
+
+    # Validate VLLM_DP_* env vars and apply ParallelConfig.__post_init__ fallback when CLI DP == 1
+    env_dp_size = (
+        _parse_dp_env_int("VLLM_DP_SIZE", positive=True)
+        if "VLLM_DP_SIZE" in effective_env
+        else 1
+    )
+    env_dp_rank = (
+        _parse_dp_env_int("VLLM_DP_RANK") if "VLLM_DP_RANK" in effective_env else 0
+    )
+    env_dp_rank_local = (
+        _parse_dp_env_int("VLLM_DP_RANK_LOCAL")
+        if "VLLM_DP_RANK_LOCAL" in effective_env
+        else env_dp_rank
+    )
+    if "VLLM_DP_MASTER_PORT" in effective_env:
+        env_dp_port = _parse_dp_env_int("VLLM_DP_MASTER_PORT")
+        if not 0 <= env_dp_port <= 65535:
+            raise ValidationError(
+                f"{context}: VLLM_DP_MASTER_PORT must be in [0, 65535], got {env_dp_port}"
+            )
+
+    if cli_dp_val > 1:
+        if "VLLM_DP_SIZE" in server_env and env_dp_size != cli_dp_val:
+            raise ValidationError(
+                f"{context}: recipe env VLLM_DP_SIZE ({env_dp_size}) conflicts with "
+                f"--data-parallel-size ({cli_dp_val})"
+            )
+        for dead_dp_var in ("VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"):
+            if dead_dp_var in server_env:
+                raise ValidationError(
+                    f"{context}: recipe env {dead_dp_var} is ignored when "
+                    f"--data-parallel-size ({cli_dp_val}) > 1"
+                )
+        dp_val = cli_dp_val
+    else:
+        if topo_nodes > 1 and env_dp_size > 1:
+            raise ValidationError(
+                f"{context}: multi-node topology (nodes={topo_nodes}) requires CLI "
+                f"--data-parallel-size rather than VLLM_DP_SIZE={env_dp_size} env fallback"
+            )
+        dp_val = env_dp_size
+        if not 0 <= env_dp_rank < dp_val:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK must be in [0, {dp_val - 1}], got {env_dp_rank}"
+            )
+        if not 0 <= env_dp_rank_local < dp_local_val:
+            raise ValidationError(
+                f"{context}: VLLM_DP_RANK_LOCAL ({env_dp_rank_local}) must be in "
+                f"[0, {dp_local_val - 1}] for allocated local DP size ({dp_local_val})"
+            )
+
+    ppu_count = dp_val * world_within_dp
+    if topo_nodes > 1:
+        if ppu_count % topo_nodes != 0:
+            raise ValidationError(
+                f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+                f"vLLM world size ({ppu_count})"
+            )
+        if not ext_lb:
+            dp_node_size = dp_val // dp_local_val
+            if dp_val % dp_local_val != 0 or topo_nodes % dp_node_size != 0:
+                raise ValidationError(
+                    f"{context}: topology.nodes ({topo_nodes}) must be divisible by "
+                    f"data-parallel node groups ({dp_val} / {dp_local_val})"
+                )
+            nnodes_within_dp = topo_nodes // dp_node_size
+            if world_within_dp % nnodes_within_dp != 0:
+                raise ValidationError(
+                    f"{context}: per-replica world size ({world_within_dp}) must be divisible "
+                    f"by nodes per DP replica ({nnodes_within_dp})"
+                )
+    return ppu_count, dp_val, dp_local_val, dpl_explicit, world_within_dp, ext_lb
+
+
+def _validate_resolved_topology_and_placeholders(
+    resolved: Mapping[str, Any],
+    *,
+    context: str,
+    base_env: Mapping[str, str] | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Validate topology/placeholder invariants and return dummy-substituted flags/env."""
+    flags = list(resolved["flags"])
+    server_env = dict(resolved["server_env"])
+    topo = resolved["topology"]
+    topo_kind = topo["kind"]
+    topo_nodes = int(topo["nodes"])
+    topo_capacity = topo_nodes * int(topo["devices_per_node"])
+    preset_name = resolved.get("preset")
+
+    entries = _parse_flag_entries(flags)
+    flag_names = {name for name, _, _ in entries}
+    (
+        calc_ppu_count,
+        dp_val,
+        dp_local_val,
+        dpl_explicit,
+        world_within_dp,
+        ext_lb,
+    ) = _compute_parallel_and_dp_local(
+        entries,
+        server_env,
+        topo_nodes=topo_nodes,
+        context=context,
+        base_env=base_env,
+    )
+    ppu_count = max(int(resolved["ppu_count"]), calc_ppu_count)
+
+    if topo_nodes == 1 and dp_local_val != dp_val:
+        raise ValidationError(
+            f"{context}: single-node launch requires effective local DP size "
+            f"({dp_local_val}) to equal global DP size ({dp_val})"
+        )
+    if ppu_count > topo_capacity:
+        raise ValidationError(
+            f"{context}: resolved parallelism requires {ppu_count} devices, "
+            f"exceeding declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
+        )
+    if topo_nodes > 1 and ppu_count % topo_nodes != 0:
+        raise ValidationError(
+            f"{context}: topology.nodes ({topo_nodes}) must evenly divide effective "
+            f"vLLM world size ({ppu_count})"
+        )
+
+    placeholders = _extract_placeholders_from_flags_and_env(flags, server_env)
+    unknown = sorted(placeholders - set(TOPOLOGY_PLACEHOLDERS))
+    if unknown:
+        raise ValidationError(
+            f"{context}: unknown topology placeholder(s): {', '.join(unknown)}"
+        )
+
+    def _require_matching_nnodes() -> None:
+        nnodes_raw = _flag_value(entries, "--nnodes")
+        if nnodes_raw is None:
+            raise ValidationError(
+                f"{context}: {topo_kind} topology (nodes={topo_nodes}) requires "
+                f"--nnodes matching topology.nodes ({topo_nodes})"
+            )
+        try:
+            nnodes_val = int(nnodes_raw)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{context}: --nnodes must be an integer, got {nnodes_raw!r}"
+            ) from exc
+        if nnodes_val != topo_nodes:
+            raise ValidationError(
+                f"{context}: --nnodes ({nnodes_val}) must match topology.nodes ({topo_nodes})"
+            )
+
+    if topo_kind == "single_node":
+        if placeholders:
+            raise ValidationError(
+                f"{context}: single_node topology must not contain placeholders: "
+                f"{', '.join(sorted(placeholders))}"
+            )
+        bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+        if bad_mn:
+            raise ValidationError(
+                f"{context}: single_node topology must not set multi-node flag(s): "
+                f"{', '.join(bad_mn)}"
+            )
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: single_node topology must not set --kv-transfer-config; "
+                f"declare paired pd_disagg presets instead"
+            )
+    elif topo_kind == "multi_node_ep":
+        if "--kv-transfer-config" in flag_names:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology must not set --kv-transfer-config; "
+                f"use paired pd_disagg presets instead"
+            )
+        missing = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
+        if missing:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology missing required placeholder(s): "
+                f"{', '.join(missing)}"
+            )
+        _require_matching_nnodes()
+        if ppu_count != topo_capacity:
+            raise ValidationError(
+                f"{context}: multi_node_ep parallelism ({ppu_count}) must match "
+                f"declared topology capacity ({topo_nodes}x{topo['devices_per_node']}={topo_capacity})"
+            )
+        ep_enabled = _effective_bool_flag(
+            entries,
+            "--enable-expert-parallel",
+            ("--no-enable-expert-parallel", "--disable-expert-parallel"),
+            default=False,
+            context=context,
+        )
+        if not ep_enabled:
+            raise ValidationError(
+                f"{context}: multi_node_ep topology requires effective --enable-expert-parallel"
+            )
+        expected_multi_dpl = (
+            1 if ext_lb else max((ppu_count // topo_nodes) // world_within_dp, 1)
+        )
+        if dpl_explicit is not None and dpl_explicit != expected_multi_dpl:
+            layout_desc = (
+                "external-LB per-process DP layout" if ext_lb else "per-node DP layout"
+            )
+            raise ValidationError(
+                f"{context}: multi_node_ep --data-parallel-size-local ({dpl_explicit}) "
+                f"must match {layout_desc} ({expected_multi_dpl}) for {topo_nodes} nodes "
+                f"(DP={dp_val}, replica world={world_within_dp})"
+            )
+    elif topo_kind == "pd_disagg":
+        kv_raw = _flag_value(entries, "--kv-transfer-config")
+        if kv_raw is None:
+            raise ValidationError(
+                f"{context}: pd_disagg preset requires --kv-transfer-config"
+            )
+        kv_obj = json.loads(kv_raw)
+        connector = kv_obj.get("kv_connector")
+        if not isinstance(connector, str) or not connector.strip():
+            raise ValidationError(
+                f"{context}: --kv-transfer-config requires non-empty kv_connector"
+            )
+        role = topo.get("role")
+        if role is None:
+            if preset_name == "pd_prefill":
+                role = "prefill"
+            elif preset_name == "pd_decode":
+                role = "decode"
+        required_pd_ph = (
+            PD_DISAGG_DECODE_REQUIRED_PLACEHOLDERS
+            if role == "decode"
+            else PD_DISAGG_PREFILL_REQUIRED_PLACEHOLDERS
+        )
+        missing = sorted(required_pd_ph - placeholders)
+        if missing:
+            raise ValidationError(
+                f"{context}: pd_disagg topology missing required placeholder(s): "
+                f"{', '.join(missing)}"
+            )
+        expected_kv_role = (
+            "kv_producer"
+            if role == "prefill"
+            else ("kv_consumer" if role == "decode" else None)
+        )
+        if expected_kv_role is not None and kv_obj.get("kv_role") != expected_kv_role:
+            raise ValidationError(
+                f"{context}: pd_disagg role {role!r} requires "
+                f"kv_role={expected_kv_role!r}, got {kv_obj.get('kv_role')!r}"
+            )
+        if connector == "MooncakeConnector":
+            extra = kv_obj.get("kv_connector_extra_config")
+            if extra is not None and not isinstance(extra, dict):
+                raise ValidationError(
+                    f"{context}: MooncakeConnector kv_connector_extra_config must be a JSON object"
+                )
+            extra = extra or {}
+            if "kv_port" in kv_obj:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector does not read KVTransferConfig.kv_port; "
+                    f"wire {{kv_port}} via VLLM_MOONCAKE_BOOTSTRAP_PORT or "
+                    f"kv_connector_extra_config.bootstrap_server_address"
+                )
+            if "kv_ip" in extra:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector does not read kv_connector_extra_config.kv_ip; "
+                    f"wire {{kv_ip}} via VLLM_HOST_IP (and optional bootstrap_server_address)"
+                )
+            dev_name = extra.get("device_name")
+            if not isinstance(dev_name, str) or "{ib_devices}" not in dev_name:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector requires kv_connector_extra_config.device_name "
+                    f"to wire {{ib_devices}}"
+                )
+            host_ip_env = server_env.get("VLLM_HOST_IP")
+            if not isinstance(host_ip_env, str) or "{kv_ip}" not in host_ip_env:
+                raise ValidationError(
+                    f"{context}: MooncakeConnector requires env VLLM_HOST_IP to wire {{kv_ip}}"
+                )
+            bootstrap_addr = extra.get("bootstrap_server_address")
+            bootstrap_port_env = server_env.get("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+            if role == "prefill":
+                if bootstrap_addr is not None and bootstrap_port_env is not None:
+                    raise ValidationError(
+                        f"{context}: MooncakeConnector prefill must not set both "
+                        f"bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT"
+                    )
+                if bootstrap_addr is not None:
+                    if (
+                        not isinstance(bootstrap_addr, str)
+                        or "{kv_port}" not in bootstrap_addr
+                    ):
+                        raise ValidationError(
+                            f"{context}: MooncakeConnector bootstrap_server_address must "
+                            f"be a 'host:port' string wiring {{kv_port}}"
+                        )
+                    sub_addr = _substitute_placeholders_in_str(bootstrap_addr)
+                    _parse_mooncake_host_port(
+                        sub_addr,
+                        context=f"{context}.bootstrap_server_address",
+                    )
+                else:
+                    if (
+                        not isinstance(bootstrap_port_env, str)
+                        or "{kv_port}" not in bootstrap_port_env
+                    ):
+                        raise ValidationError(
+                            f"{context}: MooncakeConnector prefill requires env "
+                            f"VLLM_MOONCAKE_BOOTSTRAP_PORT (or kv_connector_extra_config."
+                            f"bootstrap_server_address) to wire {{kv_port}}"
+                        )
+                    _validate_port_value(
+                        _substitute_placeholders_in_str(bootstrap_port_env),
+                        context=f"{context}.VLLM_MOONCAKE_BOOTSTRAP_PORT",
+                    )
+            elif role == "decode":
+                if bootstrap_addr is not None or bootstrap_port_env is not None:
+                    raise ValidationError(
+                        f"{context}: MooncakeConnector decode (kv_consumer) does not read "
+                        f"bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT; "
+                        f"decoders receive remote_bootstrap_addr via kv_transfer_params"
+                    )
+        if topo_nodes == 1:
+            bad_mn = sorted(flag_names & MULTI_NODE_LAUNCH_FLAGS)
+            if bad_mn:
+                raise ValidationError(
+                    f"{context}: single-node pd_disagg topology must not set multi-node flag(s): "
+                    f"{', '.join(bad_mn)}"
+                )
+        else:
+            missing_mn = sorted(MULTI_NODE_REQUIRED_PLACEHOLDERS - placeholders)
+            if missing_mn:
+                raise ValidationError(
+                    f"{context}: multi-node pd_disagg topology missing required placeholder(s): "
+                    f"{', '.join(missing_mn)}"
+                )
+            _require_matching_nnodes()
+
+    sub_flags, sub_env = substitute_validation_placeholders(flags, server_env)
+    _validate_flag_list(sub_flags, context=context, allow_policy_flags=True)
+    for loc, s in _walk_strings({"flags": sub_flags, "env": sub_env}, context):
+        findings = _scan_text(s, context=loc, allow_loopback=True)
+        if findings:
+            raise ValidationError("; ".join(findings))
+    return sub_flags, sub_env
+
+
+def _resolve_recipe_from_doc(
+    recipe: Mapping[str, Any],
+    *,
+    recipe_label: str,
+    policy: Mapping[str, Any] | None = None,
+    policy_label: str = "",
     tier: str | None = None,
     variant: str | None = None,
-    hardware: str = "zhenwu_m890",
+    hardware: str | None = None,
     preset: str | None = None,
     cache: str | None = None,
     dummy_weights: bool = False,
@@ -1040,20 +2020,12 @@ def resolve_recipe(
     port: int = 9985,
     served_model_name: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
-    recipe = _load_yaml(recipe_path)
-    validate_serving_recipe_structure(recipe, context=str(recipe_path))
-
+    """Resolve an already structurally validated recipe dict (+ optional policy dict)."""
     ppu_blk = recipe["ppu"]
     if ppu_blk["framework"] != "vllm":
         raise ValidationError(
-            f"{recipe_path}: vllm-sail executor only resolves framework='vllm', got {ppu_blk['framework']!r}"
+            f"{recipe_label}: vllm-sail executor only resolves framework='vllm', got {ppu_blk['framework']!r}"
         )
-
-    policy: dict[str, Any] | None = None
-    if policy_path is not None:
-        policy = _load_yaml(policy_path)
-        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
 
     eff_cache = cache
     eff_dummy = dummy_weights
@@ -1069,9 +2041,16 @@ def resolve_recipe(
     if policy is not None:
         if tier is None:
             raise ValidationError("--tier is required when --policy is supplied")
+        policy_model_id = policy.get("model_id")
+        recipe_model_id = recipe["model"]["model_id"]
+        if policy_model_id != recipe_model_id:
+            raise ValidationError(
+                f"{policy_label or recipe_label}: policy model_id {policy_model_id!r} "
+                f"does not match recipe model.model_id {recipe_model_id!r}"
+            )
         tiers = policy.get("tiers", {})
         if tier not in tiers:
-            raise ValidationError(f"{policy_path}: tier {tier!r} not found")
+            raise ValidationError(f"{policy_label}: tier {tier!r} not found")
         tier_cfg = tiers[tier]
         if tier == "fast_sanity":
             if eff_cache is None:
@@ -1092,8 +2071,57 @@ def resolve_recipe(
                 if eff_preset is None and st.get("preset"):
                     eff_preset = st["preset"]
                     break
-        if policy.get("hardware") and hardware == "zhenwu_m890":
-            hardware = policy["hardware"]
+
+    variants_blk = recipe.get("variants", {})
+    if eff_variant not in variants_blk:
+        raise ValidationError(f"{recipe_label}: unknown variant {eff_variant!r}")
+    var_blk = variants_blk[eff_variant]
+
+    presets_blk = recipe.get("presets", {})
+    preset_blk: Mapping[str, Any] = {}
+    if eff_preset is not None:
+        if eff_preset not in presets_blk:
+            raise ValidationError(f"{recipe_label}: unknown preset {eff_preset!r}")
+        preset_blk = presets_blk[eff_preset]
+        allowed_vars = preset_blk.get("variants")
+        if allowed_vars is not None and eff_variant not in allowed_vars:
+            raise ValidationError(
+                f"{recipe_label}: preset {eff_preset!r} does not support variant {eff_variant!r}"
+            )
+
+    var_hw = _infer_variant_hardware(
+        var_blk, context=f"{recipe_label}.variants.{eff_variant}"
+    )
+    preset_hw = preset_blk.get("hardware")
+    policy_hw = policy.get("hardware") if policy is not None else None
+    if hardware is not None:
+        eff_hardware = hardware
+        if policy_hw is not None and policy_hw != eff_hardware:
+            raise ValidationError(
+                f"{recipe_label}: requested hardware {eff_hardware!r} conflicts with policy hardware {policy_hw!r}"
+            )
+    elif policy_hw is not None:
+        eff_hardware = str(policy_hw)
+    elif preset_hw is not None:
+        eff_hardware = str(preset_hw)
+    else:
+        eff_hardware = var_hw
+
+    if var_blk.get("hardware") is not None and var_blk["hardware"] != eff_hardware:
+        raise ValidationError(
+            f"{recipe_label}: variant {eff_variant!r} targets hardware "
+            f"{var_blk['hardware']!r}, incompatible with {eff_hardware!r}"
+        )
+    if preset_hw is not None and preset_hw != eff_hardware:
+        raise ValidationError(
+            f"{recipe_label}: preset {eff_preset!r} targets hardware "
+            f"{preset_hw!r}, incompatible with {eff_hardware!r}"
+        )
+    _validate_hardware_precision(
+        hardware=eff_hardware,
+        precision=var_blk["precision"],
+        context=f"{recipe_label}.variants.{eff_variant}",
+    )
 
     ordered: list[tuple[str, str | None, bool]] = []
     server_env: dict[str, str] = {}
@@ -1104,26 +2132,15 @@ def resolve_recipe(
     server_env.update(model_blk.get("base_env", {}))
 
     # 2. variants.<variant>
-    variants_blk = recipe.get("variants", {})
-    if eff_variant not in variants_blk:
-        raise ValidationError(f"{recipe_path}: unknown variant {eff_variant!r}")
-    var_blk = variants_blk[eff_variant]
     ordered = _apply_flag_entries(ordered, list(var_blk.get("extra_args", [])))
     server_env.update(var_blk.get("extra_env", {}))
 
     # 3. hardware_overrides.<hw>
-    hw_blk = recipe.get("hardware_overrides", {}).get(hardware, {})
+    hw_blk = recipe.get("hardware_overrides", {}).get(eff_hardware, {})
     ordered = _apply_flag_entries(ordered, list(hw_blk.get("extra_args", [])))
     server_env.update(hw_blk.get("extra_env", {}))
 
     # 4. enabled features (ppu.default_features overridden by preset.select.features)
-    presets_blk = recipe.get("presets", {})
-    preset_blk: dict[str, Any] = {}
-    if eff_preset is not None:
-        if eff_preset not in presets_blk:
-            raise ValidationError(f"{recipe_path}: unknown preset {eff_preset!r}")
-        preset_blk = presets_blk[eff_preset]
-
     enabled_features = {name: True for name in ppu_blk.get("default_features", [])}
     select_features = preset_blk.get("select", {}).get("features", {})
     for feat_name, flag_on in select_features.items():
@@ -1135,7 +2152,7 @@ def resolve_recipe(
         if not is_enabled:
             continue
         if feat_name not in features_blk:
-            raise ValidationError(f"{recipe_path}: unknown feature {feat_name!r}")
+            raise ValidationError(f"{recipe_label}: unknown feature {feat_name!r}")
         active_features.append(feat_name)
         feat = features_blk[feat_name]
         if "modes" in feat:
@@ -1159,6 +2176,15 @@ def resolve_recipe(
             ordered = _merge_json_flag(ordered, json_flag, json_patch)
         ordered = _apply_flag_entries(ordered, list(preset_blk.get("args", [])))
         server_env.update(preset_blk.get("env", {}))
+
+    eff_topology = copy.deepcopy(
+        preset_blk.get("topology") or var_blk.get("topology") or ppu_blk["topology"]
+    )
+    if eff_topology["kind"] == "pd_disagg" and "role" not in eff_topology:
+        if eff_preset == "pd_prefill":
+            eff_topology["role"] = "prefill"
+        elif eff_preset == "pd_decode":
+            eff_topology["role"] = "decode"
 
     # 6. assets-map + runtime endpoint resolution
     assets_map = _load_assets_map(assets_map_path)
@@ -1219,14 +2245,12 @@ def resolve_recipe(
         *flags_only,
     ]
 
-    dp_raw = _flag_value(ordered, "--data-parallel-size")
-    tp_raw = _flag_value(ordered, "--tensor-parallel-size")
-    if dp_raw is not None:
-        ppu_count = int(dp_raw) * (int(tp_raw) if tp_raw is not None else 1)
-    elif tp_raw is not None:
-        ppu_count = int(tp_raw)
-    else:
-        ppu_count = int(ppu_blk["topology"]["devices_per_node"])
+    ppu_count, dp_val, dp_local_val, _, _, _ = _compute_parallel_and_dp_local(
+        ordered,
+        server_env,
+        topo_nodes=int(eff_topology["nodes"]),
+        context=recipe_label,
+    )
 
     runtime_env: dict[str, str] = {}
     if needs_dev_mode:
@@ -1237,7 +2261,7 @@ def resolve_recipe(
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "variant": eff_variant,
-        "hardware": hardware,
+        "hardware": eff_hardware,
         "preset": eff_preset,
         "tier": tier,
         "cache": eff_cache,
@@ -1252,12 +2276,14 @@ def resolve_recipe(
         )
     ).hexdigest()
 
-    return {
+    result = {
         "argv": argv,
         "flags": flags_only,
         "server_env": server_env,
         "runtime_env": runtime_env,
         "ppu_count": ppu_count,
+        "dp_size": dp_val,
+        "dp_size_local": dp_local_val,
         "model_id": model_blk["model_id"],
         "hf_model_id": hf_model_id,
         "resolved_model": resolved_model,
@@ -1267,11 +2293,67 @@ def resolve_recipe(
         "tier": tier,
         "preset": eff_preset,
         "variant": eff_variant,
-        "hardware": hardware,
+        "precision": _normalize_precision(
+            var_blk["precision"], context=f"{recipe_label}.variants.{eff_variant}"
+        ),
+        "hardware": eff_hardware,
+        "topology": eff_topology,
         "enabled_features": active_features,
         "layer_override": eff_layers,
         "dummy_weights": eff_dummy,
     }
+    _validate_resolved_topology_and_placeholders(
+        result, context=f"{recipe_label}:{eff_variant}:{eff_preset or 'baseline'}"
+    )
+    return result
+
+
+def resolve_recipe(
+    recipe_path: Path,
+    *,
+    policy_path: Path | None = None,
+    tier: str | None = None,
+    variant: str | None = None,
+    hardware: str | None = None,
+    preset: str | None = None,
+    cache: str | None = None,
+    dummy_weights: bool = False,
+    layer_override: Any = _UNSET,
+    assets_map_path: Path | None = None,
+    model_dir: Path | None = None,
+    host: str = "127.0.0.1",
+    port: int = 9985,
+    served_model_name: str | None = None,
+) -> dict[str, Any]:
+    """Resolve recipe + optional policy tier into effective vLLM argv, env, and digest."""
+    recipe = _load_yaml(recipe_path)
+    validate_serving_recipe_structure(
+        recipe, context=str(recipe_path), validate_expansions=False
+    )
+
+    policy: dict[str, Any] | None = None
+    if policy_path is not None:
+        policy = _load_yaml(policy_path)
+        validate_policy_structure(policy, context=str(policy_path), base_dir=REPO_ROOT)
+
+    return _resolve_recipe_from_doc(
+        recipe,
+        recipe_label=str(recipe_path),
+        policy=policy,
+        policy_label=str(policy_path) if policy_path is not None else "",
+        tier=tier,
+        variant=variant,
+        hardware=hardware,
+        preset=preset,
+        cache=cache,
+        dummy_weights=dummy_weights,
+        layer_override=layer_override,
+        assets_map_path=assets_map_path,
+        model_dir=model_dir,
+        host=host,
+        port=port,
+        served_model_name=served_model_name,
+    )
 
 
 def _scan_text(text: str, *, context: str, allow_loopback: bool = False) -> list[str]:
@@ -1320,7 +2402,7 @@ def _validate_env_block(
     context: str,
 ) -> None:
     checked = _check_str_dict(env, context=context)
-    for name in checked:
+    for name, val in checked.items():
         if name in FORBIDDEN_RECIPE_ENV:
             raise ValidationError(
                 f"{context}: runtime-mode env {name!r} must not be set in recipe"
@@ -1334,6 +2416,14 @@ def _validate_env_block(
         ):
             raise ValidationError(
                 f"{context}: external env {name!r} must be listed in ppu.external_env"
+            )
+        unknown_ph = sorted(
+            set(_PLACEHOLDER_RE.findall(val)) - set(TOPOLOGY_PLACEHOLDERS)
+        )
+        if unknown_ph:
+            raise ValidationError(
+                f"{context}: env {name!r} has unknown placeholder(s): "
+                f"{', '.join(unknown_ph)}"
             )
 
 
@@ -1354,9 +2444,30 @@ def _validate_hf_model_id(value: Any, *, context: str) -> None:
         )
 
 
-def _validate_flag_list(tokens: Any, *, context: str) -> None:
+def _validate_flag_list(
+    tokens: Any, *, context: str, allow_policy_flags: bool = False
+) -> None:
     raw = _check_str_list(tokens, context=context)
     for flag, val, _ in _parse_flag_entries(raw):
+        if not allow_policy_flags and flag in FORBIDDEN_RECIPE_FLAGS:
+            raise ValidationError(
+                f"{context}: policy/runtime flag {flag!r} must not be hardcoded in recipe"
+            )
+        if flag == "--gpu-memory-utilization":
+            if val is None:
+                raise ValidationError(
+                    f"{context}: --gpu-memory-utilization requires a float in (0.0, 1.0]"
+                )
+            try:
+                util = float(val)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"{context}: --gpu-memory-utilization must be a float in (0.0, 1.0], got {val!r}"
+                ) from exc
+            if not (0.0 < util <= 1.0):
+                raise ValidationError(
+                    f"{context}: --gpu-memory-utilization must be in (0.0, 1.0], got {val!r}"
+                )
         if flag in JSON_FLAGS:
             if val is None:
                 raise ValidationError(f"{context}: JSON flag {flag} requires a value")
@@ -1374,6 +2485,23 @@ def _validate_flag_list(tokens: Any, *, context: str) -> None:
                 raise ValidationError(
                     f"{context}: JSON flag {flag} must decode to a JSON object"
                 )
+            unknown_ph = sorted(
+                _find_placeholders_in_obj(parsed) - set(TOPOLOGY_PLACEHOLDERS)
+            )
+            if unknown_ph:
+                raise ValidationError(
+                    f"{context}: JSON flag {flag} has unknown placeholder(s): "
+                    f"{', '.join(unknown_ph)}"
+                )
+        elif val is not None:
+            unknown_ph = sorted(
+                set(_PLACEHOLDER_RE.findall(val)) - set(TOPOLOGY_PLACEHOLDERS)
+            )
+            if unknown_ph:
+                raise ValidationError(
+                    f"{context}: flag {flag} has unknown placeholder(s): "
+                    f"{', '.join(unknown_ph)}"
+                )
 
 
 def validate_serving_recipe_structure(
@@ -1381,6 +2509,7 @@ def validate_serving_recipe_structure(
     *,
     context: str,
     allow_internal_visibility: bool = False,
+    validate_expansions: bool = True,
 ) -> None:
     """Validate structure, env allowlist, JSON flags, and redaction for ``ppu-serving/v1``."""
     _check_keys(
@@ -1436,20 +2565,7 @@ def validate_serving_recipe_structure(
     )
     _check_str_dict(assets, context=f"{context}.ppu.assets")
 
-    topo = _check_keys(
-        ppu["topology"],
-        allowed={"kind", "nodes", "devices_per_node"},
-        required={"kind", "nodes", "devices_per_node"},
-        context=f"{context}.ppu.topology",
-    )
-    if topo["kind"] not in {"single_node", "multi_node_ep", "pd_disagg"}:
-        raise ValidationError(f"{context}.ppu.topology.kind invalid: {topo['kind']!r}")
-    if not isinstance(topo["nodes"], int) or topo["nodes"] <= 0:
-        raise ValidationError(f"{context}.ppu.topology.nodes must be positive int")
-    if not isinstance(topo["devices_per_node"], int) or topo["devices_per_node"] <= 0:
-        raise ValidationError(
-            f"{context}.ppu.topology.devices_per_node must be positive int"
-        )
+    _validate_topology_block(ppu["topology"], context=f"{context}.ppu.topology")
 
     if "hf_model_id" in ppu:
         _validate_hf_model_id(ppu["hf_model_id"], context=f"{context}.ppu.hf_model_id")
@@ -1524,11 +2640,25 @@ def validate_serving_recipe_structure(
                 context=f"{context}.features.{fname}.env",
             )
 
-    for vname, vcfg in recipe.get("variants", {}).items():
+    if ppu["framework"] == "vllm":
+        raw_variants = recipe.get("variants")
+        if not isinstance(raw_variants, dict) or not raw_variants:
+            raise ValidationError(
+                f"{context}.variants must be a non-empty mapping for vllm serving recipes"
+            )
+        variants_blk = raw_variants
+    else:
+        variants_blk = recipe.get("variants", {})
+        if not isinstance(variants_blk, dict):
+            raise ValidationError(f"{context}.variants must be mapping")
+    variant_compat_hw_map: dict[str, frozenset[str]] = {}
+    for vname, vcfg in variants_blk.items():
         _check_keys(
             vcfg,
             allowed={
                 "precision",
+                "hardware",
+                "topology",
                 "extra_args",
                 "extra_env",
                 "assets",
@@ -1539,6 +2669,20 @@ def validate_serving_recipe_structure(
             required={"precision"},
             context=f"{context}.variants.{vname}",
         )
+        compat_hw = _variant_compatible_hardware(
+            vcfg, context=f"{context}.variants.{vname}"
+        )
+        for hw in sorted(compat_hw):
+            _validate_hardware_precision(
+                hardware=hw,
+                precision=vcfg["precision"],
+                context=f"{context}.variants.{vname}",
+            )
+        variant_compat_hw_map[vname] = compat_hw
+        if "topology" in vcfg:
+            _validate_topology_block(
+                vcfg["topology"], context=f"{context}.variants.{vname}.topology"
+            )
         if "assets" in vcfg:
             v_assets = _check_keys(
                 vcfg["assets"],
@@ -1568,7 +2712,7 @@ def validate_serving_recipe_structure(
         )
 
     for hname, hcfg in recipe.get("hardware_overrides", {}).items():
-        if hname not in {"zhenwu_m890", "zhenwu_810e"}:
+        if hname not in SUPPORTED_HARDWARE:
             raise ValidationError(
                 f"{context}.hardware_overrides: unknown hardware {hname!r}"
             )
@@ -1587,13 +2731,22 @@ def validate_serving_recipe_structure(
             context=f"{context}.hardware_overrides.{hname}.extra_env",
         )
 
-    for pname, pcfg in recipe.get("presets", {}).items():
+    presets_blk = recipe.get("presets", {})
+    if not isinstance(presets_blk, dict):
+        raise ValidationError(f"{context}.presets must be mapping")
+    if ("pd_prefill" in presets_blk) != ("pd_decode" in presets_blk):
+        raise ValidationError(
+            f"{context}.presets: pd_prefill and pd_decode must be declared as a pair"
+        )
+    for pname, pcfg in presets_blk.items():
         if pname not in ALLOWED_PRESET_SLOTS:
             raise ValidationError(f"{context}.presets: unknown preset slot {pname!r}")
         _check_keys(
             pcfg,
             allowed={
                 "hardware",
+                "variants",
+                "topology",
                 "tp",
                 "select",
                 "args",
@@ -1603,7 +2756,61 @@ def validate_serving_recipe_structure(
             },
             context=f"{context}.presets.{pname}",
         )
-        if "tp" in pcfg and (not isinstance(pcfg["tp"], int) or pcfg["tp"] <= 0):
+        if "hardware" in pcfg and pcfg["hardware"] not in SUPPORTED_HARDWARE:
+            raise ValidationError(
+                f"{context}.presets.{pname}.hardware invalid: {pcfg['hardware']!r}"
+            )
+        if "variants" in pcfg:
+            p_variants = _check_str_list(
+                pcfg["variants"], context=f"{context}.presets.{pname}.variants"
+            )
+            if not p_variants:
+                raise ValidationError(
+                    f"{context}.presets.{pname}.variants must be non-empty"
+                )
+            for vname in p_variants:
+                if vname not in variants_blk:
+                    raise ValidationError(
+                        f"{context}.presets.{pname}.variants references unknown variant {vname!r}"
+                    )
+                if (
+                    "hardware" in pcfg
+                    and pcfg["hardware"] not in variant_compat_hw_map[vname]
+                ):
+                    raise ValidationError(
+                        f"{context}.presets.{pname}: variant {vname!r} compatible hardware "
+                        f"{sorted(variant_compat_hw_map[vname])} conflicts with preset hardware {pcfg['hardware']!r}"
+                    )
+        expected_role = (
+            "prefill"
+            if pname == "pd_prefill"
+            else ("decode" if pname == "pd_decode" else None)
+        )
+        if "topology" in pcfg:
+            ptopo = _validate_topology_block(
+                pcfg["topology"],
+                context=f"{context}.presets.{pname}.topology",
+                allow_role=True,
+                expected_role=expected_role,
+            )
+            if pname in {"pd_prefill", "pd_decode"} and ptopo["kind"] != "pd_disagg":
+                raise ValidationError(
+                    f"{context}.presets.{pname}.topology.kind must be 'pd_disagg'"
+                )
+            if ptopo["kind"] == "pd_disagg" and pname not in {
+                "pd_prefill",
+                "pd_decode",
+            }:
+                raise ValidationError(
+                    f"{context}.presets.{pname}: pd_disagg topology must use "
+                    f"paired 'pd_prefill' and 'pd_decode' preset slots"
+                )
+        elif pname in {"pd_prefill", "pd_decode"}:
+            if ppu["topology"]["kind"] != "pd_disagg":
+                raise ValidationError(
+                    f"{context}.presets.{pname}: requires topology.kind='pd_disagg'"
+                )
+        if "tp" in pcfg and (type(pcfg["tp"]) is not int or pcfg["tp"] <= 0):
             raise ValidationError(f"{context}.presets.{pname}.tp must be positive int")
         if "select" in pcfg:
             sel = _check_keys(
@@ -1625,6 +2832,14 @@ def validate_serving_recipe_structure(
                 raise ValidationError(
                     f"{context}.presets.{pname}.json_args.{jflag} invalid"
                 )
+            unknown_jph = sorted(
+                _find_placeholders_in_obj(jval) - set(TOPOLOGY_PLACEHOLDERS)
+            )
+            if unknown_jph:
+                raise ValidationError(
+                    f"{context}.presets.{pname}.json_args.{jflag} has unknown placeholder(s): "
+                    f"{', '.join(unknown_jph)}"
+                )
         _validate_flag_list(
             pcfg.get("args", []), context=f"{context}.presets.{pname}.args"
         )
@@ -1633,11 +2848,38 @@ def validate_serving_recipe_structure(
             external_env=external_env,
             context=f"{context}.presets.{pname}.env",
         )
+        if variants_blk:
+            matched_variants = [
+                vname
+                for vname in variants_blk
+                if (pcfg.get("variants") is None or vname in pcfg["variants"])
+                and (
+                    pcfg.get("hardware") is None
+                    or pcfg["hardware"] in variant_compat_hw_map[vname]
+                )
+            ]
+            if not matched_variants:
+                raise ValidationError(
+                    f"{context}.presets.{pname}: matches no compatible variant in recipe"
+                )
 
     for loc, s in _walk_strings(recipe, context):
         findings = _scan_text(s, context=loc, allow_loopback=False)
         if findings:
             raise ValidationError("; ".join(findings))
+
+    if validate_expansions and ppu["framework"] == "vllm":
+        for vname, pname, target_hw in _iter_variant_preset_targets(
+            recipe, context=context
+        ):
+            _resolve_recipe_from_doc(
+                recipe,
+                recipe_label=context,
+                variant=vname,
+                hardware=target_hw,
+                preset=pname,
+                cache=None,
+            )
 
 
 def validate_dataset_structure(dataset: dict[str, Any], *, context: str) -> None:
@@ -1740,9 +2982,16 @@ def validate_policy_structure(
     )
     if policy["schema_version"] != POLICY_SCHEMA:
         raise ValidationError(f"{context}: schema_version must be {POLICY_SCHEMA!r}")
+    if policy["hardware"] not in SUPPORTED_HARDWARE:
+        raise ValidationError(
+            f"{context}.hardware invalid: {policy['hardware']!r}; "
+            f"expected one of {sorted(SUPPORTED_HARDWARE)}"
+        )
     if "tiers" not in policy and "stages" not in policy:
         raise ValidationError(f"{context}: policy must define 'tiers' or 'stages'")
 
+    if not isinstance(policy["model_id"], str) or not policy["model_id"].strip():
+        raise ValidationError(f"{context}.model_id must be non-empty string")
     if "variant" in policy and (
         not isinstance(policy["variant"], str) or not policy["variant"].strip()
     ):
@@ -1750,6 +2999,7 @@ def validate_policy_structure(
     policy_variant = policy.get("variant", "default")
 
     recipe_path: Path | None = None
+    rec_doc: dict[str, Any] | None = None
     if "recipe" in policy:
         rel = Path(policy["recipe"])
         recipe_path = rel if rel.is_absolute() else (base_dir / rel)
@@ -1758,10 +3008,37 @@ def validate_policy_structure(
                 f"{context}: referenced recipe not found: {policy['recipe']}"
             )
         rec_doc = _load_yaml(recipe_path)
+        recipe_model_blk = rec_doc.get("model")
+        recipe_model_id = (
+            recipe_model_blk.get("model_id")
+            if isinstance(recipe_model_blk, Mapping)
+            else None
+        )
+        if not isinstance(recipe_model_id, str) or not recipe_model_id.strip():
+            raise ValidationError(
+                f"{context}: referenced recipe {policy['recipe']} is missing model.model_id"
+            )
+        if policy["model_id"] != recipe_model_id:
+            raise ValidationError(
+                f"{context}: policy model_id {policy['model_id']!r} does not match "
+                f"recipe {policy['recipe']} model.model_id {recipe_model_id!r}"
+            )
         variants_blk = rec_doc.get("variants", {})
         if policy_variant not in variants_blk:
             raise ValidationError(
                 f"{context}: unknown variant {policy_variant!r} in {policy['recipe']}"
+            )
+        var_cfg = variants_blk[policy_variant]
+        _validate_hardware_precision(
+            hardware=policy["hardware"],
+            precision=var_cfg.get("precision"),
+            context=f"{context} ({policy['recipe']}#{policy_variant})",
+        )
+        var_explicit_hw = var_cfg.get("hardware")
+        if var_explicit_hw is not None and var_explicit_hw != policy["hardware"]:
+            raise ValidationError(
+                f"{context}: variant {policy_variant!r} in {policy['recipe']} targets hardware "
+                f"{var_explicit_hw!r}, incompatible with policy hardware {policy['hardware']!r}"
             )
 
     tiers = policy.get("tiers", {})
@@ -1845,6 +3122,15 @@ def validate_policy_structure(
                     raise ValidationError(
                         f"{stream_context}.enable_thinking must be boolean"
                     )
+            if recipe_path is not None:
+                resolve_recipe(
+                    recipe_path,
+                    variant=policy_variant,
+                    hardware=policy["hardware"],
+                    preset=fs.get("preset"),
+                    cache=fs.get("cache"),
+                    tier="fast_sanity",
+                )
         if "model_sanity" in tiers:
             ms = _check_keys(
                 tiers["model_sanity"],
@@ -1899,6 +3185,7 @@ def validate_policy_structure(
                         hardware=policy["hardware"],
                         preset=stage.get("preset"),
                         cache=stage.get("cache"),
+                        tier="model_sanity",
                     )
                     flags = resolved["flags"]
                 _validate_stage_cache_rules(
@@ -1941,6 +3228,11 @@ def validate_policy_structure(
             if missing_kinds:
                 raise ValidationError(
                     f"{context}.tiers.model_sanity: missing required stage kind(s): {', '.join(missing_kinds)}"
+                )
+            stage_presets = {stage.get("preset") for stage in ms["stages"]}
+            if len(stage_presets) > 1:
+                raise ValidationError(
+                    f"{context}.tiers.model_sanity: all shared-server stages must agree on preset, got {sorted(str(p) for p in stage_presets)}"
                 )
 
     for idx, stage in enumerate(policy.get("stages", [])):
@@ -2001,52 +3293,102 @@ def validate_flags_with_parser(
         parser.error = orig_error  # type: ignore[method-assign]
 
 
+def iter_recipe_catalog_entries(
+    recipe_path: Path,
+    recipe: dict[str, Any] | None = None,
+    *,
+    allow_internal_visibility: bool = False,
+) -> list[dict[str, Any]]:
+    """Expand every compatible ``variant x preset`` entry (including each variant baseline)."""
+    rdoc = recipe if recipe is not None else _load_yaml(recipe_path)
+    validate_serving_recipe_structure(
+        rdoc,
+        context=str(recipe_path),
+        allow_internal_visibility=allow_internal_visibility,
+        validate_expansions=False,
+    )
+    entries: list[dict[str, Any]] = []
+    for vname, pname, target_hw in _iter_variant_preset_targets(
+        rdoc, context=str(recipe_path)
+    ):
+        resolved = _resolve_recipe_from_doc(
+            rdoc,
+            recipe_label=str(recipe_path),
+            variant=vname,
+            hardware=target_hw,
+            preset=pname,
+            cache=None,
+        )
+        entries.append(
+            {
+                "recipe_path": recipe_path,
+                "variant": vname,
+                "preset": pname,
+                "hardware": target_hw,
+                "resolved": resolved,
+            }
+        )
+    return entries
+
+
 def _collect_all_recipe_flag_sets(
-    recipe_path: Path, recipe: dict[str, Any]
+    recipe_path: Path,
+    recipe: dict[str, Any],
+    *,
+    catalog_entries: Sequence[dict[str, Any]] | None = None,
 ) -> list[tuple[str, list[str]]]:
     sets: list[tuple[str, list[str]]] = []
-    default_res = resolve_recipe(recipe_path, cache="enabled")
-    sets.append((f"{recipe_path.name}:default", default_res["flags"]))
-    sets.append(
-        (
-            f"{recipe_path.name}:fast_sanity_2l",
-            resolve_recipe(
-                recipe_path, cache="enabled", dummy_weights=True, layer_override=2
-            )["flags"],
-        )
+    entries = (
+        list(catalog_entries)
+        if catalog_entries is not None
+        else iter_recipe_catalog_entries(recipe_path, recipe)
     )
+    for item in entries:
+        vname = item["variant"]
+        pname = item["preset"]
+        hw = item["hardware"]
+        label = (
+            f"{recipe_path.name}:{vname}:{hw}:baseline"
+            if pname is None
+            else f"{recipe_path.name}:{vname}:{hw}:{pname}"
+        )
+        sub_flags, _ = _validate_resolved_topology_and_placeholders(
+            item["resolved"], context=label
+        )
+        sets.append((label, sub_flags))
+        if (
+            pname is None
+            and vname == "default"
+            and item["resolved"]["topology"]["kind"] == "single_node"
+        ):
+            fs_res = _resolve_recipe_from_doc(
+                recipe,
+                recipe_label=str(recipe_path),
+                variant=vname,
+                hardware=hw,
+                cache="enabled",
+                dummy_weights=True,
+                layer_override=2,
+            )
+            fs_flags, _ = _validate_resolved_topology_and_placeholders(
+                fs_res, context=f"{recipe_path.name}:{hw}:fast_sanity_2l"
+            )
+            sets.append((f"{recipe_path.name}:{hw}:fast_sanity_2l", fs_flags))
+
     for feat_name, feat_cfg in recipe.get("features", {}).items():
         if "modes" in feat_cfg:
             for mode_name, mode_cfg in feat_cfg["modes"].items():
+                sub_f, _ = substitute_validation_placeholders(
+                    list(mode_cfg.get("args", [])), {}
+                )
                 sets.append(
-                    (
-                        f"{recipe_path.name}:feature:{feat_name}.{mode_name}",
-                        list(mode_cfg.get("args", [])),
-                    )
+                    (f"{recipe_path.name}:feature:{feat_name}.{mode_name}", sub_f)
                 )
         else:
-            sets.append(
-                (
-                    f"{recipe_path.name}:feature:{feat_name}",
-                    list(feat_cfg.get("args", [])),
-                )
+            sub_f, _ = substitute_validation_placeholders(
+                list(feat_cfg.get("args", [])), {}
             )
-    for var_name in recipe.get("variants", {}):
-        sets.append(
-            (
-                f"{recipe_path.name}:variant:{var_name}",
-                resolve_recipe(recipe_path, variant=var_name)["flags"],
-            )
-        )
-    for preset_name in recipe.get("presets", {}):
-        sets.append(
-            (
-                f"{recipe_path.name}:preset:{preset_name}",
-                resolve_recipe(recipe_path, preset=preset_name, cache="enabled")[
-                    "flags"
-                ],
-            )
-        )
+            sets.append((f"{recipe_path.name}:feature:{feat_name}", sub_f))
     return sets
 
 
@@ -2072,6 +3414,7 @@ def validate_paths(
                 doc,
                 context=str(path),
                 allow_internal_visibility=allow_internal_visibility,
+                validate_expansions=False,
             )
             recipe_items.append((path, doc))
         elif schema == DATASET_SCHEMA:
@@ -2081,6 +3424,19 @@ def validate_paths(
         else:
             raise ValidationError(f"{path}: unsupported schema_version {schema!r}")
         validated.append(str(path))
+
+    expanded_flag_sets: list[tuple[str, list[str]]] = []
+    checked_combinations = 0
+    for rpath, rdoc in recipe_items:
+        if rdoc["ppu"]["framework"] != "vllm":
+            continue
+        entries = iter_recipe_catalog_entries(
+            rpath, rdoc, allow_internal_visibility=allow_internal_visibility
+        )
+        checked_combinations += len(entries)
+        expanded_flag_sets.extend(
+            _collect_all_recipe_flag_sets(rpath, rdoc, catalog_entries=entries)
+        )
 
     parser_checked = False
     checked_flag_sets = 0
@@ -2096,18 +3452,16 @@ def validate_paths(
                     ) from exc
                 active_parser = None
         if active_parser is not None:
-            for rpath, rdoc in recipe_items:
-                if rdoc["ppu"]["framework"] != "vllm":
-                    continue
-                for label, flag_set in _collect_all_recipe_flag_sets(rpath, rdoc):
-                    validate_flags_with_parser(active_parser, flag_set, context=label)
-                    checked_flag_sets += 1
+            for label, flag_set in expanded_flag_sets:
+                validate_flags_with_parser(active_parser, flag_set, context=label)
+                checked_flag_sets += 1
             parser_checked = True
 
     return {
         "validated_files": validated,
         "parser_checked": parser_checked,
         "checked_flag_sets": checked_flag_sets,
+        "checked_combinations": checked_combinations,
     }
 
 
@@ -2238,17 +3592,62 @@ def _render_md_table(headers: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
+def _format_topology_summary(resolved: Mapping[str, Any]) -> str:
+    hw = _md_code(str(resolved["hardware"]))
+    cards = int(resolved["ppu_count"])
+    topo = resolved["topology"]
+    kind = str(topo["kind"])
+    if kind == "multi_node_ep":
+        return (
+            f"{hw} / {cards} / {_md_code(kind)} "
+            f"({topo['nodes']}x{topo['devices_per_node']})"
+        )
+    if kind == "pd_disagg":
+        role = topo.get("role")
+        if not role:
+            preset = resolved.get("preset")
+            role = (
+                "prefill"
+                if preset == "pd_prefill"
+                else ("decode" if preset == "pd_decode" else "disagg")
+            )
+        return f"{hw} / {cards} / {_md_code(kind)} ({role})"
+    return f"{hw} / {cards} / {_md_code(kind)}"
+
+
+def _format_catalog_gate_tiers(tiers: Sequence[str]) -> str:
+    if not tiers:
+        return f"{_md_code('static')} (catalog only)"
+    ordered = ["static", *[t for t in ("fast_sanity", "model_sanity") if t in tiers]]
+    return ", ".join(_md_code(t) for t in ordered)
+
+
 def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
-    """Render the PR and Nightly PPU CI recipe matrix Markdown document."""
+    """Render the PR, Nightly, and Catalog PPU CI recipe matrix Markdown document."""
     ci_dir = str(Path(__file__).resolve().parent)
     if ci_dir not in sys.path:
         sys.path.insert(0, ci_dir)
     select = importlib.import_module("ppu_e2e_select")
     doc_dir = base_dir if base_dir is not None else DEFAULT_MATRIX_DOC.parent
+    authoring_rel = Path(
+        os.path.relpath(
+            (REPO_ROOT / "tests" / "ppu" / "AUTHORING.md").resolve(),
+            doc_dir.resolve(),
+        )
+    ).as_posix()
+
+    gate_tiers_by_key: dict[tuple[str, str, str, str | None], set[str]] = {}
 
     fast_rows: list[list[str]] = []
     for entry, _replaces, resolved in select._recipe_entries("", "fast_sanity"):
         pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        gate_key = (
+            entry["recipe_path"],
+            resolved["variant"],
+            resolved["hardware"],
+            resolved["preset"],
+        )
+        gate_tiers_by_key.setdefault(gate_key, set()).add("fast_sanity")
         fast_rows.append(
             [
                 _md_link(entry["key"], entry["policy_path"], base_dir=doc_dir),
@@ -2268,6 +3667,13 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
     nightly_rows: list[list[str]] = []
     for entry, replaces, resolved in select._recipe_entries("", "model_sanity"):
         pol_doc = _load_yaml(REPO_ROOT / entry["policy_path"])
+        gate_key = (
+            entry["recipe_path"],
+            resolved["variant"],
+            resolved["hardware"],
+            resolved["preset"],
+        )
+        gate_tiers_by_key.setdefault(gate_key, set()).add("model_sanity")
         replaces_text = (
             ", ".join(_md_code(case_id) for case_id in replaces)
             if replaces
@@ -2289,6 +3695,48 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
                 _format_flags_and_env(resolved["flags"], resolved["server_env"]),
             ]
         )
+
+    catalog_rows: list[list[str]] = []
+    recipes_root = REPO_ROOT / "tests" / "ppu" / "recipes"
+    if recipes_root.is_dir():
+        recipe_files = sorted(
+            (p for p in recipes_root.rglob("*.yaml") if not p.name.startswith(".")),
+            key=lambda p: p.relative_to(REPO_ROOT).as_posix(),
+        )
+        for rec_path in recipe_files:
+            rec_doc = _load_yaml(rec_path)
+            if rec_doc.get("schema_version") != SERVING_SCHEMA:
+                continue
+            if rec_doc.get("ppu", {}).get("framework") != "vllm":
+                continue
+            rec_rel = rec_path.relative_to(REPO_ROOT).as_posix()
+            for item in iter_recipe_catalog_entries(rec_path, rec_doc):
+                resolved = item["resolved"]
+                preset_name = item["preset"]
+                gate_key = (
+                    rec_rel,
+                    item["variant"],
+                    item["hardware"],
+                    preset_name,
+                )
+                tiers = sorted(gate_tiers_by_key.get(gate_key, set()))
+                preset_cell = (
+                    _md_code(preset_name)
+                    if preset_name is not None
+                    else f"{_md_code('default')} (baseline)"
+                )
+                catalog_rows.append(
+                    [
+                        _md_link(rec_path.name, rec_rel, base_dir=doc_dir),
+                        f"{_md_code(item['variant'])} ({_md_code(resolved['precision'])})",
+                        preset_cell,
+                        _format_topology_summary(resolved),
+                        _format_catalog_gate_tiers(tiers),
+                        _format_flags_and_env(
+                            resolved["flags"], resolved["server_env"]
+                        ),
+                    ]
+                )
 
     catalog = json.loads(select.CATALOG.read_text(encoding="utf-8"))
     acc_entries = select.build_accuracy_matrix(catalog, "")["include"]
@@ -2320,12 +3768,13 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
         "",
         "This document is generated from `tests/ppu/recipes/`, `tests/ppu/policy/models/`,",
         "and `scripts/ci/ppu_e2e_models.json` using the same selector logic as GitHub Actions.",
+        f"For recipe/preset authoring rules, hardware-precision bindings, and CI gate admission criteria, see [AUTHORING.md]({authoring_rel}).",
         "",
         "## Configuration Resolution Rules",
         "",
         "- **Resolution order**: `model.base_args` -> `variants.<variant>` (default: `default`) -> `hardware_overrides.<hardware>` -> `ppu.default_features` -> optional `presets.<preset>` -> policy runtime switches (`--enable-prefix-caching`, `--load-format dummy`, `--hf-overrides`).",
         "- **Auto layer override in `fast_sanity`**: When `layer_override: auto` (default), the runner inspects local checkpoint metadata (`config.json` and safetensors headers) to select the minimal prefix covering every distinct layer archetype (`2..8` layers), or runs full layers when prefix coverage exceeds the cap or the architecture is segmented.",
-        "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `dp_ep_low_latency`) are not applied unless explicitly selected by a policy or `--preset`.",
+        "- **Default preset behavior**: When a policy does not specify `preset`, CI runs the recipe's default baseline configuration. Named presets (such as `decode`, `decode_ep`, `dp_ep_low_latency`, or `pd_prefill`/`pd_decode`) are not applied unless explicitly selected by a policy or `--preset`.",
         "- **Shared server in `model_sanity`**: All stages in `model_sanity` run against one server process; when a `bench` stage is present, the runner injects `VLLM_SERVER_DEV_MODE=1` into the server process environment for cache resets between concurrency points.",
         "- **Regenerate / verify**:",
         "  ```bash",
@@ -2369,6 +3818,35 @@ def render_ci_matrix_markdown(*, base_dir: Path | None = None) -> str:
                     "Effective serve flags",
                 ],
                 nightly_rows,
+            )
+        )
+    else:
+        lines.append("_None._")
+
+    lines.extend(
+        [
+            "",
+            "## Registered Serving Presets (Benchmark & Disagg Catalog)",
+            "",
+            "Every compatible `variant x preset` expansion below is statically validated by",
+            "`ppu_recipe.py validate --all` (and real `vllm serve` argparse in PPU pin-UT with",
+            "topology placeholders substituted). Policy-injected switches such as prefix caching",
+            "and dummy weights are intentionally omitted from serving recipes.",
+            "",
+        ]
+    )
+    if catalog_rows:
+        lines.extend(
+            _render_md_table(
+                [
+                    "Recipe",
+                    "Variant (Precision)",
+                    "Preset",
+                    "Hardware / Cards / Topology",
+                    "Gate Tier",
+                    "Effective `vllm serve` args",
+                ],
+                catalog_rows,
             )
         )
     else:
@@ -2425,7 +3903,7 @@ def main(argv: list[str] | None = None) -> int:
     res.add_argument("--policy", type=Path, default=None)
     res.add_argument("--tier", choices=["fast_sanity", "model_sanity"], default=None)
     res.add_argument("--variant", default=None)
-    res.add_argument("--hardware", default="zhenwu_m890")
+    res.add_argument("--hardware", default=None)
     res.add_argument("--preset", default=None)
     res.add_argument("--cache", choices=["enabled", "disabled"], default=None)
     res.add_argument("--dummy-weights", action="store_true")

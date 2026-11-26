@@ -37,6 +37,42 @@ ppu_recipe_runner = _load_module("ppu_recipe_runner", CI_DIR / "ppu_recipe_runne
 ppu_e2e_select = _load_module("ppu_e2e_select", CI_DIR / "ppu_e2e_select.py")
 
 
+def _parse_sample_kv_transfer_config(raw: str) -> dict:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid json: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("kv-transfer-config must be a JSON object")
+    allowed = {
+        "kv_connector",
+        "engine_id",
+        "kv_buffer_device",
+        "kv_role",
+        "kv_port",
+        "kv_connector_extra_config",
+        "kv_connector_module_path",
+        "enable_permute_local_kv",
+        "kv_load_failure_policy",
+    }
+    extra = sorted(set(parsed) - allowed)
+    if extra:
+        raise argparse.ArgumentTypeError(
+            f"unexpected KVTransferConfig fields: {', '.join(extra)}"
+        )
+    if "kv_port" in parsed and type(parsed["kv_port"]) is not int:
+        raise argparse.ArgumentTypeError(
+            f"kv_port must be int, got {type(parsed['kv_port']).__name__}"
+        )
+    if parsed.get("kv_role") not in {None, "kv_producer", "kv_consumer", "kv_both"}:
+        raise argparse.ArgumentTypeError(f"invalid kv_role: {parsed.get('kv_role')!r}")
+    if "kv_connector_extra_config" in parsed and not isinstance(
+        parsed["kv_connector_extra_config"], dict
+    ):
+        raise argparse.ArgumentTypeError("kv_connector_extra_config must be dict")
+    return parsed
+
+
 def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vllm serve")
     parser.add_argument("model_tag")
@@ -45,9 +81,30 @@ def _sample_vllm_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int)
+    parser.add_argument("--pipeline-parallel-size", type=int)
+    parser.add_argument("--prefill-context-parallel-size", type=int)
     parser.add_argument("--data-parallel-size", type=int)
-    parser.add_argument("--enable-expert-parallel", action="store_true")
+    parser.add_argument("--data-parallel-size-local", type=int)
+    parser.add_argument("--data-parallel-rank", type=int)
+    parser.add_argument("--data-parallel-backend", default="mp")
+    parser.add_argument("--distributed-executor-backend")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--data-parallel-external-lb", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--data-parallel-hybrid-lb", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument(
+        "--enable-expert-parallel", action=argparse.BooleanOptionalAction
+    )
+    parser.add_argument("--disable-expert-parallel", action="store_true")
     parser.add_argument("--all2all-backend")
+    parser.add_argument("--nnodes", type=int)
+    parser.add_argument("--node-rank", type=int)
+    parser.add_argument("--master-addr")
+    parser.add_argument("--master-port", type=int)
+    parser.add_argument("--kv-transfer-config", type=_parse_sample_kv_transfer_config)
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--max-model-len")
     parser.add_argument("--max-num-batched-tokens", type=int)
@@ -82,9 +139,9 @@ def _yaml_files() -> list[Path]:
 def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
     files = _yaml_files()
     assert files
-    assert len(
-        ppu_recipe.validate_paths(files, vllm_parser_mode="skip")["validated_files"]
-    ) == len(files)
+    full_report = ppu_recipe.validate_paths(files, vllm_parser_mode="skip")
+    assert len(full_report["validated_files"]) == len(files)
+    assert full_report["checked_combinations"] >= 35
     # The CPU stub covers the pilot flags. The runtime parser validates new recipes.
     report = ppu_recipe.validate_paths(
         [
@@ -96,7 +153,8 @@ def test_checked_in_recipes_and_policies_validate_cleanly() -> None:
         parser=_sample_vllm_parser(),
     )
     assert report["parser_checked"] is True
-    assert report["checked_flag_sets"] >= 10
+    assert report["checked_combinations"] >= 18
+    assert report["checked_flag_sets"] >= 20
 
 
 def test_glm53_flash_matches_legacy_tp2_and_default_fast_sanity() -> None:
@@ -130,16 +188,15 @@ def test_glm53_flash_matches_legacy_tp2_and_default_fast_sanity() -> None:
 def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     recipe = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
     policy = POLICY_DIR / "models" / "glm-5.3.yaml"
-    catalog = {
-        entry["key"]: entry
-        for entry in json.loads((CI_DIR / "ppu_e2e_models.json").read_text())
-    }
-    cat_flags = catalog["glm-5.3-mxfp4-tp4"]["server_cmd"][9:]
+    decode_policy = POLICY_DIR / "models" / "glm-5.3-decode.yaml"
 
     resolved_ms = ppu_recipe.resolve_recipe(
         recipe, policy_path=policy, tier="model_sanity"
     )
     assert resolved_ms["ppu_count"] == 4
+    assert resolved_ms["preset"] == "prefill"
+    assert resolved_ms["hardware"] == "zhenwu_m890"
+    assert resolved_ms["precision"] == "mxfp4"
     assert resolved_ms["runtime_env"] == {"VLLM_SERVER_DEV_MODE": "1"}
     assert resolved_ms["flags"][:-1] == [
         "--trust-remote-code",
@@ -147,6 +204,8 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
         "4",
         "--max-model-len",
         "16384",
+        "--gpu-memory-utilization",
+        "0.9",
         "--distributed-timeout-seconds",
         "3600",
         "--cpu-distributed-timeout-seconds",
@@ -155,14 +214,15 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
         "--tool-call-parser",
         "glm47",
         "--reasoning-parser",
-        "glm45",
+        "glm47",
     ]
     assert resolved_ms["flags"][-1] == "--enable-prefix-caching"
-    assert set(cat_flags) <= set(resolved_ms["flags"])
+    assert "--speculative-config" not in resolved_ms["flags"]
 
     resolved_fs = ppu_recipe.resolve_recipe(
         recipe, policy_path=policy, tier="fast_sanity"
     )
+    assert resolved_fs["preset"] == "prefill"
     assert "--load-format" in resolved_fs["flags"]
     assert "dummy" in resolved_fs["flags"]
     assert resolved_fs["layer_override"] == "auto"
@@ -182,11 +242,86 @@ def test_resolve_glm53_matches_catalog_and_supports_presets() -> None:
     assert resolved_fs_full["config_digest"] != resolved_fs["config_digest"]
     assert resolved_fs_full["config_digest"] != resolved_fs_7l["config_digest"]
 
-    resolved_tp8 = ppu_recipe.resolve_recipe(recipe, preset="tp8", cache="enabled")
-    assert resolved_tp8["ppu_count"] == 8
-    assert "--tensor-parallel-size" in resolved_tp8["flags"]
-    idx_tp = resolved_tp8["flags"].index("--tensor-parallel-size")
-    assert resolved_tp8["flags"][idx_tp + 1] == "8"
+    # Single-node TP8 decode with MTP
+    resolved_decode = ppu_recipe.resolve_recipe(
+        recipe, policy_path=decode_policy, tier="fast_sanity"
+    )
+    assert resolved_decode["ppu_count"] == 8
+    assert resolved_decode["preset"] == "decode"
+    assert resolved_decode["enabled_features"] == [
+        "tool_calling",
+        "reasoning",
+        "spec_decoding",
+    ]
+    idx_tp = resolved_decode["flags"].index("--tensor-parallel-size")
+    assert resolved_decode["flags"][idx_tp + 1] == "8"
+    idx_spec = resolved_decode["flags"].index("--speculative-config")
+    assert json.loads(resolved_decode["flags"][idx_spec + 1]) == {
+        "method": "mtp",
+        "num_speculative_tokens": 2,
+    }
+
+    # Multi-node 4x8 DP32+EP decode_ep preset
+    resolved_ep = ppu_recipe.resolve_recipe(recipe, preset="decode_ep")
+    assert resolved_ep["ppu_count"] == 32
+    assert resolved_ep["topology"] == {
+        "kind": "multi_node_ep",
+        "nodes": 4,
+        "devices_per_node": 8,
+    }
+    assert "--tensor-parallel-size" not in resolved_ep["flags"]
+    assert "--enable-expert-parallel" in resolved_ep["flags"]
+    assert "{master_addr}" in resolved_ep["flags"]
+    assert "{node_rank}" in resolved_ep["flags"]
+    assert resolved_ep["server_env"]["HGGC_EMBEDDED_COPY_THRESHOLD"] == "0x10000"
+
+    # Paired Mooncake PD disagg presets (wired to actual pinned MooncakeConnector runtime settings)
+    for slot, expected_role, expected_kv_role in (
+        ("pd_prefill", "prefill", "kv_producer"),
+        ("pd_decode", "decode", "kv_consumer"),
+    ):
+        res_pd = ppu_recipe.resolve_recipe(recipe, preset=slot)
+        assert res_pd["ppu_count"] == 8
+        assert res_pd["topology"]["kind"] == "pd_disagg"
+        assert res_pd["topology"]["role"] == expected_role
+        kv_idx = res_pd["flags"].index("--kv-transfer-config")
+        kv_cfg = json.loads(res_pd["flags"][kv_idx + 1])
+        assert kv_cfg["kv_connector"] == "MooncakeConnector"
+        assert kv_cfg["kv_role"] == expected_kv_role
+        assert "kv_port" not in kv_cfg
+        assert "kv_ip" not in kv_cfg["kv_connector_extra_config"]
+        assert kv_cfg["kv_connector_extra_config"]["device_name"] == "{ib_devices}"
+        assert res_pd["server_env"]["VLLM_HOST_IP"] == "{kv_ip}"
+        if expected_role == "prefill":
+            assert res_pd["server_env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "{kv_port}"
+        else:
+            assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" not in res_pd["server_env"]
+
+    # Multi-variant asset and hardware overrides (fp8_channel on 890P, w8a8_int8 on 810E)
+    resolved_fp8 = ppu_recipe.resolve_recipe(
+        recipe, variant="fp8_channel", preset="prefill"
+    )
+    assert resolved_fp8["hardware"] == "zhenwu_m890"
+    assert resolved_fp8["precision"] == "fp8"
+    assert resolved_fp8["ppu_count"] == 8
+    assert (
+        resolved_fp8["hf_model_id"]
+        == "T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel"
+    )
+    assert resolved_fp8["served_name"] == "glm-5.3-fp8-channel"
+
+    resolved_int8 = ppu_recipe.resolve_recipe(
+        recipe, variant="w8a8_int8", preset="prefill"
+    )
+    assert resolved_int8["hardware"] == "zhenwu_810e"
+    assert resolved_int8["precision"] == "w8a8_int8"
+    assert resolved_int8["ppu_count"] == 16
+    assert (
+        resolved_int8["hf_model_id"]
+        == "T-HEAD/GLM-5.3-Quant-W-INT8-PerChannel-A-INT8-PerToken"
+    )
+    idx_mem = resolved_int8["flags"].index("--gpu-memory-utilization")
+    assert resolved_int8["flags"][idx_mem + 1] == "0.95"
 
 
 def test_resolve_dsv4_matches_catalog_and_dpep_preset() -> None:
@@ -1717,17 +1852,49 @@ def test_resolve_recipe_reports_enabled_features() -> None:
 def test_checked_in_recipe_matrix_doc_is_up_to_date() -> None:
     expected = ppu_recipe.render_ci_matrix_markdown()
     assert ppu_recipe.DEFAULT_MATRIX_DOC.is_file()
+    assert ppu_recipe.DEFAULT_AUTHORING_DOC.is_file()
     actual = ppu_recipe.DEFAULT_MATRIX_DOC.read_text(encoding="utf-8")
+    authoring = ppu_recipe.DEFAULT_AUTHORING_DOC.read_text(encoding="utf-8")
     assert actual == expected, (
         "tests/ppu/README.md is out of date; regenerate with: "
         "python3 scripts/ci/ppu_recipe.py render-matrix --output tests/ppu/README.md"
     )
     assert ppu_recipe._scan_text(actual, context="tests/ppu/README.md") == []
+    assert (
+        ppu_recipe._scan_text(
+            authoring, context="tests/ppu/AUTHORING.md", allow_loopback=True
+        )
+        == []
+    )
+    assert "[AUTHORING.md](AUTHORING.md)" in actual
     assert "## PR CI (`fast_sanity`)" in actual
     assert "## Nightly CI — Recipe (`model_sanity`)" in actual
+    assert "## Registered Serving Presets (Benchmark & Disagg Catalog)" in actual
     assert "## Nightly CI — Remaining Legacy Accuracy Cases" in actual
     assert "`default` (none)" in actual
     assert "`tool_calling`, `reasoning`" in actual
+    fast_section = actual.split("## PR CI (`fast_sanity`)", 1)[1].split(
+        "## Nightly CI — Recipe (`model_sanity`)", 1
+    )[0]
+    nightly_section = actual.split("## Nightly CI — Recipe (`model_sanity`)", 1)[
+        1
+    ].split("## Registered Serving Presets (Benchmark & Disagg Catalog)", 1)[0]
+    catalog_section = actual.split(
+        "## Registered Serving Presets (Benchmark & Disagg Catalog)", 1
+    )[1].split("## Nightly CI — Remaining Legacy Accuracy Cases", 1)[0]
+    assert "`glm-5.3-decode`" in fast_section
+    assert "`glm-5.3-decode`" not in nightly_section
+    for token in (
+        "`fp8_channel`",
+        "`w8a8_int8`",
+        "`decode_ep`",
+        "`pd_prefill`",
+        "`pd_decode`",
+        "`multi_node_ep` (4x8)",
+        "`pd_disagg` (prefill)",
+        "`pd_disagg` (decode)",
+    ):
+        assert token in catalog_section
     legacy_section = actual.split("## Nightly CI — Remaining Legacy Accuracy Cases", 1)[
         1
     ]
@@ -2655,3 +2822,1701 @@ def test_short_layer_dummy_empty_stream_content_falls_back_to_full_layers(
             ppu_recipe_diagnostics.failure_reason(priv_dir, "fast_sanity")
             == expected_diag
         )
+
+
+def test_hardware_precision_binding_contract(tmp_path: Path) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+    glm_pol = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
+
+    # 1. Valid M890 (bf16/mxfp4/fp4/fp8) and 810E (bf16/int8/w8a8_int8/w4a8_int8) controls
+    for hw, prec in (
+        ("zhenwu_m890", "bf16"),
+        ("zhenwu_m890", "mxfp4"),
+        ("zhenwu_m890", "mxfp4_fp8"),
+        ("zhenwu_m890", "fp4"),
+        ("zhenwu_m890", "fp8"),
+        ("zhenwu_m890", "fp8_channel"),
+        ("zhenwu_810e", "bf16"),
+        ("zhenwu_810e", "int8"),
+        ("zhenwu_810e", "w8a8_int8"),
+        ("zhenwu_810e", "w4a8_int8"),
+    ):
+        ppu_recipe._validate_hardware_precision(
+            hardware=hw, precision=prec, context="control"
+        )
+
+    # 2. Cross-binding & unsupported precision counterexamples rejected on recipe variants
+    for hw, bad_prec, match in (
+        ("zhenwu_m890", "w8a8_int8", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_m890", "int8", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_m890", "fp16", "only allows bf16 or mxfp4/fp4/fp8"),
+        ("zhenwu_810e", "mxfp4", "only allows bf16 or int8 precision"),
+        ("zhenwu_810e", "fp8", "only allows bf16 or int8 precision"),
+        ("zhenwu_810e", "fp16", "only allows bf16 or int8 precision"),
+    ):
+        bad = copy.deepcopy(glm_doc)
+        bad["variants"]["default"]["hardware"] = hw
+        bad["variants"]["default"]["precision"] = bad_prec
+        with pytest.raises(ppu_recipe.ValidationError, match=match):
+            ppu_recipe.validate_serving_recipe_structure(bad, context="bad_hw_prec")
+
+    # 3. Policy cross-binding rejected (810E policy pointing at MXFP4 variant, or M890 at w8a8_int8)
+    bad_pol_810e = copy.deepcopy(glm_pol)
+    bad_pol_810e["hardware"] = "zhenwu_810e"
+    with pytest.raises(ppu_recipe.ValidationError, match="only allows bf16 or int8"):
+        ppu_recipe.validate_policy_structure(bad_pol_810e, context="bad_pol_810e")
+
+    bad_pol_m890 = copy.deepcopy(glm_pol)
+    bad_pol_m890["variant"] = "w8a8_int8"
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="only allows bf16 or mxfp4/fp4/fp8"
+    ):
+        ppu_recipe.validate_policy_structure(bad_pol_m890, context="bad_pol_m890")
+
+    # 4. Cross-hardware preset resolution fails closed
+    with pytest.raises(ppu_recipe.ValidationError, match="incompatible with"):
+        ppu_recipe.resolve_recipe(
+            RECIPES_DIR / "zai-org" / "GLM-5.3.yaml",
+            variant="w8a8_int8",
+            preset="decode",
+        )
+
+    # 5. BF16 is allowed across hardware with presets, sibling quantized variants, and model_sanity
+    ppu_recipe.validate_serving_recipe_structure(qwen_doc, context="qwen_control")
+    qwen_with_preset = copy.deepcopy(qwen_doc)
+    qwen_with_preset["presets"] = {
+        "prefill": {"hardware": "zhenwu_m890", "args": []},
+        "decode": {"hardware": "zhenwu_810e", "args": []},
+    }
+    ppu_recipe.validate_serving_recipe_structure(
+        qwen_with_preset, context="qwen_preset"
+    )
+
+    qwen_two_vars = copy.deepcopy(qwen_doc)
+    qwen_two_vars["variants"]["fp8"] = {"precision": "fp8"}
+    ppu_recipe.validate_serving_recipe_structure(qwen_two_vars, context="qwen_two_vars")
+
+    qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
+    qwen_pol_ms = copy.deepcopy(qwen_pol)
+    qwen_pol_ms["tiers"]["model_sanity"] = copy.deepcopy(
+        glm_pol["tiers"]["model_sanity"]
+    )
+    for stage in qwen_pol_ms["tiers"]["model_sanity"]["stages"]:
+        stage.pop("preset", None)
+    ppu_recipe.validate_policy_structure(qwen_pol_ms, context="qwen_ms")
+
+    # 6. Unknown hardware rejected on recipe and policy
+    bad_hw_recipe = copy.deepcopy(glm_doc)
+    bad_hw_recipe["variants"]["default"]["hardware"] = "unknown_chip"
+    with pytest.raises(ppu_recipe.ValidationError, match=r"hardware invalid"):
+        ppu_recipe.validate_serving_recipe_structure(bad_hw_recipe, context="bad_hw")
+
+    bad_hw_pol = copy.deepcopy(glm_pol)
+    bad_hw_pol["hardware"] = "unknown_chip"
+    with pytest.raises(ppu_recipe.ValidationError, match=r"hardware invalid"):
+        ppu_recipe.validate_policy_structure(bad_hw_pol, context="bad_hw_pol")
+
+    # 7. Orphan preset matching no variant rejected
+    orphan = copy.deepcopy(glm_doc)
+    orphan["variants"] = {"w8a8_int8": copy.deepcopy(glm_doc["variants"]["w8a8_int8"])}
+    orphan["presets"] = {"decode": copy.deepcopy(glm_doc["presets"]["decode"])}
+    with pytest.raises(ppu_recipe.ValidationError, match="matches no compatible"):
+        ppu_recipe.validate_serving_recipe_structure(orphan, context="orphan_preset")
+
+    # Verify temp file round-trip for a clean 810E-only recipe control
+    only_810e = copy.deepcopy(glm_doc)
+    only_810e["variants"] = {"default": copy.deepcopy(glm_doc["variants"]["w8a8_int8"])}
+    only_810e["presets"] = {"prefill": {"args": []}}
+    rec_file = tmp_path / "only_810e.yaml"
+    rec_file.write_text(yaml.safe_dump(only_810e), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [rec_file], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["checked_combinations"] == 2
+    assert report["parser_checked"] is True
+
+
+@pytest.mark.parametrize(
+    ("mutator", "match"),
+    [
+        (
+            lambda d: d["model"]["base_args"].append("--enable-prefix-caching"),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].append("--no-enable-prefix-caching"),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].append("--disable-radix-cache"),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(["--load-format", "dummy"]),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(["--model-path", "foo"]),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(["--host", "0.0.0.0"]),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(["--port", "12345"]),
+            "must not be hardcoded in recipe",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(["--gpu-memory-utilization", "0"]),
+            r"must be in \(0\.0, 1\.0\]",
+        ),
+        (
+            lambda d: d["model"]["base_args"].extend(
+                ["--gpu-memory-utilization", "1.2"]
+            ),
+            r"must be in \(0\.0, 1\.0\]",
+        ),
+        (
+            lambda d: d["model"]["base_env"].update({"VLLM_USE_MODELSCOPE": "True"}),
+            "runtime-mode env",
+        ),
+        (
+            lambda d: d["presets"]["pd_prefill"].update(
+                {"args": ["--kv-transfer-config", '{"device":"mlx5_bond_0"}']}
+            ),
+            "nic_device",
+        ),
+    ],
+)
+def test_recipe_boundary_and_sanitization_guardrails(mutator, match: str) -> None:
+    doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+    mutator(doc)
+    with pytest.raises(ppu_recipe.ValidationError, match=match):
+        ppu_recipe.validate_serving_recipe_structure(doc, context="boundary_check")
+
+
+def test_topology_placeholder_validation_and_substitution(tmp_path: Path) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    # 1. Placeholder substitution wires real Mooncake env/extra_config and parses cleanly
+    res_pd = ppu_recipe.resolve_recipe(
+        RECIPES_DIR / "zai-org" / "GLM-5.3.yaml", preset="pd_prefill"
+    )
+    sub_flags, sub_env = ppu_recipe.substitute_validation_placeholders(
+        res_pd["flags"], res_pd["server_env"]
+    )
+    kv_idx = sub_flags.index("--kv-transfer-config")
+    kv_obj = json.loads(sub_flags[kv_idx + 1])
+    assert "kv_port" not in kv_obj
+    assert "kv_ip" not in kv_obj["kv_connector_extra_config"]
+    assert kv_obj["kv_connector_extra_config"]["device_name"] == "rdma0"
+    assert sub_env["VLLM_HOST_IP"] == "127.0.0.1"
+    assert sub_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "8998"
+    assert sub_env["MOONCAKE_PROTOCOL"] == "rdma"
+    ppu_recipe.validate_flags_with_parser(
+        _sample_vllm_parser(), sub_flags, context="pd_prefill_sub"
+    )
+
+    def _validate_doc(doc: dict, name: str) -> None:
+        path = tmp_path / f"{name}.yaml"
+        path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+        ppu_recipe.validate_paths(
+            [path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+
+    # 2. single_node forbids placeholders and nodes > 1
+    bad_single_ph = copy.deepcopy(glm_doc)
+    bad_single_ph["presets"]["prefill"]["args"] = ["--master-addr", "{master_addr}"]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="single_node topology must not contain"
+    ):
+        _validate_doc(bad_single_ph, "single_ph")
+
+    bad_single_nodes = copy.deepcopy(glm_doc)
+    bad_single_nodes["presets"]["decode"]["topology"]["nodes"] = 2
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="single_node topology requires nodes=1"
+    ):
+        _validate_doc(bad_single_nodes, "single_nodes")
+
+    # 3. multi_node_ep requires nodes >= 2, {master_addr}, {node_rank}, and matching --nnodes
+    bad_ep_nodes = copy.deepcopy(glm_doc)
+    bad_ep_nodes["presets"]["decode_ep"]["topology"]["nodes"] = 1
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="multi_node_ep topology requires nodes >= 2"
+    ):
+        _validate_doc(bad_ep_nodes, "ep_nodes")
+
+    bad_ep_missing_ph = copy.deepcopy(glm_doc)
+    bad_ep_missing_ph["presets"]["decode_ep"]["args"] = [
+        tok
+        for tok in bad_ep_missing_ph["presets"]["decode_ep"]["args"]
+        if tok not in {"--master-addr", "{master_addr}"}
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="missing required placeholder"
+    ):
+        _validate_doc(bad_ep_missing_ph, "ep_missing_ph")
+
+    bad_ep_nnodes_mismatch = copy.deepcopy(glm_doc)
+    ep_args = bad_ep_nnodes_mismatch["presets"]["decode_ep"]["args"]
+    ep_args[ep_args.index("--nnodes") + 1] = "2"
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="--nnodes .* must match topology.nodes"
+    ):
+        _validate_doc(bad_ep_nnodes_mismatch, "ep_nnodes_mismatch")
+
+    bad_ep_no_nnodes = copy.deepcopy(glm_doc)
+    ep_args2 = bad_ep_no_nnodes["presets"]["decode_ep"]["args"]
+    idx_n = ep_args2.index("--nnodes")
+    del ep_args2[idx_n : idx_n + 2]
+    with pytest.raises(ppu_recipe.ValidationError, match="requires --nnodes"):
+        _validate_doc(bad_ep_no_nnodes, "ep_no_nnodes")
+
+    # 4. pd_disagg requires paired pd_prefill + pd_decode, placeholders, and matching kv_role
+    unpaired_pd = copy.deepcopy(glm_doc)
+    del unpaired_pd["presets"]["pd_decode"]
+    with pytest.raises(ppu_recipe.ValidationError, match="must be declared as a pair"):
+        _validate_doc(unpaired_pd, "unpaired_pd")
+
+    wrong_role_pd = copy.deepcopy(glm_doc)
+    p_args = wrong_role_pd["presets"]["pd_prefill"]["args"]
+    p_args[p_args.index("--kv-transfer-config") + 1] = p_args[
+        p_args.index("--kv-transfer-config") + 1
+    ].replace("kv_producer", "kv_consumer")
+    with pytest.raises(ppu_recipe.ValidationError, match="requires kv_role="):
+        _validate_doc(wrong_role_pd, "wrong_role_pd")
+
+    missing_ib_pd = copy.deepcopy(glm_doc)
+    p_args2 = missing_ib_pd["presets"]["pd_prefill"]["args"]
+    p_args2[p_args2.index("--kv-transfer-config") + 1] = p_args2[
+        p_args2.index("--kv-transfer-config") + 1
+    ].replace("{ib_devices}", "rdma0")
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="missing required placeholder.*ib_devices"
+    ):
+        _validate_doc(missing_ib_pd, "missing_ib_pd")
+
+    # 5. Unknown placeholder rejected in flags, env, and json_args
+    unknown_ph_flag = copy.deepcopy(glm_doc)
+    unknown_ph_flag["presets"]["decode_ep"]["args"].extend(
+        ["--master-port", "{bogus_port}"]
+    )
+    with pytest.raises(ppu_recipe.ValidationError, match="unknown placeholder"):
+        _validate_doc(unknown_ph_flag, "unknown_ph_flag")
+
+    unknown_ph_json = copy.deepcopy(glm_doc)
+    unknown_ph_json["presets"]["decode"]["json_args"] = {
+        "--compilation-config": {"mode": "{bad_mode}"}
+    }
+    with pytest.raises(ppu_recipe.ValidationError, match="unknown placeholder"):
+        _validate_doc(unknown_ph_json, "unknown_ph_json")
+
+
+def test_single_node_selector_skips_multinode_pd_and_810e_policies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Checked-in repo matrix: GLM-5.3 has prefill (TP4) + decode (TP8) in fast_sanity,
+    # and only prefill (TP4) in model_sanity; catalog-only fp8_channel / w8a8_int8 are absent.
+    fast_checked = ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    fast_by_key = {item["key"]: item for item in fast_checked}
+    assert fast_by_key["glm-5.3"]["ppu_count"] == 4
+    assert fast_by_key["glm-5.3"]["preset"] == "prefill"
+    assert fast_by_key["glm-5.3-decode"]["ppu_count"] == 8
+    assert fast_by_key["glm-5.3-decode"]["preset"] == "decode"
+
+    nightly_checked = ppu_e2e_select.build_recipe_matrix("", "model_sanity")["include"]
+    nightly_by_key = {item["key"]: item for item in nightly_checked}
+    assert nightly_by_key["glm-5.3"]["preset"] == "prefill"
+    assert "glm-5.3-decode" not in nightly_by_key
+
+    # Synthetic multi-node, PD disagg, and 810E policies in an isolated tree
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    policy_dir = tmp_path / "tests/ppu/policy/models"
+    base_fs = yaml.safe_load((policy_dir / "glm-5.3-decode.yaml").read_text())
+
+    ep_pol = copy.deepcopy(base_fs)
+    ep_pol["tiers"]["fast_sanity"]["preset"] = "decode_ep"
+    (policy_dir / "glm-5.3-decode-ep.yaml").write_text(yaml.safe_dump(ep_pol))
+
+    pd_pol = copy.deepcopy(base_fs)
+    pd_pol["tiers"]["fast_sanity"]["preset"] = "pd_prefill"
+    (policy_dir / "glm-5.3-pd-prefill.yaml").write_text(yaml.safe_dump(pd_pol))
+
+    e810_pol = copy.deepcopy(base_fs)
+    e810_pol["variant"] = "w8a8_int8"
+    e810_pol["hardware"] = "zhenwu_810e"
+    e810_pol["tiers"]["fast_sanity"]["preset"] = "prefill"
+    (policy_dir / "glm-5.3-810e.yaml").write_text(yaml.safe_dump(e810_pol))
+
+    selected_keys = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert {"glm-5.3", "glm-5.3-decode"} <= selected_keys
+    assert "glm-5.3-decode-ep" not in selected_keys
+    assert "glm-5.3-pd-prefill" not in selected_keys
+    assert "glm-5.3-810e" not in selected_keys
+
+    # Explicitly requesting non-single-node or wrong-hardware policy fails fast
+    with pytest.raises(ValueError, match="not runnable on single-node CI"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode-ep", "fast_sanity")
+    with pytest.raises(ValueError, match="not runnable on single-node CI"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-pd-prefill", "fast_sanity")
+    with pytest.raises(ValueError, match="not runnable on single-node 'zhenwu_m890'"):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-810e", "fast_sanity")
+
+    # Positive control: selecting with hardware='zhenwu_810e' returns the 810E policy
+    selected_810e = ppu_e2e_select.build_recipe_matrix(
+        "", "fast_sanity", hardware="zhenwu_810e"
+    )["include"]
+    assert [item["key"] for item in selected_810e] == ["glm-5.3-810e"]
+    assert selected_810e[0]["ppu_count"] == 16
+
+
+def test_model_sanity_rejects_mismatched_stage_presets() -> None:
+    pol = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    pol["tiers"]["model_sanity"]["stages"][1]["preset"] = "decode"
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="all shared-server stages must agree on preset",
+    ):
+        ppu_recipe.validate_policy_structure(pol, context="mismatched_stage_preset")
+
+
+def test_bf16_supported_across_hardware_and_respects_hardware_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    qwen_doc = yaml.safe_load((RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml").read_text())
+    qwen_pol = yaml.safe_load((POLICY_DIR / "models" / "qwen3.8-27b.yaml").read_text())
+
+    # 1a. Checked-in Qwen3.8-27B (unpinned BF16 without hardware_overrides) enumerates
+    #     both zhenwu_m890 and zhenwu_810e in catalog and parser validation; unpinned
+    #     presets also expand both chips without needing hardware_overrides.
+    qwen_entries = ppu_recipe.iter_recipe_catalog_entries(
+        RECIPES_DIR / "Qwen" / "Qwen3.8-27B.yaml", qwen_doc
+    )
+    assert [(e["variant"], e["preset"], e["hardware"]) for e in qwen_entries] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+    ]
+    no_override_bf16 = copy.deepcopy(qwen_doc)
+    no_override_bf16["presets"] = {
+        "prefill": {"args": ["--max-num-batched-tokens", "8192"]},
+        "decode": {
+            "hardware": "zhenwu_810e",
+            "args": ["--max-num-batched-tokens", "2048"],
+        },
+    }
+    no_override_path = tmp_path / "no_override_bf16.yaml"
+    no_override_path.write_text(
+        yaml.safe_dump(no_override_bf16, sort_keys=False), encoding="utf-8"
+    )
+    no_ov_report = ppu_recipe.validate_paths(
+        [no_override_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert no_ov_report["checked_combinations"] == 5
+    assert [
+        (e["variant"], e["preset"], e["hardware"])
+        for e in ppu_recipe.iter_recipe_catalog_entries(no_override_path)
+    ] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+        ("default", "prefill", "zhenwu_m890"),
+        ("default", "prefill", "zhenwu_810e"),
+        ("default", "decode", "zhenwu_810e"),
+    ]
+
+    # 1b. Portable BF16 recipe with M890 and 810E presets + hardware_overrides passes
+    #     structure validation, parser checks, catalog expansion, and hardware-aware policies.
+    small_bf16 = copy.deepcopy(qwen_doc)
+    small_bf16["model"]["model_id"] = "Qwen/Qwen3-8B"
+    small_bf16["ppu"]["hf_model_id"] = "Qwen/Qwen3-8B"
+    small_bf16["ppu"]["assets"] = {"model": "qwen3-8b", "tokenizer": "qwen3-8b"}
+    small_bf16["ppu"]["served_name"] = "qwen3-8b"
+    small_bf16["hardware_overrides"] = {
+        "zhenwu_810e": {"extra_args": ["--max-num-seqs", "64"]}
+    }
+    small_bf16["presets"] = {
+        "prefill": {
+            "hardware": "zhenwu_m890",
+            "args": ["--max-num-batched-tokens", "8192"],
+        },
+        "decode": {
+            "hardware": "zhenwu_810e",
+            "args": ["--max-num-batched-tokens", "2048"],
+        },
+    }
+    ppu_recipe.validate_serving_recipe_structure(small_bf16, context="small_bf16")
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    rec_path = tmp_path / "tests/ppu/recipes/Qwen/Qwen3-8B.yaml"
+    rec_path.write_text(yaml.safe_dump(small_bf16, sort_keys=False), encoding="utf-8")
+
+    report = ppu_recipe.validate_paths(
+        [rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    # 2 baselines (m890 default + 810e hardware_override) + 2 presets (prefill/m890, decode/810e)
+    assert report["checked_combinations"] == 4
+    entries = ppu_recipe.iter_recipe_catalog_entries(rec_path)
+    assert [(e["variant"], e["preset"], e["hardware"]) for e in entries] == [
+        ("default", None, "zhenwu_m890"),
+        ("default", None, "zhenwu_810e"),
+        ("default", "prefill", "zhenwu_m890"),
+        ("default", "decode", "zhenwu_810e"),
+    ]
+    decode_810e = ppu_recipe.resolve_recipe(rec_path, preset="decode")
+    assert decode_810e["hardware"] == "zhenwu_810e"
+    assert "--max-num-seqs" in decode_810e["flags"]
+    assert "--max-num-batched-tokens" in decode_810e["flags"]
+
+    pol_m890 = copy.deepcopy(qwen_pol)
+    pol_m890["model_id"] = "Qwen/Qwen3-8B"
+    pol_m890["recipe"] = "tests/ppu/recipes/Qwen/Qwen3-8B.yaml"
+    pol_m890["tiers"]["fast_sanity"]["preset"] = "prefill"
+    pol_m890_path = tmp_path / "tests/ppu/policy/models/qwen3-8b.yaml"
+    pol_m890_path.write_text(yaml.safe_dump(pol_m890), encoding="utf-8")
+
+    pol_810e = copy.deepcopy(pol_m890)
+    pol_810e["hardware"] = "zhenwu_810e"
+    pol_810e["tiers"]["fast_sanity"]["preset"] = "decode"
+    pol_810e_path = tmp_path / "tests/ppu/policy/models/qwen3-8b-810e.yaml"
+    pol_810e_path.write_text(yaml.safe_dump(pol_810e), encoding="utf-8")
+
+    ppu_recipe.validate_policy_structure(
+        pol_m890, context="pol_m890", base_dir=tmp_path
+    )
+    ppu_recipe.validate_policy_structure(
+        pol_810e, context="pol_810e", base_dir=tmp_path
+    )
+    # Default M890 selector picks qwen3-8b and skips qwen3-8b-810e
+    m890_keys = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "qwen3-8b" in m890_keys
+    assert "qwen3-8b-810e" not in m890_keys
+
+    # 2. Explicitly pinned BF16 variant still enforces hardware pin on presets and policies
+    pinned_m890 = copy.deepcopy(small_bf16)
+    pinned_m890["variants"]["default"]["hardware"] = "zhenwu_m890"
+    with pytest.raises(ppu_recipe.ValidationError, match="matches no compatible"):
+        ppu_recipe.validate_serving_recipe_structure(
+            pinned_m890, context="pinned_m890_orphan_810e_preset"
+        )
+
+    pinned_m890["presets"]["decode"]["variants"] = ["default"]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="conflicts with preset hardware 'zhenwu_810e'"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            pinned_m890, context="pinned_m890_conflict_preset"
+        )
+
+    pinned_only = copy.deepcopy(qwen_doc)
+    pinned_only["variants"]["default"]["hardware"] = "zhenwu_m890"
+    pinned_path = tmp_path / "tests/ppu/recipes/Qwen/Qwen3-8B-Pinned.yaml"
+    pinned_path.write_text(yaml.safe_dump(pinned_only), encoding="utf-8")
+    bad_810e_pol = copy.deepcopy(qwen_pol)
+    bad_810e_pol["hardware"] = "zhenwu_810e"
+    bad_810e_pol["recipe"] = "tests/ppu/recipes/Qwen/Qwen3-8B-Pinned.yaml"
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="targets hardware 'zhenwu_m890', incompatible with policy hardware 'zhenwu_810e'",
+    ):
+        ppu_recipe.validate_policy_structure(
+            bad_810e_pol, context="bad_pinned_bf16_pol", base_dir=tmp_path
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="targets hardware 'zhenwu_m890', incompatible with 'zhenwu_810e'",
+    ):
+        ppu_recipe.resolve_recipe(pinned_path, hardware="zhenwu_810e")
+
+    # 3. Policy model_id mismatch against recipe canonical model.model_id fails closed
+    #    across validate_policy_structure, validate_paths, resolve_recipe, and selector
+    #    (while variant hf_model_id overrides like fp8_channel keep working).
+    spoof_pol = copy.deepcopy(qwen_pol)
+    spoof_pol["model_id"] = "zai-org/GLM-5.3"
+    spoof_pol_path = tmp_path / "tests/ppu/policy/models/spoof-glm-on-qwen.yaml"
+    spoof_pol_path.write_text(yaml.safe_dump(spoof_pol), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe .* model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe.validate_policy_structure(
+            spoof_pol, context="spoof_pol", base_dir=tmp_path
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe .* model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe.resolve_recipe(
+            tmp_path / "tests/ppu/recipes/Qwen/Qwen3.8-27B.yaml",
+            policy_path=spoof_pol_path,
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe model.model_id 'Qwen/Qwen3.8-27B'",
+    ):
+        ppu_recipe._resolve_recipe_from_doc(
+            qwen_doc,
+            recipe_label="qwen_doc",
+            policy=spoof_pol,
+            policy_label="spoof_pol",
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="policy model_id 'zai-org/GLM-5.3' does not match recipe",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    spoof_pol_path.unlink()
+
+    # Positive control: policy using canonical model_id with a variant overriding hf_model_id passes
+    glm_fp8_pol = yaml.safe_load((POLICY_DIR / "models" / "glm-5.3.yaml").read_text())
+    glm_fp8_pol["variant"] = "fp8_channel"
+    glm_fp8_pol["tiers"] = {"fast_sanity": glm_fp8_pol["tiers"]["fast_sanity"]}
+    glm_fp8_pol.pop("replaces_legacy_cases", None)
+    ppu_recipe.validate_policy_structure(
+        glm_fp8_pol, context="glm_fp8_variant_control", base_dir=tmp_path
+    )
+    glm_fp8_pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3-fp8-ctrl.yaml"
+    glm_fp8_pol_path.write_text(yaml.safe_dump(glm_fp8_pol), encoding="utf-8")
+    glm_fp8_res = ppu_recipe.resolve_recipe(
+        tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml",
+        policy_path=glm_fp8_pol_path,
+        tier="fast_sanity",
+    )
+    assert glm_fp8_res["model_id"] == "zai-org/GLM-5.3"
+    assert (
+        glm_fp8_res["hf_model_id"]
+        == "T-HEAD/GLM-5.3-Quant-W-FP8-PerChannel-A-FP8-PerChannel"
+    )
+
+
+def test_topology_flag_invariant_blocks_multinode_and_disagg_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    # 1. Counterexample (R1 P1-02): single_node preset smuggling multi-node launch flags
+    #    (--nnodes 4 --node-rank 0 --master-addr localhost) must fail closed across
+    #    structure validation, validate_paths, resolve_recipe, and CI selector.
+    bypass_doc = copy.deepcopy(glm_doc)
+    bypass_doc["presets"]["decode"]["args"] = [
+        "--nnodes",
+        "4",
+        "--node-rank",
+        "0",
+        "--master-addr",
+        "localhost",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bypass_doc, context="bypass_mn")
+
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    glm_copy = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_copy.write_text(yaml.safe_dump(bypass_doc), encoding="utf-8")
+
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_paths(
+            [glm_copy], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_copy,
+            policy_path=tmp_path / "tests/ppu/policy/models/glm-5.3-decode.yaml",
+            tier="fast_sanity",
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set multi-node flag",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+
+    # 2. single_node preset injecting --kv-transfer-config or exceeding declared devices
+    bad_kv_single = copy.deepcopy(glm_doc)
+    bad_kv_single["presets"]["decode"]["args"] = [
+        "--kv-transfer-config",
+        '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}',
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single_node topology must not set --kv-transfer-config",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_kv_single, context="kv_single")
+
+    bad_cap_single = copy.deepcopy(glm_doc)
+    bad_cap_single["presets"]["decode"]["remove_args"] = ["--tensor-parallel-size"]
+    bad_cap_single["presets"]["decode"].pop("tp", None)
+    bad_cap_single["presets"]["decode"]["args"] = ["--data-parallel-size", "32"]
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="exceeding declared topology capacity"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_cap_single, context="cap_single"
+        )
+
+    # 3. single-node pd_disagg preset smuggling --nnodes 4 fails closed
+    bad_pd_mn = copy.deepcopy(glm_doc)
+    bad_pd_mn["presets"]["pd_prefill"]["args"].extend(["--nnodes", "4"])
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="single-node pd_disagg topology must not set multi-node flag",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_pd_mn, context="pd_mn")
+
+    # 4. Positive control: restoring clean GLM-5.3.yaml passes full validation and selector
+    glm_copy.write_text(yaml.safe_dump(glm_doc), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [glm_copy], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["checked_combinations"] == 14
+    assert report["parser_checked"] is True
+    decode_entry = next(
+        item
+        for item in ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")[
+            "include"
+        ]
+        if item["key"] == "glm-5.3-decode"
+    )
+    assert decode_entry["ppu_count"] == 8
+    assert decode_entry["preset"] == "decode"
+
+
+def test_mooncake_pd_endpoint_wiring_nondefault_and_counterexamples(
+    tmp_path: Path,
+) -> None:
+    recipe_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
+
+    # 1. Non-default address, port, and IB device list resolve to Mooncake's real runtime inputs
+    prefill = ppu_recipe.resolve_recipe(recipe_path, preset="pd_prefill")
+    p_flags, p_env = ppu_recipe.substitute_validation_placeholders(
+        prefill["flags"],
+        prefill["server_env"],
+        values={
+            "kv_ip": "198.51.100.10",
+            "kv_port": 18998,
+            "ib_devices": "rdma2,rdma3",
+        },
+    )
+    p_kv = json.loads(p_flags[p_flags.index("--kv-transfer-config") + 1])
+    assert p_env["VLLM_HOST_IP"] == "198.51.100.10"
+    assert int(p_env["VLLM_MOONCAKE_BOOTSTRAP_PORT"]) == 18998
+    assert p_kv["kv_role"] == "kv_producer"
+    assert p_kv["kv_connector_extra_config"]["device_name"] == "rdma2,rdma3"
+    assert "kv_port" not in p_kv
+    assert "kv_ip" not in p_kv["kv_connector_extra_config"]
+    ppu_recipe.validate_flags_with_parser(
+        _sample_vllm_parser(), p_flags, context="pd_prefill_nondefault"
+    )
+
+    decode = ppu_recipe.resolve_recipe(recipe_path, preset="pd_decode")
+    d_flags, d_env = ppu_recipe.substitute_validation_placeholders(
+        decode["flags"],
+        decode["server_env"],
+        values={"kv_ip": "198.51.100.20", "ib_devices": "rdma4,rdma5"},
+    )
+    d_kv = json.loads(d_flags[d_flags.index("--kv-transfer-config") + 1])
+    assert d_env["VLLM_HOST_IP"] == "198.51.100.20"
+    assert "VLLM_MOONCAKE_BOOTSTRAP_PORT" not in d_env
+    assert d_kv["kv_role"] == "kv_consumer"
+    assert d_kv["kv_connector_extra_config"]["device_name"] == "rdma4,rdma5"
+    assert "kv_port" not in d_kv
+    assert "kv_ip" not in d_kv["kv_connector_extra_config"]
+    ppu_recipe.validate_flags_with_parser(
+        _sample_vllm_parser(), d_flags, context="pd_decode_nondefault"
+    )
+
+    # 2. External bootstrap_server_address mode on prefill also works with non-default host:port
+    ext_doc = copy.deepcopy(glm_doc)
+    ext_doc["presets"]["pd_prefill"]["env"].pop("VLLM_MOONCAKE_BOOTSTRAP_PORT")
+    ext_args = ext_doc["presets"]["pd_prefill"]["args"]
+    ext_kv = json.loads(ext_args[ext_args.index("--kv-transfer-config") + 1])
+    ext_kv["kv_connector_extra_config"]["bootstrap_server_address"] = (
+        "{kv_ip}:{kv_port}"
+    )
+    ext_args[ext_args.index("--kv-transfer-config") + 1] = json.dumps(
+        ext_kv, separators=(",", ":")
+    )
+    ext_path = tmp_path / "ext_bootstrap.yaml"
+    ext_path.write_text(yaml.safe_dump(ext_doc), encoding="utf-8")
+    ext_res = ppu_recipe.resolve_recipe(ext_path, preset="pd_prefill")
+    ext_flags, ext_env = ppu_recipe.substitute_validation_placeholders(
+        ext_res["flags"],
+        ext_res["server_env"],
+        values={"kv_ip": "198.51.100.30", "kv_port": 19001, "ib_devices": "rdma1"},
+    )
+    ext_sub_kv = json.loads(ext_flags[ext_flags.index("--kv-transfer-config") + 1])
+    assert ext_env["VLLM_HOST_IP"] == "198.51.100.30"
+    assert (
+        ext_sub_kv["kv_connector_extra_config"]["bootstrap_server_address"]
+        == "198.51.100.30:19001"
+    )
+    assert ppu_recipe._parse_mooncake_host_port(
+        ext_sub_kv["kv_connector_extra_config"]["bootstrap_server_address"],
+        context="ext_ipv4",
+    ) == ("198.51.100.30", 19001)
+
+    # Bracketed IPv6 host:port control passes
+    ext_v6 = copy.deepcopy(ext_doc)
+    v6_args = ext_v6["presets"]["pd_prefill"]["args"]
+    v6_kv = json.loads(v6_args[v6_args.index("--kv-transfer-config") + 1])
+    v6_kv["kv_connector_extra_config"]["bootstrap_server_address"] = (
+        "[{kv_ip}]:{kv_port}"
+    )
+    v6_args[v6_args.index("--kv-transfer-config") + 1] = json.dumps(
+        v6_kv, separators=(",", ":")
+    )
+    ppu_recipe.validate_serving_recipe_structure(ext_v6, context="ext_ipv6_control")
+    assert ppu_recipe._parse_mooncake_host_port("[::1]:19001", context="v6") == (
+        "::1",
+        19001,
+    )
+
+    # Counterexamples: scheme/path/extra-colon/empty-host bootstrap_server_address rejected
+    for bad_addr in (
+        "http://{kv_ip}:{kv_port}",
+        "{kv_ip}:0:{kv_port}",
+        ":{kv_port}",
+        "{kv_ip}:{kv_port}/query",
+        "[{kv_ip}]:0:{kv_port}",
+        "[{kv_ip}]{kv_port}",
+    ):
+        bad_ext = copy.deepcopy(ext_doc)
+        b_args = bad_ext["presets"]["pd_prefill"]["args"]
+        b_kv = json.loads(b_args[b_args.index("--kv-transfer-config") + 1])
+        b_kv["kv_connector_extra_config"]["bootstrap_server_address"] = bad_addr
+        b_args[b_args.index("--kv-transfer-config") + 1] = json.dumps(
+            b_kv, separators=(",", ":")
+        )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="bootstrap_server_address"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_ext, context="bad_ext")
+        bad_ext_path = tmp_path / f"bad_ext_{abs(hash(bad_addr))}.yaml"
+        bad_ext_path.write_text(yaml.safe_dump(bad_ext), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="bootstrap_server_address"
+        ):
+            ppu_recipe.validate_paths(
+                [bad_ext_path],
+                vllm_parser_mode="required",
+                parser=_sample_vllm_parser(),
+            )
+
+    # 3. Counterexamples: dead Mooncake fields and missing/ambiguous runtime wiring fail closed
+    dead_port = copy.deepcopy(glm_doc)
+    dp_args = dead_port["presets"]["pd_prefill"]["args"]
+    dp_kv = json.loads(dp_args[dp_args.index("--kv-transfer-config") + 1])
+    dp_kv["kv_port"] = "{kv_port}"
+    dp_args[dp_args.index("--kv-transfer-config") + 1] = json.dumps(dp_kv)
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"does not read KVTransferConfig\.kv_port",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(dead_port, context="dead_port")
+
+    dead_ip = copy.deepcopy(glm_doc)
+    di_args = dead_ip["presets"]["pd_prefill"]["args"]
+    di_kv = json.loads(di_args[di_args.index("--kv-transfer-config") + 1])
+    di_kv["kv_connector_extra_config"]["kv_ip"] = "{kv_ip}"
+    di_args[di_args.index("--kv-transfer-config") + 1] = json.dumps(di_kv)
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"does not read kv_connector_extra_config\.kv_ip",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(dead_ip, context="dead_ip")
+
+    no_host_ip = copy.deepcopy(glm_doc)
+    no_host_ip["presets"]["pd_decode"]["env"].pop("VLLM_HOST_IP")
+    with pytest.raises(
+        ppu_recipe.ValidationError, match="missing required placeholder.*kv_ip"
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_host_ip, context="no_host_ip")
+
+    both_bootstrap = copy.deepcopy(ext_doc)
+    both_bootstrap["presets"]["pd_prefill"]["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = (
+        "{kv_port}"
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="must not set both bootstrap_server_address and VLLM_MOONCAKE_BOOTSTRAP_PORT",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            both_bootstrap, context="both_bootstrap"
+        )
+
+    decode_bootstrap = copy.deepcopy(glm_doc)
+    decode_bootstrap["presets"]["pd_decode"]["env"]["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = (
+        "{kv_port}"
+    )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="decode .* does not read bootstrap_server_address or VLLM_MOONCAKE_BOOTSTRAP_PORT",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            decode_bootstrap, context="decode_bootstrap"
+        )
+
+
+def test_effective_vllm_world_size_pcp_defaults_and_runner_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    # 1. TP8 + PCP2 demands 16 devices (not 8): fails against 1x8 topology, resolves to 16 on 1x16
+    pcp_oversub = copy.deepcopy(glm_doc)
+    pcp_oversub["presets"]["decode"]["args"] = [
+        "--prefill-context-parallel-size",
+        "2",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="requires 16 devices, exceeding declared topology capacity",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(pcp_oversub, context="pcp_1x8")
+
+    pcp_16 = copy.deepcopy(pcp_oversub)
+    pcp_16["presets"]["decode"]["topology"]["devices_per_node"] = 16
+    pcp_path = tmp_path / "glm_pcp16.yaml"
+    pcp_path.write_text(yaml.safe_dump(pcp_16), encoding="utf-8")
+    resolved_pcp = ppu_recipe.resolve_recipe(pcp_path, preset="decode")
+    assert resolved_pcp["ppu_count"] == 16
+    report = ppu_recipe.validate_paths(
+        [pcp_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["parser_checked"] is True
+
+    # 2. Removing --data-parallel-size 32 from 4-node decode_ep yields vLLM default world size 1,
+    #    which must fail (not silently copy topology capacity 32)
+    no_dp_ep = copy.deepcopy(glm_doc)
+    ep_args = no_dp_ep["presets"]["decode_ep"]["args"]
+    idx_dp = ep_args.index("--data-parallel-size")
+    del ep_args[idx_dp : idx_dp + 2]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"topology\.nodes \(4\) must evenly divide effective vLLM world size \(1\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_dp_ep, context="no_dp_ep")
+
+    # 3. Single-node recipe omitting all parallel flags resolves to vLLM default world_size=1
+    one_card = copy.deepcopy(glm_doc)
+    one_card["ppu"]["topology"]["devices_per_node"] = 1
+    one_card["model"]["base_args"] = [
+        tok
+        for i, tok in enumerate(one_card["model"]["base_args"])
+        if tok != "--tensor-parallel-size"
+        and (
+            i == 0 or one_card["model"]["base_args"][i - 1] != "--tensor-parallel-size"
+        )
+    ]
+    one_card["variants"] = {"default": copy.deepcopy(glm_doc["variants"]["default"])}
+    one_card["presets"] = {}
+    one_path = tmp_path / "one_card.yaml"
+    one_path.write_text(yaml.safe_dump(one_card), encoding="utf-8")
+    assert ppu_recipe.resolve_recipe(one_path)["ppu_count"] == 1
+
+    # 4. Single-node M890 selector enforces the 8-card runner cap for both TP16 and TP8xPCP2
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+    glm_tp16_doc = copy.deepcopy(glm_doc)
+    glm_tp16_doc["presets"]["decode"]["topology"]["devices_per_node"] = 16
+    glm_tp16_doc["presets"]["decode"]["tp"] = 16
+    (tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml").write_text(
+        yaml.safe_dump(glm_tp16_doc), encoding="utf-8"
+    )
+    # Static validation still passes (preset stays available in static catalog)
+    assert (
+        ppu_recipe.validate_paths(
+            [tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"],
+            vllm_parser_mode="required",
+            parser=_sample_vllm_parser(),
+        )["checked_combinations"]
+        == 14
+    )
+    default_keys = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "glm-5.3" in default_keys
+    assert "glm-5.3-decode" not in default_keys
+    with pytest.raises(
+        ValueError,
+        match="requires 16 devices, exceeding single-node 'zhenwu_m890' CI runner limit \\(8\\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+    # Positive control: higher runner cap admits the 16-card entry cleanly
+    admitted = ppu_e2e_select.build_recipe_matrix(
+        "glm-5.3-decode", "fast_sanity", max_devices=16
+    )["include"]
+    assert len(admitted) == 1 and admitted[0]["ppu_count"] == 16
+
+    # Same 8-card cap catches TP8 + PCP2 (16 devices) in selector
+    (tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml").write_text(
+        yaml.safe_dump(pcp_16), encoding="utf-8"
+    )
+    default_keys_pcp = {
+        item["key"]
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+    }
+    assert "glm-5.3-decode" not in default_keys_pcp
+    with pytest.raises(
+        ValueError,
+        match="requires 16 devices, exceeding single-node 'zhenwu_m890' CI runner limit \\(8\\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3-decode", "fast_sanity")
+
+
+def test_vllm_recipe_rejects_missing_or_empty_variants(tmp_path: Path) -> None:
+    glm_doc = yaml.safe_load((RECIPES_DIR / "zai-org" / "GLM-5.3.yaml").read_text())
+
+    for name, mutator in (
+        ("empty_variants", lambda d: d.update({"variants": {}, "presets": {}})),
+        (
+            "missing_variants",
+            lambda d: (d.pop("variants", None), d.update({"presets": {}})),
+        ),
+    ):
+        bad = copy.deepcopy(glm_doc)
+        mutator(bad)
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"variants must be a non-empty mapping for vllm serving recipes",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad, context=name)
+
+        bad_path = tmp_path / f"{name}.yaml"
+        bad_path.write_text(yaml.safe_dump(bad), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"variants must be a non-empty mapping for vllm serving recipes",
+        ):
+            ppu_recipe.validate_paths(
+                [bad_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+            )
+
+    # Positive control: non-empty single variant expands and passes parser check
+    good = copy.deepcopy(glm_doc)
+    good["variants"] = {"default": copy.deepcopy(glm_doc["variants"]["default"])}
+    good["presets"] = {}
+    good_path = tmp_path / "nonempty_variants.yaml"
+    good_path.write_text(yaml.safe_dump(good), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [good_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["checked_combinations"] == 1
+    assert report["parser_checked"] is True
+
+
+def test_single_node_dp_requires_all_ranks_local_and_admits_dp8_local8_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+
+    m3_rec_path = tmp_path / "tests/ppu/recipes/MiniMaxAI/MiniMax-M3.yaml"
+    m3_pol_path = tmp_path / "tests/ppu/policy/models/minimax-m3.yaml"
+    m3_doc_orig = yaml.safe_load(m3_rec_path.read_text(encoding="utf-8"))
+    m3_pol_doc = yaml.safe_load(m3_pol_path.read_text(encoding="utf-8"))
+    m3_pol_doc["tiers"]["fast_sanity"]["preset"] = "dp_ep_low_latency"
+    m3_pol_path.write_text(yaml.safe_dump(m3_pol_doc), encoding="utf-8")
+
+    # 1. Counterexample (P1 r4694520699): DP8 with --data-parallel-size-local 4 on single_node
+    #    fails recipe validation, policy resolution, automatic selection, and explicit selection.
+    bad_dpl4 = copy.deepcopy(m3_doc_orig)
+    bad_dpl4["presets"]["dp_ep_low_latency"]["args"] = [
+        *bad_dpl4["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-size-local",
+        "4",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_dpl4, context="bad_dpl4")
+
+    m3_rec_path.write_text(yaml.safe_dump(bad_dpl4), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe.validate_paths(
+            [m3_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(4\) to equal global DP size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
+
+    # Additional partial-local-DP counterexamples on single_node (external rank & ray span)
+    for extra_args, extra_env, expected in (
+        (
+            ["--data-parallel-rank", "0"],
+            {},
+            r"effective local DP size \(1\) to equal global DP size \(8\)",
+        ),
+        (
+            ["--data-parallel-external-lb"],
+            {},
+            r"--data-parallel-external-lb requires --data-parallel-rank",
+        ),
+        (
+            ["--data-parallel-size-local", "16"],
+            {},
+            r"--data-parallel-size-local \(16\) cannot exceed --data-parallel-size \(8\)",
+        ),
+        (
+            ["--data-parallel-backend", "ray"],
+            {"VLLM_RAY_DP_PACK_STRATEGY": "span"},
+            r"effective local DP size \(1\) to equal global DP size \(8\)",
+        ),
+    ):
+        bad_extra = copy.deepcopy(m3_doc_orig)
+        bad_extra["presets"]["dp_ep_low_latency"]["args"] = [
+            *bad_extra["presets"]["dp_ep_low_latency"]["args"],
+            *extra_args,
+        ]
+        if extra_env:
+            bad_extra["presets"]["dp_ep_low_latency"]["env"] = {
+                **bad_extra["presets"]["dp_ep_low_latency"].get("env", {}),
+                **extra_env,
+            }
+        with pytest.raises(ppu_recipe.ValidationError, match=expected):
+            ppu_recipe.validate_serving_recipe_structure(bad_extra, context="bad_extra")
+
+    # 2. Positive control: DP8 with explicit --data-parallel-size-local 8 passes validation
+    #    and is admitted by both automatic and explicit single-node CI selection.
+    good_dpl8 = copy.deepcopy(m3_doc_orig)
+    good_dpl8["presets"]["dp_ep_low_latency"]["args"] = [
+        *good_dpl8["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-size-local",
+        "8",
+    ]
+    m3_rec_path.write_text(yaml.safe_dump(good_dpl8), encoding="utf-8")
+    report = ppu_recipe.validate_paths(
+        [m3_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert report["parser_checked"] is True
+    resolved_ctrl = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert resolved_ctrl["ppu_count"] == 8
+    assert resolved_ctrl["dp_size"] == 8
+    assert resolved_ctrl["dp_size_local"] == 8
+
+    auto_item = next(
+        item
+        for item in ppu_e2e_select.build_recipe_matrix("", "fast_sanity")["include"]
+        if item["key"] == "minimax-m3"
+    )
+    explicit_items = ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")[
+        "include"
+    ]
+    assert auto_item["ppu_count"] == 8
+    assert auto_item["preset"] == "dp_ep_low_latency"
+    assert len(explicit_items) == 1 and explicit_items[0]["ppu_count"] == 8
+
+    # 3. Inherited os.environ VLLM_RAY_DP_PACK_STRATEGY=span with --data-parallel-backend ray
+    #    and omitted --data-parallel-size-local is consistently rejected across validation,
+    #    resolve_recipe, automatic/explicit selector, and _launch_resolved_server, whereas
+    #    overriding VLLM_RAY_DP_PACK_STRATEGY=fill in recipe env passes.
+    ray_doc = copy.deepcopy(m3_doc_orig)
+    ray_doc["presets"]["dp_ep_low_latency"]["args"] = [
+        *ray_doc["presets"]["dp_ep_low_latency"]["args"],
+        "--data-parallel-backend",
+        "ray",
+    ]
+    m3_rec_path.write_text(yaml.safe_dump(ray_doc), encoding="utf-8")
+    pre_resolved_ray = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert pre_resolved_ray["dp_size_local"] == 8
+
+    monkeypatch.setenv("VLLM_RAY_DP_PACK_STRATEGY", "span")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(ray_doc, context="ray_env_span")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("minimax-m3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(8\)",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            pre_resolved_ray, log_path=tmp_path / "never_launched.log"
+        )
+
+    ray_fill = copy.deepcopy(ray_doc)
+    ray_fill["presets"]["dp_ep_low_latency"]["env"] = {
+        **ray_fill["presets"]["dp_ep_low_latency"].get("env", {}),
+        "VLLM_RAY_DP_PACK_STRATEGY": "fill",
+    }
+    m3_rec_path.write_text(yaml.safe_dump(ray_fill), encoding="utf-8")
+    resolved_fill = ppu_recipe.resolve_recipe(
+        m3_rec_path, policy_path=m3_pol_path, tier="fast_sanity"
+    )
+    assert resolved_fill["dp_size_local"] == 8
+    monkeypatch.delenv("VLLM_RAY_DP_PACK_STRATEGY")
+
+    # 4. Multi-node DP32+EP with --data-parallel-hybrid-lb and omitted --data-parallel-size-local
+    #    infers local DP = 8 per node first (matching pinned vllm arg_utils.py:2476-2520) and passes.
+    glm_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_hybrid = yaml.safe_load(glm_path.read_text(encoding="utf-8"))
+    glm_hybrid["presets"]["decode_ep"]["args"] = [
+        *glm_hybrid["presets"]["decode_ep"]["args"],
+        "--data-parallel-hybrid-lb",
+    ]
+    glm_path.write_text(yaml.safe_dump(glm_hybrid), encoding="utf-8")
+    glm_hybrid_report = ppu_recipe.validate_paths(
+        [glm_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert glm_hybrid_report["checked_combinations"] == 14
+    glm_hybrid_ep = ppu_recipe.resolve_recipe(glm_path, preset="decode_ep")
+    assert glm_hybrid_ep["ppu_count"] == 32
+    assert glm_hybrid_ep["dp_size"] == 32
+    assert glm_hybrid_ep["dp_size_local"] == 8
+
+
+def test_multi_node_ep_requires_effective_expert_parallel(tmp_path: Path) -> None:
+    glm_path = RECIPES_DIR / "zai-org" / "GLM-5.3.yaml"
+    glm_doc = yaml.safe_load(glm_path.read_text(encoding="utf-8"))
+
+    # Positive control: checked-in GLM-5.3 decode_ep (DP32 + --enable-expert-parallel) passes
+    ctrl_report = ppu_recipe.validate_paths(
+        [glm_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+    )
+    assert ctrl_report["checked_combinations"] == 14
+    ctrl_ep = ppu_recipe.resolve_recipe(glm_path, preset="decode_ep")
+    assert ctrl_ep["ppu_count"] == 32
+    assert "--enable-expert-parallel" in ctrl_ep["flags"]
+
+    # Counterexample 1 (P2 r4694520719): removing --enable-expert-parallel from decode_ep fails
+    no_ep = copy.deepcopy(glm_doc)
+    no_ep["presets"]["decode_ep"]["args"] = [
+        tok
+        for tok in no_ep["presets"]["decode_ep"]["args"]
+        if tok != "--enable-expert-parallel"
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="multi_node_ep topology requires effective --enable-expert-parallel",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(no_ep, context="no_ep")
+
+    no_ep_path = tmp_path / "glm_no_ep.yaml"
+    no_ep_path.write_text(yaml.safe_dump(no_ep), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="multi_node_ep topology requires effective --enable-expert-parallel",
+    ):
+        ppu_recipe.validate_paths(
+            [no_ep_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+
+    # Counterexample 2: disabling EP via --no-enable-expert-parallel or --disable-expert-parallel fails
+    for neg_flag in ("--no-enable-expert-parallel", "--disable-expert-parallel"):
+        neg_ep = copy.deepcopy(glm_doc)
+        neg_ep["presets"]["decode_ep"]["args"] = [
+            *neg_ep["presets"]["decode_ep"]["args"],
+            neg_flag,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match="multi_node_ep topology requires effective --enable-expert-parallel",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(neg_ep, context=neg_flag)
+
+
+def test_vllm_dp_env_fallback_crossnode_tp_and_hybrid_headless_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shutil.copytree(ROOT / "tests/ppu", tmp_path / "tests/ppu")
+    monkeypatch.setattr(ppu_e2e_select, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(ppu_recipe, "REPO_ROOT", tmp_path)
+
+    glm_rec_path = tmp_path / "tests/ppu/recipes/zai-org/GLM-5.3.yaml"
+    glm_pol_path = tmp_path / "tests/ppu/policy/models/glm-5.3.yaml"
+    glm_orig = yaml.safe_load(glm_rec_path.read_text(encoding="utf-8"))
+
+    # 1. P1 (r4695877063): GLM-5.3 TP4 prefill with no --data-parallel-size flag and
+    #    VLLM_DP_SIZE=2 (in preset env or inherited os.environ) activates ParallelConfig
+    #    env fallback (global DP=2, local DP=1) and must be rejected everywhere.
+    bad_env_dp2 = copy.deepcopy(glm_orig)
+    bad_env_dp2["presets"]["prefill"]["env"] = {
+        **bad_env_dp2["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(bad_env_dp2, context="env_dp2")
+
+    glm_rec_path.write_text(yaml.safe_dump(bad_env_dp2), encoding="utf-8")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.validate_paths(
+            [glm_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+    # Inherited os.environ VLLM_DP_SIZE=2 on clean recipe is also rejected across
+    # resolve_recipe, selector, and _launch_resolved_server.
+    glm_rec_path.write_text(yaml.safe_dump(glm_orig), encoding="utf-8")
+    clean_resolved = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    monkeypatch.setenv("VLLM_DP_SIZE", "2")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"effective local DP size \(1\) to equal global DP size \(2\)",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_resolved, log_path=tmp_path / "never_started.log"
+        )
+    monkeypatch.delenv("VLLM_DP_SIZE")
+
+    # Conflicting recipe VLLM_DP_SIZE alongside CLI --data-parallel-size > 1 fails closed
+    conflict_dp = copy.deepcopy(glm_orig)
+    conflict_dp["presets"]["pd_decode"]["env"] = {
+        **conflict_dp["presets"]["pd_decode"]["env"],
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"recipe env VLLM_DP_SIZE \(2\) conflicts with --data-parallel-size \(8\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            conflict_dp, context="conflict_env_dp"
+        )
+
+    # Positive control: GLM-5.3 TP4 prefill with VLLM_DP_SIZE=1 agrees on DP=1 / local DP=1 (4 cards)
+    good_env_dp1 = copy.deepcopy(glm_orig)
+    good_env_dp1["presets"]["prefill"]["env"] = {
+        **good_env_dp1["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "1",
+    }
+    glm_rec_path.write_text(yaml.safe_dump(good_env_dp1), encoding="utf-8")
+    res_dp1 = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    assert res_dp1["ppu_count"] == 4
+    assert res_dp1["dp_size"] == 1
+    assert res_dp1["dp_size_local"] == 1
+    sel_dp1 = ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")["include"]
+    assert len(sel_dp1) == 1 and sel_dp1[0]["ppu_count"] == 4
+
+    # 2. P2 (r4695877083): 4x8 multi_node_ep with DP2 x TP16 (each TP16 replica spans 2 nodes)
+    #    resolves to 32 devices and local DP=1 both when omitted and when explicitly set to 1.
+    for explicit_dpl in (None, "1"):
+        dp2_tp16 = copy.deepcopy(glm_orig)
+        ep_args = [
+            tok
+            for tok in dp2_tp16["presets"]["decode_ep"]["args"]
+            if tok not in {"--data-parallel-size", "32"}
+        ]
+        ep_args.extend(["--data-parallel-size", "2", "--tensor-parallel-size", "16"])
+        if explicit_dpl is not None:
+            ep_args.extend(["--data-parallel-size-local", explicit_dpl])
+        dp2_tp16["presets"]["decode_ep"]["args"] = ep_args
+        glm_rec_path.write_text(yaml.safe_dump(dp2_tp16), encoding="utf-8")
+        rep = ppu_recipe.validate_paths(
+            [glm_rec_path], vllm_parser_mode="required", parser=_sample_vllm_parser()
+        )
+        assert rep["checked_combinations"] == 14
+        res_ep = ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
+        assert res_ep["ppu_count"] == 32
+        assert res_ep["dp_size"] == 2
+        assert res_ep["dp_size_local"] == 1
+
+    bad_dp2_tp16_dpl2 = copy.deepcopy(dp2_tp16)
+    bad_dp2_tp16_dpl2["presets"]["decode_ep"]["args"] = [
+        *dp2_tp16["presets"]["decode_ep"]["args"][:-2],
+        "--data-parallel-size-local",
+        "2",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"multi_node_ep --data-parallel-size-local \(2\) must match per-node DP layout \(1\)",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_dp2_tp16_dpl2, context="bad_dp2_tp16_dpl2"
+        )
+
+    # 3. P2 (r4695877100): AUTHORING.md qualifies --headless vs --data-parallel-hybrid-lb,
+    #    and combining --data-parallel-hybrid-lb with --headless is rejected.
+    authoring_text = (ROOT / "tests/ppu/AUTHORING.md").read_text(encoding="utf-8")
+    assert "--data-parallel-hybrid-lb" in authoring_text
+    assert "without `--headless`" in authoring_text
+
+    bad_hybrid_headless = copy.deepcopy(glm_orig)
+    bad_hybrid_headless["presets"]["decode_ep"]["args"] = [
+        *bad_hybrid_headless["presets"]["decode_ep"]["args"],
+        "--data-parallel-hybrid-lb",
+        "--headless",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="--data-parallel-hybrid-lb is not applicable in --headless mode",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_hybrid_headless, context="hybrid_headless"
+        )
+
+    # 4. R1 P1-1: Single-node out-of-bounds VLLM_DP_RANK_LOCAL=1 (with VLLM_DP_SIZE=1)
+    #    and multi-node env-only VLLM_DP_SIZE=2 without CLI --data-parallel-size fail closed;
+    #    VLLM_DP_RANK_LOCAL=0 and CLI --data-parallel-size 2 controls pass.
+    bad_rank_local = copy.deepcopy(glm_orig)
+    bad_rank_local["presets"]["prefill"]["env"] = {
+        **bad_rank_local["presets"]["prefill"].get("env", {}),
+        "VLLM_DP_SIZE": "1",
+        "VLLM_DP_RANK_LOCAL": "1",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_rank_local, context="bad_rank_local"
+        )
+
+    glm_rec_path.write_text(yaml.safe_dump(glm_orig), encoding="utf-8")
+    monkeypatch.setenv("VLLM_DP_SIZE", "1")
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "1")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"VLLM_DP_RANK_LOCAL \(1\) must be in \[0, 0\]",
+    ):
+        ppu_recipe_runner._launch_resolved_server(
+            clean_resolved, log_path=tmp_path / "never_started_rank_local.log"
+        )
+    monkeypatch.setenv("VLLM_DP_RANK_LOCAL", "0")
+    ok_rank_local = ppu_recipe.resolve_recipe(
+        glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+    )
+    assert ok_rank_local["ppu_count"] == 4
+    monkeypatch.delenv("VLLM_DP_SIZE")
+    monkeypatch.delenv("VLLM_DP_RANK_LOCAL")
+
+    bad_mn_env_dp = copy.deepcopy(glm_orig)
+    ep_no_cli_dp = [
+        tok
+        for tok in bad_mn_env_dp["presets"]["decode_ep"]["args"]
+        if tok not in {"--data-parallel-size", "32"}
+    ]
+    ep_no_cli_dp.extend(["--tensor-parallel-size", "16"])
+    bad_mn_env_dp["presets"]["decode_ep"]["args"] = ep_no_cli_dp
+    bad_mn_env_dp["presets"]["decode_ep"]["env"] = {
+        **bad_mn_env_dp["presets"]["decode_ep"]["env"],
+        "VLLM_DP_SIZE": "2",
+    }
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match=r"multi-node topology \(nodes=4\) requires CLI --data-parallel-size rather than VLLM_DP_SIZE=2",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_mn_env_dp, context="bad_mn_env_dp"
+        )
+
+    # 5. R1 P1-2: ExecutorWithExternalLauncher class path, external_launcher, and
+    #    underscore CLI flag spellings fail closed across validation, resolve, selector, and runner.
+    for exec_val in (
+        "external_launcher",
+        "vllm.v1.executor.uniproc_executor.ExecutorWithExternalLauncher",
+        "uni",
+    ):
+        bad_exec = copy.deepcopy(glm_orig)
+        bad_exec["presets"]["prefill"]["args"] = [
+            *bad_exec["presets"]["prefill"].get("args", []),
+            "--distributed-executor-backend",
+            exec_val,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="--distributed-executor-backend"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_exec, context=exec_val)
+        glm_rec_path.write_text(yaml.safe_dump(bad_exec), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="--distributed-executor-backend"
+        ):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+
+    good_exec_mp = copy.deepcopy(glm_orig)
+    good_exec_mp["presets"]["prefill"]["args"] = [
+        *good_exec_mp["presets"]["prefill"].get("args", []),
+        "--distributed-executor-backend",
+        "mp",
+    ]
+    glm_rec_path.write_text(yaml.safe_dump(good_exec_mp), encoding="utf-8")
+    assert (
+        ppu_recipe.resolve_recipe(
+            glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+        )["ppu_count"]
+        == 4
+    )
+
+    # Multi-node (nodes > 1) rejects --distributed-executor-backend ray / external_launcher /
+    # ExecutorWithExternalLauncher (matching pinned parallel.py:1199-1207), rejects 'uni' when
+    # replica world > 1 (DP2 x TP16), and accepts 'mp' or 'uni' when replica world == 1 (DP32).
+    for bad_mn_exec in (
+        "ray",
+        "external_launcher",
+        "vllm.v1.executor.uniproc_executor.ExecutorWithExternalLauncher",
+    ):
+        bad_mn_doc = copy.deepcopy(glm_orig)
+        bad_mn_doc["presets"]["decode_ep"]["args"] = [
+            *bad_mn_doc["presets"]["decode_ep"]["args"],
+            "--distributed-executor-backend",
+            bad_mn_exec,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"--distributed-executor-backend must be one of \['mp', 'uni'\] for nodes=4",
+        ):
+            ppu_recipe.validate_serving_recipe_structure(
+                bad_mn_doc, context=f"mn_{bad_mn_exec}"
+            )
+        tampered_mn = ppu_recipe.resolve_recipe(
+            ROOT / "tests/ppu/recipes/zai-org/GLM-5.3.yaml", preset="decode_ep"
+        )
+        tampered_mn["flags"] = [
+            *tampered_mn["flags"],
+            "--distributed-executor-backend",
+            bad_mn_exec,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError,
+            match=r"--distributed-executor-backend must be one of \['mp', 'uni'\] for nodes=4",
+        ):
+            ppu_recipe_runner._launch_resolved_server(
+                tampered_mn, log_path=tmp_path / "never_started_mn_exec.log"
+            )
+
+    bad_mn_uni_tp16 = copy.deepcopy(dp2_tp16)
+    bad_mn_uni_tp16["presets"]["decode_ep"]["args"] = [
+        *dp2_tp16["presets"]["decode_ep"]["args"],
+        "--distributed-executor-backend",
+        "uni",
+    ]
+    with pytest.raises(
+        ppu_recipe.ValidationError,
+        match="--distributed-executor-backend 'uni' requires per-replica world size 1, got 16",
+    ):
+        ppu_recipe.validate_serving_recipe_structure(
+            bad_mn_uni_tp16, context="mn_uni_tp16"
+        )
+
+    for good_mn_exec in ("mp", "uni"):
+        good_mn_doc = copy.deepcopy(glm_orig)
+        good_mn_doc["presets"]["decode_ep"]["args"] = [
+            *good_mn_doc["presets"]["decode_ep"]["args"],
+            "--distributed-executor-backend",
+            good_mn_exec,
+        ]
+        glm_rec_path.write_text(yaml.safe_dump(good_mn_doc), encoding="utf-8")
+        assert (
+            ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")["ppu_count"]
+            == 32
+        )
+
+    for bad_us_args in (
+        ["--data_parallel_size", "2"],
+        ["--distributed_executor_backend", "external_launcher"],
+        ["--enable_prefix_caching"],
+    ):
+        bad_us = copy.deepcopy(glm_orig)
+        bad_us["presets"]["prefill"]["args"] = [
+            *bad_us["presets"]["prefill"].get("args", []),
+            *bad_us_args,
+        ]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe.validate_serving_recipe_structure(bad_us, context="bad_us")
+        glm_rec_path.write_text(yaml.safe_dump(bad_us), encoding="utf-8")
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe.resolve_recipe(
+                glm_rec_path, policy_path=glm_pol_path, tier="fast_sanity"
+            )
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_e2e_select.build_recipe_matrix("glm-5.3", "fast_sanity")
+        tampered = copy.deepcopy(clean_resolved)
+        tampered["flags"] = [*tampered["flags"], *bad_us_args]
+        with pytest.raises(
+            ppu_recipe.ValidationError, match="canonical hyphenated spelling"
+        ):
+            ppu_recipe_runner._launch_resolved_server(
+                tampered, log_path=tmp_path / "never_started_us.log"
+            )
+
+    # Review #6066321892: external-LB multi_node_ep accepts both omitted and explicit
+    # --data-parallel-size-local 1 on the same external rank (matching pinned arg_utils.py:2501-2535).
+    for ext_args in (
+        ["--data-parallel-external-lb", "--data-parallel-rank", "0"],
+        [
+            "--data-parallel-external-lb",
+            "--data-parallel-rank",
+            "0",
+            "--data-parallel-size-local",
+            "1",
+        ],
+        ["--data-parallel-rank", "0", "--data-parallel-size-local", "1"],
+        ["--data-parallel-hybrid-lb", "--data-parallel-size-local", "1"],
+        ["--data-parallel-start-rank", "0", "--data-parallel-size-local", "1"],
+    ):
+        ext_doc = copy.deepcopy(glm_orig)
+        ext_doc["presets"]["decode_ep"]["args"] = [
+            *ext_doc["presets"]["decode_ep"]["args"],
+            *ext_args,
+        ]
+        ppu_recipe.validate_serving_recipe_structure(ext_doc, context="ext_lb_mn")
+        glm_rec_path.write_text(yaml.safe_dump(ext_doc), encoding="utf-8")
+        report = ppu_recipe.validate_paths([glm_rec_path], vllm_parser_mode="skip")
+        assert report["checked_combinations"] > 0
+        ext_res = ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
+        assert (ext_res["ppu_count"], ext_res["dp_size"], ext_res["dp_size_local"]) == (
+            32,
+            32,
+            1,
+        )
+
+    for bad_ext_args, err_pat in (
+        (
+            [
+                "--data-parallel-external-lb",
+                "--data-parallel-rank",
+                "0",
+                "--data-parallel-size-local",
+                "8",
+            ],
+            "external data-parallel mode requires --data-parallel-size-local 1 or omitted",
+        ),
+        (
+            ["--data-parallel-rank", "0"],
+            "external data-parallel mode requires --data-parallel-size-local 1 or omitted",
+        ),
+        (
+            ["--data-parallel-start-rank", "32", "--data-parallel-size-local", "1"],
+            "--data-parallel-start-rank must be in",
+        ),
+        (
+            ["--data-parallel-start-rank", "bad", "--data-parallel-size-local", "8"],
+            "--data-parallel-start-rank must be an integer",
+        ),
+    ):
+        bad_ext_doc = copy.deepcopy(glm_orig)
+        bad_ext_doc["presets"]["decode_ep"]["args"] = [
+            *bad_ext_doc["presets"]["decode_ep"]["args"],
+            *bad_ext_args,
+        ]
+        with pytest.raises(ppu_recipe.ValidationError, match=err_pat):
+            ppu_recipe.validate_serving_recipe_structure(
+                bad_ext_doc, context="bad_ext_lb_mn"
+            )
+        glm_rec_path.write_text(yaml.safe_dump(bad_ext_doc), encoding="utf-8")
+        with pytest.raises(ppu_recipe.ValidationError, match=err_pat):
+            ppu_recipe.resolve_recipe(glm_rec_path, preset="decode_ep")
